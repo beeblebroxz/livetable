@@ -242,6 +242,15 @@ impl Table {
         self.columns[col_idx].get(row)
     }
 
+    /// Get a value by column index (faster than get_value when column index is known).
+    /// Used for performance-critical loops where column lookup can be done once upfront.
+    #[inline]
+    pub fn get_value_by_index(&self, row: usize, col_idx: usize) -> Result<ColumnValue, String> {
+        self.columns.get(col_idx)
+            .ok_or_else(|| format!("Column index {} out of range", col_idx))?
+            .get(row)
+    }
+
     pub fn set_value(&mut self, row: usize, column: &str, value: ColumnValue) -> Result<(), String> {
         let col_idx = self.schema
             .get_column_index(column)

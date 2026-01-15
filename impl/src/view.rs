@@ -477,8 +477,8 @@ impl JoinView {
         Ok(view)
     }
 
-    /// Build a composite key string from multiple column values.
-    /// Returns None if any key column is missing or contains NULL (SQL semantics: NULL != NULL)
+    /// Build a composite key string from a HashMap row (for incremental sync).
+    /// Returns None if any key column is missing or contains NULL.
     fn build_composite_key(row: &HashMap<String, ColumnValue>, keys: &[String]) -> Option<String> {
         let mut parts: Vec<String> = Vec::with_capacity(keys.len());
         for key in keys {
@@ -488,46 +488,90 @@ impl JoinView {
                 None => return None, // Missing key column
             }
         }
-        Some(parts.join("\x00")) // Use null byte as separator
+        Some(parts.join("\x00"))
     }
 
-    /// Rebuilds the join index by scanning both tables
+    /// Build a composite key string from column values at given indices.
+    /// Returns None if any key column contains NULL (SQL semantics: NULL != NULL)
+    /// This is the fast path - uses pre-computed column indices.
+    /// Optimized to minimize allocations for common types.
+    fn build_key_from_indices(
+        table: &Table,
+        row: usize,
+        col_indices: &[usize],
+    ) -> Option<String> {
+        // Fast path for single-column join (most common case)
+        if col_indices.len() == 1 {
+            return match table.get_value_by_index(row, col_indices[0]) {
+                Ok(ColumnValue::Null) => None,
+                Ok(ColumnValue::Int32(v)) => Some(v.to_string()),
+                Ok(ColumnValue::Int64(v)) => Some(v.to_string()),
+                Ok(ColumnValue::String(s)) => Some(s),
+                Ok(value) => Some(format!("{:?}", value)),
+                Err(_) => None,
+            };
+        }
+
+        // Multi-column join path
+        let mut parts: Vec<String> = Vec::with_capacity(col_indices.len());
+        for &col_idx in col_indices {
+            match table.get_value_by_index(row, col_idx) {
+                Ok(ColumnValue::Null) => return None,
+                Ok(ColumnValue::Int32(v)) => parts.push(v.to_string()),
+                Ok(ColumnValue::Int64(v)) => parts.push(v.to_string()),
+                Ok(ColumnValue::String(s)) => parts.push(s),
+                Ok(value) => parts.push(format!("{:?}", value)),
+                Err(_) => return None,
+            }
+        }
+        Some(parts.join("\x00"))
+    }
+
+    /// Rebuilds the join index by scanning both tables.
+    /// Optimized to use direct column access instead of building HashMaps per row.
     fn rebuild_index(&mut self) {
         self.join_index.clear();
 
         let left = self.left_table.borrow();
         let right = self.right_table.borrow();
 
+        // Pre-compute column indices for join keys (done once, not per row)
+        let left_col_indices: Vec<usize> = self.left_keys
+            .iter()
+            .filter_map(|k| left.schema().get_column_index(k))
+            .collect();
+        let right_col_indices: Vec<usize> = self.right_keys
+            .iter()
+            .filter_map(|k| right.schema().get_column_index(k))
+            .collect();
+
         // Build a hashmap of right table values for efficient lookup
+        // Uses direct column access instead of get_row()
         let mut right_index: HashMap<String, Vec<usize>> = HashMap::new();
 
         for i in 0..right.len() {
-            if let Ok(row) = right.get_row(i) {
-                if let Some(key_str) = Self::build_composite_key(&row, &self.right_keys) {
-                    right_index.entry(key_str).or_insert_with(Vec::new).push(i);
-                }
+            if let Some(key_str) = Self::build_key_from_indices(&right, i, &right_col_indices) {
+                right_index.entry(key_str).or_insert_with(Vec::new).push(i);
             }
         }
 
         // For each left row, find matching right rows
         for i in 0..left.len() {
-            if let Ok(row) = left.get_row(i) {
-                if let Some(key_str) = Self::build_composite_key(&row, &self.left_keys) {
-                    if let Some(matching_indices) = right_index.get(&key_str) {
-                        // Found matches - add each combination
-                        for &right_idx in matching_indices {
-                            self.join_index.push((i, Some(right_idx)));
+            if let Some(key_str) = Self::build_key_from_indices(&left, i, &left_col_indices) {
+                if let Some(matching_indices) = right_index.get(&key_str) {
+                    // Found matches - add each combination
+                    for &right_idx in matching_indices {
+                        self.join_index.push((i, Some(right_idx)));
+                    }
+                } else {
+                    // No match
+                    match self.join_type {
+                        JoinType::Left => {
+                            // Include left row with null right values
+                            self.join_index.push((i, None));
                         }
-                    } else {
-                        // No match
-                        match self.join_type {
-                            JoinType::Left => {
-                                // Include left row with null right values
-                                self.join_index.push((i, None));
-                            }
-                            JoinType::Inner => {
-                                // Skip - no match means not included
-                            }
+                        JoinType::Inner => {
+                            // Skip - no match means not included
                         }
                     }
                 }
@@ -544,11 +588,15 @@ impl JoinView {
         let right = self.right_table.borrow();
         let mut right_index: HashMap<String, Vec<usize>> = HashMap::new();
 
+        // Pre-compute column indices
+        let right_col_indices: Vec<usize> = self.right_keys
+            .iter()
+            .filter_map(|k| right.schema().get_column_index(k))
+            .collect();
+
         for i in 0..right.len() {
-            if let Ok(row) = right.get_row(i) {
-                if let Some(key_str) = Self::build_composite_key(&row, &self.right_keys) {
-                    right_index.entry(key_str).or_insert_with(Vec::new).push(i);
-                }
+            if let Some(key_str) = Self::build_key_from_indices(&right, i, &right_col_indices) {
+                right_index.entry(key_str).or_insert_with(Vec::new).push(i);
             }
         }
 
@@ -705,27 +753,32 @@ impl JoinView {
                 if let Some(right_key_str) = Self::build_composite_key(data, &self.right_keys) {
                     let left = self.left_table.borrow();
 
-                    for left_idx in 0..left.len() {
-                        if let Ok(left_row) = left.get_row(left_idx) {
-                            if let Some(left_key_str) = Self::build_composite_key(&left_row, &self.left_keys) {
-                                if left_key_str == right_key_str {
-                                    // For left joins, we might need to replace a (left_idx, None)
-                                    // with (left_idx, Some(right_idx))
-                                    if self.join_type == JoinType::Left {
-                                        // Check if there's an existing null match to replace
-                                        let existing_null = self.join_index.iter()
-                                            .position(|(l, r)| *l == left_idx && r.is_none());
+                    // Pre-compute left column indices for fast access
+                    let left_col_indices: Vec<usize> = self.left_keys
+                        .iter()
+                        .filter_map(|k| left.schema().get_column_index(k))
+                        .collect();
 
-                                        if let Some(pos) = existing_null {
-                                            self.join_index[pos] = (left_idx, Some(*right_idx));
-                                        } else {
-                                            self.join_index.push((left_idx, Some(*right_idx)));
-                                        }
+                    for left_idx in 0..left.len() {
+                        // Use fast direct column access instead of get_row()
+                        if let Some(left_key_str) = Self::build_key_from_indices(&left, left_idx, &left_col_indices) {
+                            if left_key_str == right_key_str {
+                                // For left joins, we might need to replace a (left_idx, None)
+                                // with (left_idx, Some(right_idx))
+                                if self.join_type == JoinType::Left {
+                                    // Check if there's an existing null match to replace
+                                    let existing_null = self.join_index.iter()
+                                        .position(|(l, r)| *l == left_idx && r.is_none());
+
+                                    if let Some(pos) = existing_null {
+                                        self.join_index[pos] = (left_idx, Some(*right_idx));
                                     } else {
                                         self.join_index.push((left_idx, Some(*right_idx)));
                                     }
-                                    modified = true;
+                                } else {
+                                    self.join_index.push((left_idx, Some(*right_idx)));
                                 }
+                                modified = true;
                             }
                         }
                     }
@@ -901,14 +954,31 @@ impl SortedView {
         // Create initial indices
         self.sorted_index = (0..len).collect();
 
-        // Sort by collecting values for comparison
+        // Pre-extract all sort key values (O(N) instead of O(N log N) get_value calls)
         let sort_keys = self.sort_keys.clone();
-        self.sorted_index.sort_by(|&a, &b| {
-            for key in &sort_keys {
-                let val_a = table.get_value(a, &key.column).ok();
-                let val_b = table.get_value(b, &key.column).ok();
+        let sort_col_indices: Vec<usize> = sort_keys.iter()
+            .filter_map(|key| table.schema().get_column_index(&key.column))
+            .collect();
 
-                let cmp = Self::compare_values(&val_a, &val_b, key);
+        // Pre-extract values for each sort key column
+        let sort_values: Vec<Vec<ColumnValue>> = sort_col_indices.iter()
+            .map(|&col_idx| {
+                (0..len)
+                    .map(|row_idx| {
+                        table.get_value_by_index(row_idx, col_idx)
+                            .unwrap_or(ColumnValue::Null)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Sort using pre-extracted values (reference, no clone needed)
+        self.sorted_index.sort_by(|&a, &b| {
+            for (key_idx, key) in sort_keys.iter().enumerate() {
+                let val_a = &sort_values[key_idx][a];
+                let val_b = &sort_values[key_idx][b];
+
+                let cmp = Self::compare_values_ref(val_a, val_b, key);
                 if cmp != Ordering::Equal {
                     return cmp;
                 }
@@ -917,6 +987,57 @@ impl SortedView {
         });
 
         self.last_synced_generation = table.changeset_generation();
+    }
+
+    /// Compare two column values by reference (avoids cloning)
+    fn compare_values_ref(
+        val_a: &ColumnValue,
+        val_b: &ColumnValue,
+        key: &SortKey,
+    ) -> Ordering {
+        let a_is_null = val_a.is_null();
+        let b_is_null = val_b.is_null();
+
+        // Handle NULL comparisons
+        match (a_is_null, b_is_null) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => {
+                return if key.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+            (false, true) => {
+                return if key.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+            (false, false) => {}
+        }
+
+        let base_cmp = match (val_a, val_b) {
+            (ColumnValue::Int32(a), ColumnValue::Int32(b)) => a.cmp(b),
+            (ColumnValue::Int64(a), ColumnValue::Int64(b)) => a.cmp(b),
+            (ColumnValue::Float32(a), ColumnValue::Float32(b)) => {
+                a.partial_cmp(b).unwrap_or(Ordering::Equal)
+            }
+            (ColumnValue::Float64(a), ColumnValue::Float64(b)) => {
+                a.partial_cmp(b).unwrap_or(Ordering::Equal)
+            }
+            (ColumnValue::String(a), ColumnValue::String(b)) => a.cmp(b),
+            (ColumnValue::Bool(a), ColumnValue::Bool(b)) => a.cmp(b),
+            // Mixed types - compare type ordering for deterministic results
+            _ => Ordering::Equal, // Different types are equal for stability
+        };
+
+        // Apply sort order
+        match key.order {
+            SortOrder::Ascending => base_cmp,
+            SortOrder::Descending => base_cmp.reverse(),
+        }
     }
 
     /// Compare two column values according to a sort key
@@ -1275,15 +1396,49 @@ impl GroupKey {
             .iter()
             .map(|col| {
                 row.get(col).and_then(|v| {
-                    if v.is_null() {
-                        None
-                    } else {
-                        Some(format!("{:?}", v))
+                    // Use compact format consistent with from_indices
+                    match v {
+                        ColumnValue::Null => None,
+                        ColumnValue::Int32(n) => Some(format!("i{}", n)),
+                        ColumnValue::Int64(n) => Some(format!("I{}", n)),
+                        ColumnValue::Float32(f) => Some(format!("f{}", f)),
+                        ColumnValue::Float64(f) => Some(format!("F{}", f)),
+                        ColumnValue::String(s) => Some(format!("s{}", s)),
+                        ColumnValue::Bool(b) => Some(if *b { "B1".to_string() } else { "B0".to_string() }),
                     }
                 })
             })
             .collect();
         GroupKey(values)
+    }
+
+    /// Build GroupKey directly from table using column indices (faster than from_row)
+    fn from_indices(table: &Table, row_idx: usize, col_indices: &[usize]) -> Self {
+        let values: Vec<Option<String>> = col_indices
+            .iter()
+            .map(|&col_idx| {
+                match table.get_value_by_index(row_idx, col_idx) {
+                    Ok(ColumnValue::Null) => None,
+                    // Use simpler string representation - just the value
+                    // We prepend a type marker byte to disambiguate types with same string repr
+                    Ok(ColumnValue::Int32(v)) => Some(format!("i{}", v)),
+                    Ok(ColumnValue::Int64(v)) => Some(format!("I{}", v)),
+                    Ok(ColumnValue::Float32(v)) => Some(format!("f{}", v)),
+                    Ok(ColumnValue::Float64(v)) => Some(format!("F{}", v)),
+                    Ok(ColumnValue::String(s)) => Some(format!("s{}", s)),
+                    Ok(ColumnValue::Bool(b)) => Some(if b { "B1".to_string() } else { "B0".to_string() }),
+                    Err(_) => None,
+                }
+            })
+            .collect();
+        GroupKey(values)
+    }
+
+    /// Build GroupKey for a single integer column (most common case) - ultra fast path
+    #[inline]
+    fn from_single_int(value: i32) -> Self {
+        // Avoid string allocation for the most common case - we use a static prefix
+        GroupKey(vec![Some(format!("i{}", value))])
     }
 
     fn to_column_values(&self, group_by: &[String], parent: &Table) -> HashMap<String, ColumnValue> {
@@ -1295,12 +1450,15 @@ impl GroupKey {
                     // Try to reconstruct the original value based on column type
                     if let Some(col_idx) = parent.schema().get_column_index(col_name) {
                         if let Some((_, col_type, _)) = parent.schema().get_column_info(col_idx) {
-                            // Parse the debug string back - this is a simplification
-                            // In production, we'd store actual ColumnValues
+                            // Parse the key string back to ColumnValue
+                            // Supports both old format (Int32(...)) and new compact format (i...)
                             match col_type {
                                 crate::column::ColumnType::String => {
-                                    // Extract string from String("value") format
-                                    if s.starts_with("String(\"") && s.ends_with("\")") {
+                                    // New format: s<value>
+                                    if s.starts_with('s') {
+                                        ColumnValue::String(s[1..].to_string())
+                                    // Old format: String("value")
+                                    } else if s.starts_with("String(\"") && s.ends_with("\")") {
                                         let inner = &s[8..s.len()-2];
                                         ColumnValue::String(inner.to_string())
                                     } else {
@@ -1308,7 +1466,11 @@ impl GroupKey {
                                     }
                                 }
                                 crate::column::ColumnType::Int32 => {
-                                    if s.starts_with("Int32(") && s.ends_with(")") {
+                                    // New format: i<value>
+                                    if s.starts_with('i') {
+                                        s[1..].parse().map(ColumnValue::Int32).unwrap_or(ColumnValue::Null)
+                                    // Old format: Int32(value)
+                                    } else if s.starts_with("Int32(") && s.ends_with(")") {
                                         let inner = &s[6..s.len()-1];
                                         inner.parse().map(ColumnValue::Int32).unwrap_or(ColumnValue::Null)
                                     } else {
@@ -1316,14 +1478,43 @@ impl GroupKey {
                                     }
                                 }
                                 crate::column::ColumnType::Int64 => {
-                                    if s.starts_with("Int64(") && s.ends_with(")") {
+                                    // New format: I<value>
+                                    if s.starts_with('I') {
+                                        s[1..].parse().map(ColumnValue::Int64).unwrap_or(ColumnValue::Null)
+                                    // Old format: Int64(value)
+                                    } else if s.starts_with("Int64(") && s.ends_with(")") {
                                         let inner = &s[6..s.len()-1];
                                         inner.parse().map(ColumnValue::Int64).unwrap_or(ColumnValue::Null)
                                     } else {
                                         ColumnValue::Null
                                     }
                                 }
-                                _ => ColumnValue::String(s.clone()),
+                                crate::column::ColumnType::Float32 => {
+                                    // New format: f<value>
+                                    if s.starts_with('f') {
+                                        s[1..].parse().map(ColumnValue::Float32).unwrap_or(ColumnValue::Null)
+                                    } else {
+                                        ColumnValue::Null
+                                    }
+                                }
+                                crate::column::ColumnType::Float64 => {
+                                    // New format: F<value>
+                                    if s.starts_with('F') {
+                                        s[1..].parse().map(ColumnValue::Float64).unwrap_or(ColumnValue::Null)
+                                    } else {
+                                        ColumnValue::Null
+                                    }
+                                }
+                                crate::column::ColumnType::Bool => {
+                                    // New format: B0 or B1
+                                    if s == "B1" || s == "Bool(true)" {
+                                        ColumnValue::Bool(true)
+                                    } else if s == "B0" || s == "Bool(false)" {
+                                        ColumnValue::Bool(false)
+                                    } else {
+                                        ColumnValue::Null
+                                    }
+                                }
                             }
                         } else {
                             ColumnValue::String(s.clone())
@@ -1366,6 +1557,8 @@ pub struct AggregateView {
     group_order: Vec<GroupKey>,
     /// Map from parent row index to its group key
     row_to_group: HashMap<usize, GroupKey>,
+    /// Whether row_to_group is populated (deferred for fast initial build)
+    row_to_group_built: bool,
     /// Last synced generation from parent's changeset
     last_synced_generation: u64,
     /// Number of changes already processed (to skip old changes on sync)
@@ -1411,6 +1604,7 @@ impl AggregateView {
             groups: HashMap::new(),
             group_order: Vec::new(),
             row_to_group: HashMap::new(),
+            row_to_group_built: false,
             last_synced_generation: generation,
             last_processed_change_count: change_count,
         };
@@ -1422,26 +1616,156 @@ impl AggregateView {
         self.groups.clear();
         self.group_order.clear();
         self.row_to_group.clear();
+        self.row_to_group_built = false;
 
-        // Collect rows first to avoid borrow conflicts
-        let (rows, generation, change_count) = {
-            let parent = self.parent.borrow();
-            let mut rows = Vec::new();
-            for row_idx in 0..parent.len() {
-                if let Ok(row) = parent.get_row(row_idx) {
-                    rows.push((row_idx, row));
-                }
-            }
-            (rows, parent.changeset_generation(), parent.changeset().changes().len())
+        // Pre-compute column indices for fast access
+        let parent = self.parent.borrow();
+        let group_col_indices: Vec<usize> = self.group_by_columns
+            .iter()
+            .filter_map(|name| parent.schema().get_column_index(name))
+            .collect();
+
+        // Get unique source columns and their indices
+        let source_col_info: Vec<(usize, String)> = self.unique_source_columns()
+            .into_iter()
+            .filter_map(|col| {
+                parent.schema().get_column_index(&col).map(|idx| (idx, col))
+            })
+            .collect();
+
+        let num_rows = parent.len();
+        let generation = parent.changeset_generation();
+        let change_count = parent.changeset().changes().len();
+
+        // Check for single-column integer group-by fast path
+        let is_single_int_group = group_col_indices.len() == 1 && {
+            let col_idx = group_col_indices[0];
+            matches!(
+                parent.schema().get_column_info(col_idx),
+                Some((_, crate::column::ColumnType::Int32, _))
+            )
         };
 
-        // Now process the rows
-        for (row_idx, row) in rows {
-            self.add_row_to_aggregates(row_idx, &row);
+        // Check for single-column aggregation on a numeric column
+        let single_source_col_idx = if source_col_info.len() == 1 {
+            Some(source_col_info[0].0)
+        } else {
+            None
+        };
+        let single_source_col_name = if source_col_info.len() == 1 {
+            Some(source_col_info[0].1.clone())
+        } else {
+            None
+        };
+
+        // Use integer key map for single-int group by - minimizes allocations
+        if is_single_int_group {
+            let group_col_idx = group_col_indices[0];
+
+            // For single-int groups with single aggregation (most common case),
+            // use direct integer -> GroupState map to avoid ALL string allocations
+            let has_single_source = single_source_col_idx.is_some();
+            let source_col_idx = single_source_col_idx.unwrap_or(0);
+            let source_col_name_ref = single_source_col_name.as_ref();
+
+            // Build using integer keys directly
+            let mut int_groups: HashMap<i32, GroupState> = HashMap::new();
+            let mut int_group_order: Vec<i32> = Vec::new();
+
+            for row_idx in 0..num_rows {
+                // Get group key value directly as int
+                let group_val = match parent.get_value_by_index(row_idx, group_col_idx) {
+                    Ok(ColumnValue::Int32(v)) => v,
+                    _ => continue, // Skip null/invalid
+                };
+
+                // Get or create group state directly with int key
+                let is_new_group = !int_groups.contains_key(&group_val);
+                let state = int_groups.entry(group_val).or_insert_with(GroupState::new);
+                state.row_indices.insert(row_idx);
+
+                // Add aggregation value(s)
+                if has_single_source {
+                    if let Ok(v) = parent.get_value_by_index(row_idx, source_col_idx) {
+                        if let Some(num) = Self::extract_numeric(&v) {
+                            state.add_column_value(source_col_name_ref.unwrap(), num);
+                        }
+                    }
+                } else {
+                    for (col_idx, col_name) in &source_col_info {
+                        if let Ok(v) = parent.get_value_by_index(row_idx, *col_idx) {
+                            if let Some(num) = Self::extract_numeric(&v) {
+                                state.add_column_value(col_name, num);
+                            }
+                        }
+                    }
+                }
+
+                if is_new_group {
+                    int_group_order.push(group_val);
+                }
+            }
+
+            // Convert integer groups to GroupKey-based maps (only allocate once per group)
+            // NOTE: We skip populating row_to_group for initial build.
+            // It will be populated lazily if incremental sync is needed.
+            for &int_val in &int_group_order {
+                let key = GroupKey::from_single_int(int_val);
+                if let Some(state) = int_groups.remove(&int_val) {
+                    self.groups.insert(key.clone(), state);
+                    self.group_order.push(key);
+                }
+            }
+            self.row_to_group_built = false; // Deferred for fast path
+        } else {
+            // General case - multi-column or non-int group by
+            for row_idx in 0..num_rows {
+                let key = GroupKey::from_indices(&parent, row_idx, &group_col_indices);
+                self.row_to_group.insert(row_idx, key.clone());
+
+                let col_values: Vec<(String, f64)> = source_col_info
+                    .iter()
+                    .filter_map(|(col_idx, col_name)| {
+                        parent.get_value_by_index(row_idx, *col_idx)
+                            .ok()
+                            .and_then(|v| Self::extract_numeric(&v))
+                            .map(|num| (col_name.clone(), num))
+                    })
+                    .collect();
+
+                let is_new_group = !self.groups.contains_key(&key);
+                let state = self.groups.entry(key.clone()).or_insert_with(GroupState::new);
+                state.row_indices.insert(row_idx);
+
+                for (source_col, num) in col_values {
+                    state.add_column_value(&source_col, num);
+                }
+
+                if is_new_group {
+                    self.group_order.push(key);
+                }
+            }
+            self.row_to_group_built = true; // General case builds it eagerly
         }
+        drop(parent);
 
         self.last_synced_generation = generation;
         self.last_processed_change_count = change_count;
+    }
+
+    /// Build row_to_group mapping if not already built (lazy initialization)
+    fn ensure_row_to_group_built(&mut self) {
+        if self.row_to_group_built {
+            return;
+        }
+
+        // Populate row_to_group from groups' row_indices
+        for (key, state) in &self.groups {
+            for &row_idx in &state.row_indices {
+                self.row_to_group.insert(row_idx, key.clone());
+            }
+        }
+        self.row_to_group_built = true;
     }
 
     /// Get unique source columns from aggregations
@@ -1547,14 +1871,19 @@ impl AggregateView {
 
         let values: Vec<f64> = {
             let parent = self.parent.borrow();
-            row_indices
-                .iter()
-                .filter_map(|&row_idx| {
-                    parent.get_row(row_idx).ok().and_then(|row| {
-                        row.get(source_col).and_then(|value| Self::extract_numeric(value))
+            // Get column index once for direct access
+            if let Some(col_idx) = parent.schema().get_column_index(source_col) {
+                row_indices
+                    .iter()
+                    .filter_map(|&row_idx| {
+                        parent.get_value_by_index(row_idx, col_idx)
+                            .ok()
+                            .and_then(|value| Self::extract_numeric(&value))
                     })
-                })
-                .collect()
+                    .collect()
+            } else {
+                Vec::new()
+            }
         };
 
         if let Some(state) = self.groups.get_mut(key) {
@@ -1656,6 +1985,9 @@ impl AggregateView {
         let new_changes: Vec<TableChange> = all_changes[self.last_processed_change_count..].to_vec();
         let new_count = all_changes.len();
         drop(parent);
+
+        // Ensure row_to_group is built before processing changes
+        self.ensure_row_to_group_built();
 
         let modified = self.apply_changes(&new_changes);
         self.last_processed_change_count = new_count;
