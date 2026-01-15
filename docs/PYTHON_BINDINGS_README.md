@@ -246,6 +246,41 @@ with open("data.csv", "r") as f:
 - "true"/"false" (case-insensitive) → BOOL
 - Everything else → STRING
 
+### ✅ Iterator Protocol
+
+All tables and views support Python's iterator protocol, enabling `for row in table:` syntax:
+
+```python
+# Iterate over a table
+for row in table:
+    print(f"{row['name']}: {row['score']}")
+
+# Works with all view types
+filtered = table.filter(lambda r: r["score"] >= 90)
+for row in filtered:
+    print(f"High scorer: {row['name']}")
+
+# Use with list comprehensions
+names = [row["name"] for row in table]
+
+# Use with built-in functions
+total = sum(row["score"] for row in table)
+sorted_rows = sorted(table, key=lambda r: r["score"])
+
+# Works with enumerate() and zip()
+for i, row in enumerate(table):
+    print(f"Row {i}: {row['name']}")
+```
+
+**Supported types:**
+- `Table`
+- `FilterView`
+- `ProjectionView`
+- `ComputedView`
+- `JoinView`
+- `SortedView`
+- `AggregateView`
+
 ## Supported Data Types
 
 | Python Type | LiveTable ColumnType | Rust Type |
@@ -531,9 +566,9 @@ amount = row["right_amount"]     # From right table (prefixed!)
 Potential additions:
 - [x] ~~GroupBy/Aggregation support~~ ✅ **DONE!**
 - [x] ~~CSV/JSON Serialization~~ ✅ **DONE!**
+- [x] ~~Iterator protocol support~~ ✅ **DONE!**
 - [ ] RIGHT and FULL OUTER joins
 - [ ] Multi-column joins
-- [ ] Iterator protocol support
 - [ ] Pandas DataFrame interop
 
 ## Contributing

@@ -482,6 +482,16 @@ impl PyTable {
             inner: Rc::new(RefCell::new(table)),
         })
     }
+
+    /// Return an iterator over the table rows.
+    /// Enables: `for row in table:`
+    fn __iter__(slf: PyRef<'_, Self>) -> PyTableIterator {
+        PyTableIterator {
+            table: slf.clone(),
+            index: 0,
+            length: slf.inner.borrow().len(),
+        }
+    }
 }
 
 impl Clone for PyTable {
@@ -679,6 +689,17 @@ impl PyFilterView {
     fn last_synced_generation(&self) -> u64 {
         self.last_synced_generation
     }
+
+    /// Return an iterator over the filtered rows.
+    /// Enables: `for row in filter_view:`
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyFilterViewIterator {
+        let length = slf.indices.len();
+        PyFilterViewIterator {
+            view: slf.into_py(py).extract(py).unwrap(),
+            index: 0,
+            length,
+        }
+    }
 }
 
 // ============================================================================
@@ -742,6 +763,17 @@ impl PyProjectionView {
         }
 
         self.table.get_value(py, row, column)
+    }
+
+    /// Return an iterator over the projected rows.
+    /// Enables: `for row in projection_view:`
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyProjectionViewIterator {
+        let length = slf.table.inner.borrow().len();
+        PyProjectionViewIterator {
+            view: slf.into_py(py).extract(py).unwrap(),
+            index: 0,
+            length,
+        }
     }
 }
 
@@ -821,6 +853,17 @@ impl PyComputedView {
             self.compute_fn.call1(py, (dict,))
         } else {
             self.table.get_value(py, row, column)
+        }
+    }
+
+    /// Return an iterator over the rows with computed column.
+    /// Enables: `for row in computed_view:`
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyComputedViewIterator {
+        let length = slf.table.inner.borrow().len();
+        PyComputedViewIterator {
+            view: slf.into_py(py).extract(py).unwrap(),
+            index: 0,
+            length,
         }
     }
 }
@@ -925,6 +968,17 @@ impl PyJoinView {
 
     fn refresh(&mut self) {
         self.inner.borrow_mut().refresh();
+    }
+
+    /// Return an iterator over the joined rows.
+    /// Enables: `for row in join_view:`
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyJoinViewIterator {
+        let length = slf.inner.borrow().len();
+        PyJoinViewIterator {
+            view: slf.into_py(py).extract(py).unwrap(),
+            index: 0,
+            length,
+        }
     }
 }
 
@@ -1108,6 +1162,17 @@ impl PySortedView {
     fn sync(&mut self) -> bool {
         self.inner.borrow_mut().sync()
     }
+
+    /// Return an iterator over the sorted rows.
+    /// Enables: `for row in sorted_view:`
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PySortedViewIterator {
+        let length = slf.inner.borrow().len();
+        PySortedViewIterator {
+            view: slf.into_py(py).extract(py).unwrap(),
+            index: 0,
+            length,
+        }
+    }
 }
 
 // ============================================================================
@@ -1270,6 +1335,195 @@ impl PyAggregateView {
     fn sync(&mut self) -> bool {
         self.inner.borrow_mut().sync()
     }
+
+    /// Return an iterator over the aggregated groups.
+    /// Enables: `for group in aggregate_view:`
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyAggregateViewIterator {
+        let length = slf.inner.borrow().len();
+        PyAggregateViewIterator {
+            view: slf.into_py(py).extract(py).unwrap(),
+            index: 0,
+            length,
+        }
+    }
+}
+
+// ============================================================================
+// Iterator Types
+// ============================================================================
+
+/// Iterator for PyTable - enables `for row in table:` syntax
+#[pyclass(name = "TableIterator", unsendable)]
+pub struct PyTableIterator {
+    table: PyTable,
+    index: usize,
+    length: usize,
+}
+
+#[pymethods]
+impl PyTableIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
+        if self.index >= self.length {
+            return Ok(None);
+        }
+        let row = self.table.get_row(py, self.index)?;
+        self.index += 1;
+        Ok(Some(row))
+    }
+}
+
+/// Iterator for PyFilterView
+#[pyclass(name = "FilterViewIterator", unsendable)]
+pub struct PyFilterViewIterator {
+    view: Py<PyFilterView>,
+    index: usize,
+    length: usize,
+}
+
+#[pymethods]
+impl PyFilterViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
+        if self.index >= self.length {
+            return Ok(None);
+        }
+        let view = self.view.borrow(py);
+        let row = view.get_row(py, self.index)?;
+        self.index += 1;
+        Ok(Some(row))
+    }
+}
+
+/// Iterator for PyProjectionView
+#[pyclass(name = "ProjectionViewIterator", unsendable)]
+pub struct PyProjectionViewIterator {
+    view: Py<PyProjectionView>,
+    index: usize,
+    length: usize,
+}
+
+#[pymethods]
+impl PyProjectionViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
+        if self.index >= self.length {
+            return Ok(None);
+        }
+        let view = self.view.borrow(py);
+        let row = view.get_row(py, self.index)?;
+        self.index += 1;
+        Ok(Some(row))
+    }
+}
+
+/// Iterator for PyComputedView
+#[pyclass(name = "ComputedViewIterator", unsendable)]
+pub struct PyComputedViewIterator {
+    view: Py<PyComputedView>,
+    index: usize,
+    length: usize,
+}
+
+#[pymethods]
+impl PyComputedViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
+        if self.index >= self.length {
+            return Ok(None);
+        }
+        let view = self.view.borrow(py);
+        let row = view.get_row(py, self.index)?;
+        self.index += 1;
+        Ok(Some(row))
+    }
+}
+
+/// Iterator for PyJoinView
+#[pyclass(name = "JoinViewIterator", unsendable)]
+pub struct PyJoinViewIterator {
+    view: Py<PyJoinView>,
+    index: usize,
+    length: usize,
+}
+
+#[pymethods]
+impl PyJoinViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
+        if self.index >= self.length {
+            return Ok(None);
+        }
+        let view = self.view.borrow(py);
+        let row = view.get_row(py, self.index)?;
+        self.index += 1;
+        Ok(Some(row))
+    }
+}
+
+/// Iterator for PySortedView
+#[pyclass(name = "SortedViewIterator", unsendable)]
+pub struct PySortedViewIterator {
+    view: Py<PySortedView>,
+    index: usize,
+    length: usize,
+}
+
+#[pymethods]
+impl PySortedViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
+        if self.index >= self.length {
+            return Ok(None);
+        }
+        let view = self.view.borrow(py);
+        let row = view.get_row(py, self.index)?;
+        self.index += 1;
+        Ok(Some(row))
+    }
+}
+
+/// Iterator for PyAggregateView
+#[pyclass(name = "AggregateViewIterator", unsendable)]
+pub struct PyAggregateViewIterator {
+    view: Py<PyAggregateView>,
+    index: usize,
+    length: usize,
+}
+
+#[pymethods]
+impl PyAggregateViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
+        if self.index >= self.length {
+            return Ok(None);
+        }
+        let view = self.view.borrow(py);
+        let row = view.get_row(py, self.index)?;
+        self.index += 1;
+        Ok(Some(row))
+    }
 }
 
 // ============================================================================
@@ -1279,9 +1533,12 @@ impl PyAggregateView {
 /// Python module for LiveTable
 #[pymodule]
 fn livetable(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Core types
     m.add_class::<PyColumnType>()?;
     m.add_class::<PySchema>()?;
     m.add_class::<PyTable>()?;
+
+    // View types
     m.add_class::<PyFilterView>()?;
     m.add_class::<PyProjectionView>()?;
     m.add_class::<PyComputedView>()?;
@@ -1292,6 +1549,15 @@ fn livetable(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySortedView>()?;
     m.add_class::<PyAggregateFunction>()?;
     m.add_class::<PyAggregateView>()?;
+
+    // Iterator types (for `for row in table:` syntax)
+    m.add_class::<PyTableIterator>()?;
+    m.add_class::<PyFilterViewIterator>()?;
+    m.add_class::<PyProjectionViewIterator>()?;
+    m.add_class::<PyComputedViewIterator>()?;
+    m.add_class::<PyJoinViewIterator>()?;
+    m.add_class::<PySortedViewIterator>()?;
+    m.add_class::<PyAggregateViewIterator>()?;
 
     Ok(())
 }

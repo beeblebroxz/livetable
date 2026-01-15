@@ -167,4 +167,12 @@ json_string = table.to_json()
 # Serialization - import (types are auto-inferred)
 table_from_csv = livetable.Table.from_csv("imported", csv_string)
 table_from_json = livetable.Table.from_json("imported", json_string)
+
+# Iterator protocol - works with all tables and views
+for row in table:
+    print(f"{row['name']}: {row['score']}")
+
+# Use with comprehensions and built-ins
+names = [row["name"] for row in filtered]
+total = sum(row["score"] for row in table)
 ```

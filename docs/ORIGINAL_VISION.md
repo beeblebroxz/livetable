@@ -186,13 +186,15 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 
 ### Completed
 - [x] Sequence layer (ArraySequence, TieredVectorSequence)
-- [x] Column layer with NULL support
-- [x] Table layer (Root tables)
-- [x] Views: FilterView, ProjectionView, ComputedView, JoinView, SortedView
-- [x] AggregateView with GROUP BY and incremental updates
-- [x] String interning
-- [x] CSV/JSON serialization
+- [x] Column layer with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL)
+- [x] Table layer (Root tables with CRUD operations)
+- [x] Views: FilterView, ProjectionView, ComputedView, JoinView (LEFT/INNER), SortedView
+- [x] AggregateView with GROUP BY and incremental updates (SUM, COUNT, AVG, MIN, MAX)
+- [x] String interning with reference counting
+- [x] Changesets and incremental view propagation
+- [x] CSV/JSON serialization with type inference
 - [x] Python bindings via PyO3
+- [x] WebSocket server for real-time sync (Actix-web + React frontend)
 
 ### Planned
 - [ ] RIGHT and FULL OUTER joins
@@ -200,7 +202,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 - [ ] Date/Time column types
 - [ ] Materialized Views (cached for faster reads)
 - [ ] Bulk/Batch operations for efficiency
-- [ ] Iterator protocol support
+- [x] Python iterator protocol (`for row in table`)
 - [ ] Pandas DataFrame interop
 
 ---
