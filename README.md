@@ -68,6 +68,13 @@ livetable/
 - **ComputedView** - Add computed columns with lambdas
 - **JoinView** - LEFT and INNER joins between tables
 - **SortedView** - Sorted views with multi-column support
+- **AggregateView** - GROUP BY with SUM, AVG, MIN, MAX, COUNT
+
+### Aggregations
+- Simple aggregations: `sum()`, `avg()`, `min()`, `max()`, `count_non_null()`
+- GROUP BY support with `AggregateView`
+- Incremental updates - aggregates update efficiently on table changes
+- Multiple aggregations per view
 
 ### Data Types
 - INT32, INT64
@@ -143,6 +150,26 @@ joined = livetable.JoinView(
     "student_id",   # Column in enrollments
     livetable.JoinType.LEFT
 )
+
+# Simple aggregations
+total = table.sum("score")       # Sum of all scores
+avg = table.avg("score")         # Average score
+min_score = table.min("score")   # Minimum score
+max_score = table.max("score")   # Maximum score
+
+# GROUP BY aggregations
+agg = livetable.AggregateView(
+    "scores_by_age",
+    table,
+    ["age"],  # Group by age
+    [
+        ("total_score", "score", livetable.AggregateFunction.SUM),
+        ("avg_score", "score", livetable.AggregateFunction.AVG),
+        ("count", "score", livetable.AggregateFunction.COUNT),
+    ]
+)
+for i in range(len(agg)):
+    print(agg.get_row(i))  # {"age": 20, "total_score": 95.5, ...}
 ```
 
 ## Building

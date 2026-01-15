@@ -116,6 +116,42 @@ row = with_grade.get_row(0)
 print(f"{row['name']} scored {row['score']} → grade {row['grade']}")
 ```
 
+### ✅ Aggregations
+
+Simple aggregations and GROUP BY support:
+
+```python
+# Simple aggregations on a table
+total = table.sum("score")           # Sum of all scores
+average = table.avg("score")         # Average (None if empty)
+minimum = table.min("score")         # Minimum (None if empty)
+maximum = table.max("score")         # Maximum (None if empty)
+count = table.count_non_null("score") # Count non-NULL values
+
+# GROUP BY with AggregateView
+agg = livetable.AggregateView(
+    "scores_by_age",
+    table,
+    ["age"],  # Group by columns
+    [
+        ("total", "score", livetable.AggregateFunction.SUM),
+        ("avg_score", "score", livetable.AggregateFunction.AVG),
+        ("count", "score", livetable.AggregateFunction.COUNT),
+        ("min_score", "score", livetable.AggregateFunction.MIN),
+        ("max_score", "score", livetable.AggregateFunction.MAX),
+    ]
+)
+
+# Access aggregated data
+for i in range(len(agg)):
+    row = agg.get_row(i)
+    print(f"Age {row['age']}: total={row['total']}, avg={row['avg_score']}")
+
+# Incremental updates - efficient sync after table changes
+table.append_row({"id": 3, "name": "Charlie", "age": 30, "score": 92.0})
+agg.sync()  # Updates aggregates incrementally (not full rebuild)
+```
+
 ### ✅ Join Operations
 
 LEFT and INNER joins with automatic column prefixing:
@@ -211,6 +247,11 @@ Create a new table.
 - `filter(predicate: callable) -> FilterView` - Create filtered view
 - `select(columns: list[str]) -> ProjectionView` - Create projection
 - `add_computed_column(name: str, fn: callable) -> ComputedView` - Add computed column
+- `sum(column: str) -> float` - Sum of numeric column
+- `avg(column: str) -> float | None` - Average of numeric column
+- `min(column: str) -> float | None` - Minimum of numeric column
+- `max(column: str) -> float | None` - Maximum of numeric column
+- `count_non_null(column: str) -> int` - Count non-NULL values
 
 ### FilterView
 
@@ -284,6 +325,42 @@ Join two tables on matching columns.
 Enum for join types:
 - `JoinType.LEFT` - All rows from left, matched from right
 - `JoinType.INNER` - Only rows that match in both tables
+
+### AggregateFunction
+
+Enum for aggregation types:
+- `AggregateFunction.SUM` - Sum of numeric values
+- `AggregateFunction.COUNT` - Count of non-NULL values
+- `AggregateFunction.AVG` - Average of numeric values
+- `AggregateFunction.MIN` - Minimum numeric value
+- `AggregateFunction.MAX` - Maximum numeric value
+
+### AggregateView
+
+```python
+AggregateView(
+    name: str,
+    table: Table,
+    group_by: list[str],
+    aggregations: list[tuple[str, str, AggregateFunction]]
+)
+```
+
+GROUP BY view with aggregations.
+
+**Parameters:**
+- `name`: View name
+- `table`: Source table
+- `group_by`: List of columns to group by
+- `aggregations`: List of `(result_column, source_column, function)` tuples
+
+**Methods:**
+- `len()` - Number of groups
+- `get_row(index: int) -> dict` - Get group row with aggregated values
+- `get_value(row: int, column: str)` - Get single value
+- `column_names()` - All columns (group-by + result columns)
+- `sync()` - Incremental update after table changes
+- `refresh()` - Full rebuild
 
 ## Performance
 
@@ -395,7 +472,7 @@ amount = row["right_amount"]     # From right table (prefixed!)
 ## Future Enhancements
 
 Potential additions:
-- [ ] GroupBy/Aggregation support
+- [x] ~~GroupBy/Aggregation support~~ ✅ **DONE!**
 - [ ] RIGHT and FULL OUTER joins
 - [ ] Multi-column joins
 - [ ] Persistence (save/load)

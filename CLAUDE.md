@@ -110,4 +110,18 @@ sorted_view = livetable.SortedView("by_score", table, [livetable.SortKey.descend
 
 # Joins
 joined = livetable.JoinView("result", table1, table2, "id", "ref_id", livetable.JoinType.LEFT)
+
+# Simple aggregations
+total = table.sum("score")
+avg = table.avg("score")
+min_val = table.min("score")
+max_val = table.max("score")
+count = table.count_non_null("score")
+
+# GROUP BY aggregations
+agg = livetable.AggregateView("by_name", table, ["name"], [
+    ("total", "score", livetable.AggregateFunction.SUM),
+    ("average", "score", livetable.AggregateFunction.AVG),
+])
+agg.sync()  # Incremental update after table changes
 ```
