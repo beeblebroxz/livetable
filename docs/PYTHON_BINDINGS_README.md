@@ -193,6 +193,59 @@ inner_joined = livetable.JoinView(
 )
 ```
 
+### ✅ Serialization (CSV/JSON)
+
+Export and import tables in CSV and JSON formats:
+
+```python
+# Create a table with some data
+schema = livetable.Schema([
+    ("id", livetable.ColumnType.INT32, False),
+    ("name", livetable.ColumnType.STRING, False),
+    ("score", livetable.ColumnType.FLOAT64, True),
+])
+table = livetable.Table("students", schema)
+table.append_row({"id": 1, "name": "Alice", "score": 95.5})
+table.append_row({"id": 2, "name": "Bob", "score": None})
+
+# Export to CSV string
+csv_string = table.to_csv()
+# Returns:
+# id,name,score
+# 1,Alice,95.5
+# 2,Bob,
+
+# Export to JSON string
+json_string = table.to_json()
+# Returns:
+# [
+#   {"id": 1, "name": "Alice", "score": 95.5},
+#   {"id": 2, "name": "Bob", "score": null}
+# ]
+
+# Import from CSV (types are auto-inferred)
+restored = livetable.Table.from_csv("restored", csv_string)
+
+# Import from JSON
+restored = livetable.Table.from_json("restored", json_string)
+
+# Save to file
+with open("data.csv", "w") as f:
+    f.write(table.to_csv())
+
+# Load from file
+with open("data.csv", "r") as f:
+    table = livetable.Table.from_csv("my_table", f.read())
+```
+
+**Type Inference for CSV:**
+- Empty values → NULL
+- Numbers fitting in i32 → INT32
+- Larger integers → INT64
+- Numbers with decimals → FLOAT64
+- "true"/"false" (case-insensitive) → BOOL
+- Everything else → STRING
+
 ## Supported Data Types
 
 | Python Type | LiveTable ColumnType | Rust Type |
@@ -252,6 +305,10 @@ Create a new table.
 - `min(column: str) -> float | None` - Minimum of numeric column
 - `max(column: str) -> float | None` - Maximum of numeric column
 - `count_non_null(column: str) -> int` - Count non-NULL values
+- `to_csv() -> str` - Export table to CSV string
+- `to_json() -> str` - Export table to JSON string
+- `Table.from_csv(name: str, csv: str) -> Table` - Import from CSV (static method)
+- `Table.from_json(name: str, json: str) -> Table` - Import from JSON (static method)
 
 ### FilterView
 
@@ -473,9 +530,9 @@ amount = row["right_amount"]     # From right table (prefixed!)
 
 Potential additions:
 - [x] ~~GroupBy/Aggregation support~~ ✅ **DONE!**
+- [x] ~~CSV/JSON Serialization~~ ✅ **DONE!**
 - [ ] RIGHT and FULL OUTER joins
 - [ ] Multi-column joins
-- [ ] Persistence (save/load)
 - [ ] Iterator protocol support
 - [ ] Pandas DataFrame interop
 

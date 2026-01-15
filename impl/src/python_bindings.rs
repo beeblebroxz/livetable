@@ -409,6 +409,79 @@ impl PyTable {
             .max(column)
             .map_err(|e| PyValueError::new_err(e))
     }
+
+    // === Serialization Methods ===
+
+    /// Export table to CSV string.
+    ///
+    /// Returns a CSV string with headers and data rows.
+    /// NULL values become empty strings.
+    /// Strings containing commas, quotes, or newlines are properly escaped.
+    ///
+    /// Example:
+    ///     csv_str = table.to_csv()
+    ///     with open("data.csv", "w") as f:
+    ///         f.write(csv_str)
+    fn to_csv(&self) -> String {
+        self.inner.borrow().to_csv()
+    }
+
+    /// Export table to JSON string (array of objects).
+    ///
+    /// Returns a pretty-printed JSON string representing the table as an array
+    /// of objects, where each object is a row with column names as keys.
+    ///
+    /// Example:
+    ///     json_str = table.to_json()
+    ///     with open("data.json", "w") as f:
+    ///         f.write(json_str)
+    fn to_json(&self) -> PyResult<String> {
+        self.inner.borrow()
+            .to_json()
+            .map_err(|e| PyValueError::new_err(e))
+    }
+
+    /// Create a table from a CSV string.
+    ///
+    /// The first line is treated as the header row containing column names.
+    /// Column types are inferred from the first data row:
+    /// - Numbers that fit in i32 → INT32
+    /// - Larger integers → INT64
+    /// - Numbers with decimals → FLOAT64
+    /// - "true"/"false" (case-insensitive) → BOOL
+    /// - Everything else → STRING
+    ///
+    /// All columns are created as nullable.
+    ///
+    /// Example:
+    ///     with open("data.csv", "r") as f:
+    ///         table = livetable.Table.from_csv("my_table", f.read())
+    #[staticmethod]
+    fn from_csv(name: &str, csv: &str) -> PyResult<Self> {
+        let table = RustTable::from_csv(name, csv)
+            .map_err(|e| PyValueError::new_err(e))?;
+        Ok(PyTable {
+            inner: Rc::new(RefCell::new(table)),
+        })
+    }
+
+    /// Create a table from a JSON string (array of objects).
+    ///
+    /// Expects a JSON array where each element is an object representing a row.
+    /// Column types are inferred from the first object.
+    /// All columns are created as nullable.
+    ///
+    /// Example:
+    ///     with open("data.json", "r") as f:
+    ///         table = livetable.Table.from_json("my_table", f.read())
+    #[staticmethod]
+    fn from_json(name: &str, json: &str) -> PyResult<Self> {
+        let table = RustTable::from_json(name, json)
+            .map_err(|e| PyValueError::new_err(e))?;
+        Ok(PyTable {
+            inner: Rc::new(RefCell::new(table)),
+        })
+    }
 }
 
 impl Clone for PyTable {

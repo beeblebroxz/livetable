@@ -142,4 +142,12 @@ agg = livetable.AggregateView("by_name", table, ["name"], [
     ("average", "score", livetable.AggregateFunction.AVG),
 ])
 agg.sync()  # Incremental update after table changes
+
+# Serialization - export
+csv_string = table.to_csv()
+json_string = table.to_json()
+
+# Serialization - import (types are auto-inferred)
+table_from_csv = livetable.Table.from_csv("imported", csv_string)
+table_from_json = livetable.Table.from_json("imported", json_string)
 ```

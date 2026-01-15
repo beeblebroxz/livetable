@@ -76,6 +76,12 @@ livetable/
 - Incremental updates - aggregates update efficiently on table changes
 - Multiple aggregations per view
 
+### Serialization
+- Export tables to CSV and JSON formats
+- Import tables from CSV and JSON strings
+- Automatic type inference on import
+- Proper handling of NULL values and special characters
+
 ### Data Types
 - INT32, INT64
 - FLOAT32, FLOAT64
@@ -170,6 +176,18 @@ agg = livetable.AggregateView(
 )
 for i in range(len(agg)):
     print(agg.get_row(i))  # {"age": 20, "total_score": 95.5, ...}
+
+# Export to CSV/JSON
+csv_string = table.to_csv()
+json_string = table.to_json()
+
+# Import from CSV/JSON
+from_csv = livetable.Table.from_csv("imported", csv_string)
+from_json = livetable.Table.from_json("imported", json_string)
+
+# Save to file
+with open("data.csv", "w") as f:
+    f.write(table.to_csv())
 ```
 
 ## Building
