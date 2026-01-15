@@ -17,8 +17,11 @@ pub trait Sequence<T: Clone> {
         self.len() == 0
     }
 
-    /// Get value at index (0-based)
+    /// Get value at index (0-based) - clones the value
     fn get(&self, index: usize) -> Result<T, String>;
+
+    /// Get reference to value at index (0-based) - no clone
+    fn get_ref(&self, index: usize) -> Option<&T>;
 
     /// Set value at index
     fn set(&mut self, index: usize, value: T) -> Result<(), String>;
@@ -73,6 +76,10 @@ impl<T: Clone + Debug> Sequence<T> for ArraySequence<T> {
             .get(index)
             .cloned()
             .ok_or_else(|| format!("Index {} out of range [0, {})", index, self.data.len()))
+    }
+
+    fn get_ref(&self, index: usize) -> Option<&T> {
+        self.data.get(index)
     }
 
     fn set(&mut self, index: usize, value: T) -> Result<(), String> {
@@ -203,6 +210,15 @@ impl<T: Clone + Debug> Sequence<T> for TieredVectorSequence<T> {
 
         let (chunk_idx, offset) = self.get_chunk_and_offset(index)?;
         Ok(self.chunks[chunk_idx][offset].clone())
+    }
+
+    fn get_ref(&self, index: usize) -> Option<&T> {
+        if self.size == 0 || index >= self.size {
+            return None;
+        }
+        self.get_chunk_and_offset(index)
+            .ok()
+            .map(|(chunk_idx, offset)| &self.chunks[chunk_idx][offset])
     }
 
     fn set(&mut self, index: usize, value: T) -> Result<(), String> {

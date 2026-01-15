@@ -194,17 +194,17 @@ print("""
 ┌─────────────────┬──────────────┬───────────────────────────────────────────┐
 │ Operation       │ Current Gap  │ Status / Notes                            │
 ├─────────────────┼──────────────┼───────────────────────────────────────────┤
-│ Join            │ ~36x slower  │ OPTIMIZED: direct column access (was 100x)│
+│ Join            │ ~32x slower  │ OPTIMIZED: direct column access (was 100x)│
 │ Group By        │ ~16x slower  │ OPTIMIZED: int fast path + lazy maps      │
 │ Sort            │ ~1.8x slower │ OPTIMIZED: pre-extract values (was 8x)    │
-│ Aggregation     │ ~8x slower   │ Clone per value → needs get_f64_unchecked │
+│ Aggregation     │ ~2.6x slower │ OPTIMIZED: get_f64() fast path (was 8x)   │
 │ Filter (lambda) │ ~70x slower  │ Python callbacks (expected, unavoidable)  │
 │ Filter (expr)   │ ~5x slower   │ SIMD gap (true architectural limit)       │
 └─────────────────┴──────────────┴───────────────────────────────────────────┘
 
 REMAINING OPTIMIZATION OPPORTUNITIES:
-1. Join - 36x gap: String key allocation overhead (harder to optimize)
+1. Join - 32x gap: String key allocation overhead (harder to optimize)
 2. Group By - 16x gap: Similar string allocation overhead
-3. Aggregation - 8x gap: Needs typed column access (MEDIUM VALUE)
-4. Filter (expr) - 5x gap: SIMD/vectorization (true limit)
+3. Filter (expr) - 5x gap: SIMD/vectorization (true limit)
+4. Aggregation - 2.6x gap: Further optimization would need SIMD
 """)

@@ -248,6 +248,43 @@ impl Column {
         self.sequence.get(index)
     }
 
+    /// Fast numeric access - returns the value as f64 without cloning ColumnValue.
+    /// Returns None if the value is null, not a numeric type, or index out of bounds.
+    /// This is optimized for aggregation operations.
+    #[inline]
+    pub fn get_f64(&self, index: usize) -> Option<f64> {
+        // Check null flag first (fast path)
+        if self.nullable {
+            if let Some(ref null_flags) = self.null_flags {
+                if null_flags.get_ref(index).copied() == Some(true) {
+                    return None;
+                }
+            }
+        }
+
+        // Get reference to the value without cloning
+        self.sequence.get_ref(index).and_then(|v| match v {
+            ColumnValue::Int32(n) => Some(*n as f64),
+            ColumnValue::Int64(n) => Some(*n as f64),
+            ColumnValue::Float32(f) => Some(*f as f64),
+            ColumnValue::Float64(f) => Some(*f),
+            _ => None, // Not numeric (String, Bool, Null)
+        })
+    }
+
+    /// Check if a value at index is null (fast path without cloning).
+    #[inline]
+    pub fn is_null_at(&self, index: usize) -> bool {
+        if !self.nullable {
+            return false;
+        }
+        if let Some(ref null_flags) = self.null_flags {
+            null_flags.get_ref(index).copied() == Some(true)
+        } else {
+            false
+        }
+    }
+
     pub fn set(&mut self, index: usize, value: ColumnValue) -> Result<(), String> {
         let value = self.validate_value(value)?;
 

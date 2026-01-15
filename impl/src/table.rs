@@ -499,18 +499,6 @@ impl Table {
     // Aggregation Methods
     // ========================================================================
 
-    /// Extract numeric value from ColumnValue, converting to f64
-    fn extract_numeric(value: &ColumnValue) -> Option<f64> {
-        match value {
-            ColumnValue::Int32(v) => Some(*v as f64),
-            ColumnValue::Int64(v) => Some(*v as f64),
-            ColumnValue::Float32(v) => Some(*v as f64),
-            ColumnValue::Float64(v) => Some(*v),
-            ColumnValue::Null => None,
-            _ => None, // String, Bool not numeric
-        }
-    }
-
     /// Calculate the sum of all numeric values in a column.
     /// NULL values are skipped.
     pub fn sum(&self, column: &str) -> Result<f64, String> {
@@ -518,12 +506,11 @@ impl Table {
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
+        let col = &self.columns[col_idx];
         let mut total = 0.0;
         for i in 0..self.row_count {
-            if let Ok(value) = self.columns[col_idx].get(i) {
-                if let Some(num) = Self::extract_numeric(&value) {
-                    total += num;
-                }
+            if let Some(num) = col.get_f64(i) {
+                total += num;
             }
         }
         Ok(total)
@@ -535,12 +522,11 @@ impl Table {
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
+        let col = &self.columns[col_idx];
         let mut count = 0;
         for i in 0..self.row_count {
-            if let Ok(value) = self.columns[col_idx].get(i) {
-                if !value.is_null() {
-                    count += 1;
-                }
+            if !col.is_null_at(i) {
+                count += 1;
             }
         }
         Ok(count)
@@ -553,14 +539,13 @@ impl Table {
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
+        let col = &self.columns[col_idx];
         let mut sum = 0.0;
         let mut count = 0;
         for i in 0..self.row_count {
-            if let Ok(value) = self.columns[col_idx].get(i) {
-                if let Some(num) = Self::extract_numeric(&value) {
-                    sum += num;
-                    count += 1;
-                }
+            if let Some(num) = col.get_f64(i) {
+                sum += num;
+                count += 1;
             }
         }
 
@@ -578,12 +563,11 @@ impl Table {
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
+        let col = &self.columns[col_idx];
         let mut min_val: Option<f64> = None;
         for i in 0..self.row_count {
-            if let Ok(value) = self.columns[col_idx].get(i) {
-                if let Some(num) = Self::extract_numeric(&value) {
-                    min_val = Some(min_val.map_or(num, |m| m.min(num)));
-                }
+            if let Some(num) = col.get_f64(i) {
+                min_val = Some(min_val.map_or(num, |m| m.min(num)));
             }
         }
         Ok(min_val)
@@ -596,12 +580,11 @@ impl Table {
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
+        let col = &self.columns[col_idx];
         let mut max_val: Option<f64> = None;
         for i in 0..self.row_count {
-            if let Ok(value) = self.columns[col_idx].get(i) {
-                if let Some(num) = Self::extract_numeric(&value) {
-                    max_val = Some(max_val.map_or(num, |m| m.max(num)));
-                }
+            if let Some(num) = col.get_f64(i) {
+                max_val = Some(max_val.map_or(num, |m| m.max(num)));
             }
         }
         Ok(max_val)
