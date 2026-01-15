@@ -468,6 +468,67 @@ fn compare_ord<T: PartialOrd>(a: T, b: T, op: &CompareOp) -> bool {
     }
 }
 
+// ============================================================================
+// Fast evaluation (zero-allocation) using direct column access
+// ============================================================================
+
+/// Evaluate an expression using a column lookup function.
+/// This avoids allocating a HashMap per row - the lookup function
+/// directly accesses column data.
+pub fn eval_expr_fast<F>(expr: &Expr, get_column: &F) -> bool
+where
+    F: Fn(&str) -> Option<ColumnValue>,
+{
+    match expr {
+        Expr::Compare { column, op, value } => {
+            match get_column(column) {
+                None => false,
+                Some(col_val) => compare_values(&col_val, op, value),
+            }
+        }
+        Expr::IsNull { column } => {
+            matches!(get_column(column), Some(ColumnValue::Null) | None)
+        }
+        Expr::IsNotNull { column } => {
+            match get_column(column) {
+                Some(ColumnValue::Null) | None => false,
+                Some(_) => true,
+            }
+        }
+        Expr::And(left, right) => {
+            eval_expr_fast(left, get_column) && eval_expr_fast(right, get_column)
+        }
+        Expr::Or(left, right) => {
+            eval_expr_fast(left, get_column) || eval_expr_fast(right, get_column)
+        }
+        Expr::Not(inner) => {
+            !eval_expr_fast(inner, get_column)
+        }
+    }
+}
+
+/// Extract all column names referenced in an expression.
+pub fn extract_columns(expr: &Expr) -> Vec<String> {
+    let mut columns = Vec::new();
+    extract_columns_recursive(expr, &mut columns);
+    columns.sort();
+    columns.dedup();
+    columns
+}
+
+fn extract_columns_recursive(expr: &Expr, columns: &mut Vec<String>) {
+    match expr {
+        Expr::Compare { column, .. } => columns.push(column.clone()),
+        Expr::IsNull { column } => columns.push(column.clone()),
+        Expr::IsNotNull { column } => columns.push(column.clone()),
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            extract_columns_recursive(left, columns);
+            extract_columns_recursive(right, columns);
+        }
+        Expr::Not(inner) => extract_columns_recursive(inner, columns),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

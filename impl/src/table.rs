@@ -884,12 +884,27 @@ impl Table {
     pub fn filter_expr(&self, expression: &str) -> Result<Vec<usize>, String> {
         let expr = crate::expr::parse_expr(expression)?;
 
+        // Pre-compute column indices for columns used in the expression
+        let expr_columns = crate::expr::extract_columns(&expr);
+        let column_indices: std::collections::HashMap<String, usize> = expr_columns
+            .iter()
+            .filter_map(|name| {
+                self.schema.get_column_index(name).map(|idx| (name.clone(), idx))
+            })
+            .collect();
+
         let mut matching_indices = Vec::new();
-        for i in 0..self.row_count {
-            if let Ok(row) = self.get_row(i) {
-                if crate::expr::eval_expr(&expr, &row) {
-                    matching_indices.push(i);
-                }
+
+        for row_idx in 0..self.row_count {
+            // Use eval_expr_fast with a closure that directly accesses columns
+            let matches = crate::expr::eval_expr_fast(&expr, &|col_name: &str| {
+                column_indices.get(col_name).and_then(|&col_idx| {
+                    self.columns.get(col_idx).and_then(|col| col.get(row_idx).ok())
+                })
+            });
+
+            if matches {
+                matching_indices.push(row_idx);
             }
         }
 
