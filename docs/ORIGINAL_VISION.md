@@ -201,9 +201,9 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 - [ ] Multi-column joins
 - [ ] Date/Time column types
 - [ ] Materialized Views (cached for faster reads)
-- [ ] Bulk/Batch operations for efficiency
+- [x] Bulk/Batch operations (`append_rows`)
 - [x] Python iterator protocol (`for row in table`)
-- [ ] Pandas DataFrame interop
+- [x] Pandas DataFrame interop (`to_pandas`, `from_pandas`)
 
 ---
 

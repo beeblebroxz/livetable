@@ -281,6 +281,62 @@ for i, row in enumerate(table):
 - `SortedView`
 - `AggregateView`
 
+### ✅ Bulk Operations
+
+Insert multiple rows efficiently with a single call:
+
+```python
+# Insert many rows at once
+rows = [
+    {"id": 1, "name": "Alice", "score": 95.5},
+    {"id": 2, "name": "Bob", "score": 87.0},
+    {"id": 3, "name": "Charlie", "score": 92.0},
+]
+count = table.append_rows(rows)  # Returns number of rows inserted
+
+# Much more efficient than calling append_row() in a loop
+# Especially for large datasets (1000+ rows)
+```
+
+**Benefits:**
+- Reduces Python-Rust boundary crossings from N to 1
+- Better memory allocation patterns
+- Validates all rows before inserting (atomic operation)
+
+### ✅ Pandas DataFrame Interop
+
+Convert between LiveTable and pandas DataFrames:
+
+```python
+import pandas as pd
+import livetable
+
+# Table → DataFrame
+df = table.to_pandas()
+print(df.describe())  # Use any pandas operations
+
+# DataFrame → Table
+df = pd.DataFrame({
+    "id": [1, 2, 3],
+    "name": ["Alice", "Bob", "Charlie"],
+    "score": [95.5, 87.0, 92.0],
+})
+table = livetable.Table.from_pandas("students", df)
+
+# Round-trip preserves data
+df_copy = table.to_pandas()
+table_copy = livetable.Table.from_pandas("copy", df_copy)
+```
+
+**Type mapping:**
+- pandas `int64` → `INT64`
+- pandas `float64` → `FLOAT64`
+- pandas `object`/`string` → `STRING`
+- pandas `bool` → `BOOL`
+- pandas `NaN`/`None` → `NULL`
+
+**Note:** Requires pandas to be installed (`pip install pandas`).
+
 ## Supported Data Types
 
 | Python Type | LiveTable ColumnType | Rust Type |
@@ -326,6 +382,7 @@ Create a new table.
 - `name()` - Get table name
 - `column_names()` - Get list of column names
 - `append_row(row: dict)` - Add row at end
+- `append_rows(rows: list[dict]) -> int` - Add multiple rows at once (bulk insert)
 - `insert_row(index: int, row: dict)` - Insert row at position
 - `delete_row(index: int)` - Remove row
 - `get_value(row: int, column: str)` - Get single value
@@ -342,8 +399,10 @@ Create a new table.
 - `count_non_null(column: str) -> int` - Count non-NULL values
 - `to_csv() -> str` - Export table to CSV string
 - `to_json() -> str` - Export table to JSON string
+- `to_pandas() -> pandas.DataFrame` - Export table to pandas DataFrame
 - `Table.from_csv(name: str, csv: str) -> Table` - Import from CSV (static method)
 - `Table.from_json(name: str, json: str) -> Table` - Import from JSON (static method)
+- `Table.from_pandas(name: str, df: pandas.DataFrame) -> Table` - Import from DataFrame (static method)
 
 ### FilterView
 
@@ -567,9 +626,10 @@ Potential additions:
 - [x] ~~GroupBy/Aggregation support~~ ✅ **DONE!**
 - [x] ~~CSV/JSON Serialization~~ ✅ **DONE!**
 - [x] ~~Iterator protocol support~~ ✅ **DONE!**
+- [x] ~~Pandas DataFrame interop~~ ✅ **DONE!**
+- [x] ~~Bulk operations (append_rows)~~ ✅ **DONE!**
 - [ ] RIGHT and FULL OUTER joins
 - [ ] Multi-column joins
-- [ ] Pandas DataFrame interop
 
 ## Contributing
 

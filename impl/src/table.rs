@@ -292,6 +292,98 @@ impl Table {
         Ok(())
     }
 
+    /// Append multiple rows at once (bulk insert).
+    ///
+    /// This is more efficient than calling `append_row` repeatedly because:
+    /// 1. Validation is done once for the column structure
+    /// 2. Reduces function call overhead
+    /// 3. Better memory allocation patterns
+    ///
+    /// # Arguments
+    ///
+    /// * `rows` - Vector of row data as HashMaps
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(count)` - Number of rows successfully inserted
+    /// * `Err(message)` - Error if any row is invalid (no rows inserted on error)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use livetable::{Table, Schema, ColumnType, ColumnValue};
+    /// use std::collections::HashMap;
+    ///
+    /// let schema = Schema::new(vec![
+    ///     ("id".to_string(), ColumnType::Int32, false),
+    ///     ("name".to_string(), ColumnType::String, false),
+    /// ]);
+    /// let mut table = Table::new("users".to_string(), schema);
+    ///
+    /// let rows = vec![
+    ///     {
+    ///         let mut r = HashMap::new();
+    ///         r.insert("id".to_string(), ColumnValue::Int32(1));
+    ///         r.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
+    ///         r
+    ///     },
+    ///     {
+    ///         let mut r = HashMap::new();
+    ///         r.insert("id".to_string(), ColumnValue::Int32(2));
+    ///         r.insert("name".to_string(), ColumnValue::String("Bob".to_string()));
+    ///         r
+    ///     },
+    /// ];
+    ///
+    /// let count = table.append_rows(rows).unwrap();
+    /// assert_eq!(count, 2);
+    /// assert_eq!(table.len(), 2);
+    /// ```
+    pub fn append_rows(&mut self, rows: Vec<HashMap<String, ColumnValue>>) -> Result<usize, String> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let col_names: Vec<&str> = self.schema.get_column_names();
+
+        // Validate all rows first (before inserting any)
+        for (row_idx, row) in rows.iter().enumerate() {
+            for col_name in &col_names {
+                if !row.contains_key(*col_name) {
+                    return Err(format!(
+                        "Row {}: Missing value for column '{}'",
+                        row_idx, col_name
+                    ));
+                }
+            }
+        }
+
+        let start_index = self.row_count;
+        let num_rows = rows.len();
+
+        // Insert all rows
+        for (row_offset, row) in rows.into_iter().enumerate() {
+            let insert_index = start_index + row_offset;
+
+            // Append to each column
+            for (i, col) in self.columns.iter_mut().enumerate() {
+                let col_name = col_names[i];
+                let value = row.get(col_name).unwrap().clone();
+                col.append(value);
+            }
+
+            self.row_count += 1;
+
+            // Record the change
+            self.changeset.push(TableChange::RowInserted {
+                index: insert_index,
+                data: row,
+            });
+        }
+
+        Ok(num_rows)
+    }
+
     pub fn insert_row(&mut self, index: usize, row: HashMap<String, ColumnValue>) -> Result<(), String> {
         if index > self.row_count {
             return Err(format!("Index {} out of range [0, {}]", index, self.row_count));

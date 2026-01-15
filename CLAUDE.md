@@ -175,4 +175,16 @@ for row in table:
 # Use with comprehensions and built-ins
 names = [row["name"] for row in filtered]
 total = sum(row["score"] for row in table)
+
+# Bulk operations - insert many rows efficiently
+rows = [
+    {"id": 1, "name": "Alice", "score": 95.5},
+    {"id": 2, "name": "Bob", "score": 87.0},
+]
+count = table.append_rows(rows)  # Returns number inserted
+
+# Pandas interop
+import pandas as pd
+df = table.to_pandas()  # Table → DataFrame
+table = livetable.Table.from_pandas("name", df)  # DataFrame → Table
 ```

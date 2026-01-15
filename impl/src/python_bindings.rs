@@ -5,7 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError, PyIndexError, PyKeyError};
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -119,6 +119,108 @@ fn column_value_to_py(py: Python, value: &RustColumnValue) -> PyResult<PyObject>
         RustColumnValue::Bool(v) => Ok(v.to_object(py)),
         RustColumnValue::Null => Ok(py.None()),
     }
+}
+
+/// Convert pandas dtype string to ColumnType
+fn dtype_str_to_column_type(dtype_str: &str) -> RustColumnType {
+    match dtype_str {
+        "int32" => RustColumnType::Int32,
+        "int64" | "Int64" => RustColumnType::Int64,
+        "float32" => RustColumnType::Float32,
+        "float64" => RustColumnType::Float64,
+        "bool" | "boolean" => RustColumnType::Bool,
+        _ => RustColumnType::String, // Default for object, string, etc.
+    }
+}
+
+/// Convert pandas value to ColumnValue, handling NaN and special types
+fn pandas_value_to_column_value(py: Python, value: &Bound<'_, PyAny>, expected_type: RustColumnType) -> PyResult<RustColumnValue> {
+    // Check for pandas NA/NaN/None
+    if value.is_none() {
+        return Ok(RustColumnValue::Null);
+    }
+
+    // Check for pandas NaT (Not a Time) or numpy NaN
+    let is_na = || -> bool {
+        // Try to call pandas.isna() on the value
+        if let Ok(pandas) = py.import_bound("pandas") {
+            if let Ok(is_na_fn) = pandas.getattr("isna") {
+                if let Ok(result) = is_na_fn.call1((value,)) {
+                    if let Ok(is_null) = result.extract::<bool>() {
+                        return is_null;
+                    }
+                }
+            }
+        }
+        false
+    };
+
+    if is_na() {
+        return Ok(RustColumnValue::Null);
+    }
+
+    // Convert based on expected type to ensure type consistency
+    match expected_type {
+        RustColumnType::Bool => {
+            if let Ok(v) = value.extract::<bool>() {
+                return Ok(RustColumnValue::Bool(v));
+            }
+        }
+        RustColumnType::Int32 => {
+            if let Ok(v) = value.extract::<i32>() {
+                return Ok(RustColumnValue::Int32(v));
+            }
+            // Allow i64 to be converted if it fits
+            if let Ok(v) = value.extract::<i64>() {
+                if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+                    return Ok(RustColumnValue::Int32(v as i32));
+                }
+            }
+        }
+        RustColumnType::Int64 => {
+            if let Ok(v) = value.extract::<i64>() {
+                return Ok(RustColumnValue::Int64(v));
+            }
+        }
+        RustColumnType::Float32 => {
+            if let Ok(v) = value.extract::<f32>() {
+                if v.is_nan() {
+                    return Ok(RustColumnValue::Null);
+                }
+                return Ok(RustColumnValue::Float32(v));
+            }
+            if let Ok(v) = value.extract::<f64>() {
+                if v.is_nan() {
+                    return Ok(RustColumnValue::Null);
+                }
+                return Ok(RustColumnValue::Float32(v as f32));
+            }
+        }
+        RustColumnType::Float64 => {
+            if let Ok(v) = value.extract::<f64>() {
+                if v.is_nan() {
+                    return Ok(RustColumnValue::Null);
+                }
+                return Ok(RustColumnValue::Float64(v));
+            }
+        }
+        RustColumnType::String => {
+            if let Ok(v) = value.extract::<String>() {
+                return Ok(RustColumnValue::String(v));
+            }
+            // Last resort: convert to string representation
+            if let Ok(v) = value.str() {
+                if let Ok(s) = v.extract::<String>() {
+                    return Ok(RustColumnValue::String(s));
+                }
+            }
+        }
+    }
+
+    Err(PyValueError::new_err(format!(
+        "Cannot convert pandas value to {:?}",
+        expected_type
+    )))
 }
 
 // ============================================================================
@@ -238,6 +340,46 @@ impl PyTable {
 
         self.inner.borrow_mut()
             .append_row(rust_row)
+            .map_err(|e| PyValueError::new_err(e))
+    }
+
+    /// Append multiple rows at once (bulk insert).
+    ///
+    /// This is more efficient than calling `append_row` repeatedly.
+    ///
+    /// Args:
+    ///     rows: A list of dictionaries, where each dict represents a row
+    ///
+    /// Returns:
+    ///     The number of rows successfully inserted
+    ///
+    /// Raises:
+    ///     ValueError: If any row is invalid (no rows are inserted on error)
+    ///
+    /// Example:
+    ///     count = table.append_rows([
+    ///         {"id": 1, "name": "Alice"},
+    ///         {"id": 2, "name": "Bob"},
+    ///         {"id": 3, "name": "Charlie"},
+    ///     ])
+    fn append_rows(&mut self, py: Python, rows: &Bound<'_, PyList>) -> PyResult<usize> {
+        let mut rust_rows = Vec::with_capacity(rows.len());
+
+        for item in rows.iter() {
+            let row_dict = item.downcast::<PyDict>()
+                .map_err(|_| PyValueError::new_err("Each row must be a dictionary"))?;
+
+            let mut rust_row = HashMap::new();
+            for (key, value) in row_dict.iter() {
+                let key_str: String = key.extract()?;
+                let col_value = py_to_column_value(py, &value)?;
+                rust_row.insert(key_str, col_value);
+            }
+            rust_rows.push(rust_row);
+        }
+
+        self.inner.borrow_mut()
+            .append_rows(rust_rows)
             .map_err(|e| PyValueError::new_err(e))
     }
 
@@ -478,6 +620,121 @@ impl PyTable {
     fn from_json(name: &str, json: &str) -> PyResult<Self> {
         let table = RustTable::from_json(name, json)
             .map_err(|e| PyValueError::new_err(e))?;
+        Ok(PyTable {
+            inner: Rc::new(RefCell::new(table)),
+        })
+    }
+
+    // === Pandas Interop Methods ===
+
+    /// Convert table to a pandas DataFrame.
+    ///
+    /// Requires pandas to be installed. If pandas is not available,
+    /// raises ImportError.
+    ///
+    /// Returns:
+    ///     A pandas DataFrame containing all table data
+    ///
+    /// Example:
+    ///     df = table.to_pandas()
+    ///     print(df.describe())
+    fn to_pandas(&self, py: Python) -> PyResult<PyObject> {
+        // Import pandas
+        let pandas = py.import_bound("pandas")
+            .map_err(|_| PyValueError::new_err(
+                "pandas is not installed. Install with: pip install pandas"
+            ))?;
+
+        let table = self.inner.borrow();
+        let column_names = table.schema().get_column_names();
+
+        // Build column data as Python lists
+        let data_dict = PyDict::new_bound(py);
+
+        for col_name in &column_names {
+            let mut values: Vec<PyObject> = Vec::with_capacity(table.len());
+
+            for row_idx in 0..table.len() {
+                let value = table.get_value(row_idx, col_name)
+                    .map_err(|e| PyValueError::new_err(e))?;
+                values.push(column_value_to_py(py, &value)?);
+            }
+
+            let py_list = PyList::new_bound(py, values);
+            data_dict.set_item(*col_name, py_list)?;
+        }
+
+        // Create DataFrame
+        let df = pandas.call_method1("DataFrame", (data_dict,))?;
+        Ok(df.to_object(py))
+    }
+
+    /// Create a table from a pandas DataFrame.
+    ///
+    /// Column types are inferred from DataFrame dtypes:
+    /// - int32, int64 → INT32, INT64
+    /// - float32, float64 → FLOAT32, FLOAT64
+    /// - bool → BOOL
+    /// - object, string → STRING
+    ///
+    /// All columns are created as nullable to handle NaN values.
+    ///
+    /// Args:
+    ///     name: Name for the new table
+    ///     df: A pandas DataFrame
+    ///
+    /// Returns:
+    ///     A new Table containing the DataFrame data
+    ///
+    /// Example:
+    ///     import pandas as pd
+    ///     df = pd.DataFrame({"id": [1, 2], "name": ["Alice", "Bob"]})
+    ///     table = livetable.Table.from_pandas("users", df)
+    #[staticmethod]
+    fn from_pandas(py: Python, name: &str, df: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // Get column names
+        let columns = df.getattr("columns")?;
+        let column_list: Vec<String> = columns.call_method0("tolist")?.extract()?;
+
+        if column_list.is_empty() {
+            return Err(PyValueError::new_err("DataFrame has no columns"));
+        }
+
+        // Get dtypes and build schema
+        let dtypes = df.getattr("dtypes")?;
+        let mut schema_cols = Vec::new();
+        let mut col_types = Vec::new();
+
+        for col_name in &column_list {
+            let dtype = dtypes.get_item(col_name.as_str())?;
+            let dtype_str: String = dtype.str()?.extract()?;
+
+            let col_type = dtype_str_to_column_type(&dtype_str);
+            col_types.push(col_type);
+            schema_cols.push((col_name.clone(), col_type, true)); // All nullable
+        }
+
+        let schema = RustSchema::new(schema_cols);
+        let mut table = RustTable::new(name.to_string(), schema);
+
+        // Iterate over rows using itertuples for efficiency
+        let itertuples = df.call_method1("itertuples", (false,))?;
+
+        for row_tuple in itertuples.iter()? {
+            let row_tuple = row_tuple?;
+            let mut rust_row = HashMap::new();
+
+            for (i, col_name) in column_list.iter().enumerate() {
+                let value = row_tuple.get_item(i)?;
+                let expected_type = col_types[i];
+                let col_value = pandas_value_to_column_value(py, &value, expected_type)?;
+                rust_row.insert(col_name.clone(), col_value);
+            }
+
+            table.append_row(rust_row)
+                .map_err(|e| PyValueError::new_err(e))?;
+        }
+
         Ok(PyTable {
             inner: Rc::new(RefCell::new(table)),
         })
