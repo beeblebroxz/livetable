@@ -6,6 +6,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 LiveTable is a high-performance columnar table system written in Rust with Python bindings via PyO3. It provides 10-100x faster operations compared to pure Python implementations through zero-copy views and lazy evaluation.
 
+## Documentation Maintenance
+
+**IMPORTANT**: When adding new features or making API changes, always update:
+
+1. **README.md** - Features list and Example section
+2. **CLAUDE.md** - Python API Usage section (this file)
+3. **docs/PYTHON_BINDINGS_README.md** - Full API reference and examples
+
+**Checklist for new features:**
+- [ ] Add to README.md Features section
+- [ ] Add example code to README.md Example section
+- [ ] Add to CLAUDE.md Python API Usage
+- [ ] Add full documentation to docs/PYTHON_BINDINGS_README.md
+- [ ] Add API reference (constructor, methods, parameters)
+- [ ] Update Future Enhancements if applicable
+- [ ] Add Python tests in tests/python/
+
+
 ## Build Commands
 
 ```bash
