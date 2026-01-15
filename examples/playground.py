@@ -86,7 +86,7 @@ print("=" * 70)
 
 # Example 1: Basic querying
 print("\n--- Example 1: Basic Querying ---")
-print("First user:", users.get_row(0))
+print("First user:", users[0])
 print("Bob's email:", users.get_value(1, "email"))
 print("Charlie's age (should be None):", users.get_value(2, "age"))
 
@@ -103,21 +103,21 @@ print("\n--- Example 3: Filter Views ---")
 active_users = users.filter(lambda row: row["active"])
 print(f"Active users: {len(active_users)}")
 for i in range(len(active_users)):
-    row = active_users.get_row(i)
+    row = active_users[i]
     print(f"  - {row['name']} (score: {row['score']})")
 
 # Filter: High scorers (score >= 90)
 high_scorers = users.filter(lambda row: row["score"] >= 90)
 print(f"\nHigh scorers (>= 90): {len(high_scorers)}")
 for i in range(len(high_scorers)):
-    row = high_scorers.get_row(i)
+    row = high_scorers[i]
     print(f"  - {row['name']}: {row['score']}")
 
 # Filter: Users with known age >= 30
 mature_users = users.filter(lambda row: row.get("age") is not None and row["age"] >= 30)
 print(f"\nUsers aged 30+: {len(mature_users)}")
 for i in range(len(mature_users)):
-    row = mature_users.get_row(i)
+    row = mature_users[i]
     print(f"  - {row['name']}: {row['age']}")
 
 # Example 4: Projection views
@@ -126,7 +126,7 @@ print("\n--- Example 4: Projection Views ---")
 # Select only public columns
 public_view = users.select(["id", "name", "score"])
 print(f"Public view columns: {public_view.column_names()}")
-print("First row:", public_view.get_row(0))
+print("First row:", public_view[0])
 
 # Example 5: Computed columns
 print("\n--- Example 5: Computed Columns ---")
@@ -141,7 +141,7 @@ with_grade = users.add_computed_column(
 
 print("Users with grades:")
 for i in range(len(with_grade)):
-    row = with_grade.get_row(i)
+    row = with_grade[i]
     print(f"  {row['name']}: {row['score']} → {row['grade']}")
 
 # Add age group column
@@ -154,7 +154,7 @@ with_age_group = users.add_computed_column(
 
 print("\nUsers with age groups:")
 for i in range(len(with_age_group)):
-    row = with_age_group.get_row(i)
+    row = with_age_group[i]
     age_str = str(row['age']) if row['age'] is not None else "Unknown"
     print(f"  {row['name']}: age {age_str} → {row['age_group']}")
 
@@ -192,7 +192,7 @@ user_orders_left = livetable.JoinView(
 
 print(f"\nLEFT JOIN (all users): {len(user_orders_left)} rows")
 for i in range(len(user_orders_left)):
-    row = user_orders_left.get_row(i)
+    row = user_orders_left[i]
     product = row.get('right_product')
     amount = row.get('right_amount')
     if product:
@@ -212,7 +212,7 @@ user_orders_inner = livetable.JoinView(
 
 print(f"\nINNER JOIN (users with orders only): {len(user_orders_inner)} rows")
 for i in range(len(user_orders_inner)):
-    row = user_orders_inner.get_row(i)
+    row = user_orders_inner[i]
     print(f"  {row['name']}: {row['right_product']} (${row['right_amount']:.2f})")
 
 # =============================================================================

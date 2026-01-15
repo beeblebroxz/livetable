@@ -47,7 +47,7 @@ print("\n🔍 Step 3: Query data")
 print("-" * 60)
 
 # Get a full row
-row = table.get_row(0)
+row = table[0]
 print(f"First row: {row}")
 
 # Get a specific value
@@ -80,7 +80,7 @@ high_scorers = table.filter(lambda row: row["score"] >= 90)
 print(f"Students with score >= 90: {len(high_scorers)}")
 
 for i in range(len(high_scorers)):
-    row = high_scorers.get_row(i)
+    row = high_scorers[i]
     print(f"  - {row['name']}: {row['score']}")
 
 # =============================================================================
@@ -92,7 +92,7 @@ print("-" * 60)
 # Create a view with only certain columns
 summary = table.select(["name", "score"])
 print(f"Summary columns: {summary.column_names()}")
-print(f"First row: {summary.get_row(0)}")
+print(f"First row: {summary[0]}")
 
 # =============================================================================
 # 7. COMPUTED COLUMNS
@@ -108,7 +108,7 @@ with_grade = table.add_computed_column(
 
 print("Students with grades:")
 for i in range(len(with_grade)):
-    row = with_grade.get_row(i)
+    row = with_grade[i]
     print(f"  {row['name']}: {row['score']} → {row['grade']}")
 
 # =============================================================================
@@ -140,7 +140,7 @@ joined = livetable.JoinView(
 
 print(f"Joined view has {len(joined)} rows:")
 for i in range(len(joined)):
-    row = joined.get_row(i)
+    row = joined[i]
     course = row.get('right_course', 'No enrollment')
     print(f"  {row['name']}: {course}")
 

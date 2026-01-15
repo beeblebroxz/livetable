@@ -32,7 +32,7 @@ print(f"   ✓ Added 4 rows. Table has {len(table)} rows")
 
 # Test 3: Reading Data
 print("\n3. Reading data from the table...")
-print(f"   First row: {table.get_row(0)}")
+print(f"   First row: {table[0]}")
 print(f"   Name of user 2: {table.get_value(1, 'name')}")
 print(f"   Age of user 3 (Charlie - should be None): {table.get_value(2, 'age')}")
 
@@ -52,7 +52,7 @@ try:
     adults = table.filter(lambda row: row.get("age") is not None and row["age"] >= 28)
     print(f"   ✓ Filtered view has {len(adults)} rows")
     for i in range(len(adults)):
-        row = adults.get_row(i)
+        row = adults[i]
         print(f"      - {row['name']}: age {row['age']}")
 except Exception as e:
     print(f"   ✗ Filter view error: {e}")
@@ -63,7 +63,7 @@ try:
     public_view = table.select(["id", "name"])
     print(f"   ✓ Projection has {len(public_view)} rows")
     print(f"   Columns in projection: {public_view.column_names()}")
-    print(f"   First row: {public_view.get_row(0)}")
+    print(f"   First row: {public_view[0]}")
 except Exception as e:
     print(f"   ✗ Projection view error: {e}")
 
@@ -77,7 +77,7 @@ try:
     print(f"   ✓ Computed view has {len(with_grade)} rows")
     print(f"   Columns: {with_grade.column_names()}")
     for i in range(len(with_grade)):
-        row = with_grade.get_row(i)
+        row = with_grade[i]
         print(f"      - {row['name']}: score {row['score']} → grade {row['grade']}")
 except Exception as e:
     print(f"   ✗ Computed view error: {e}")
@@ -110,7 +110,7 @@ try:
     print(f"   ✓ Created LEFT join view with {len(joined)} rows")
 
     for i in range(min(5, len(joined))):  # Show first 5
-        row = joined.get_row(i)
+        row = joined[i]
         amount = row.get('right_amount', 'no orders')
         print(f"      - {row['name']}: {amount}")
 

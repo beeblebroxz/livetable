@@ -20,7 +20,7 @@ table = livetable.Table("test", schema)
 table.append_row({"id": 1, "name": "Test"})
 
 print("Table created:", table)
-print("First row:", table.get_row(0))
+print("First row:", table[0])
 
 # Add your experiments below:
 # ----------------------------
