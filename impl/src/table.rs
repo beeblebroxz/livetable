@@ -98,6 +98,20 @@ impl Schema {
     pub fn get_column_info(&self, index: usize) -> Option<(&str, ColumnType, bool)> {
         self.columns.get(index).map(|(name, ty, nullable)| (name.as_str(), *ty, *nullable))
     }
+
+    /// Returns the type of a column by name, or None if not found.
+    pub fn get_column_type(&self, name: &str) -> Option<ColumnType> {
+        self.columns.iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, ty, _)| *ty)
+    }
+
+    /// Returns whether a column is nullable by name, or None if not found.
+    pub fn is_column_nullable(&self, name: &str) -> Option<bool> {
+        self.columns.iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, nullable)| *nullable)
+    }
 }
 
 /// Root table owning its data.
@@ -828,6 +842,58 @@ impl Table {
         }
 
         Ok(table)
+    }
+
+    // ========================================================================
+    // Expression-based Filtering
+    // ========================================================================
+
+    /// Filter rows using an expression string.
+    ///
+    /// This is faster than lambda-based filtering because the expression is
+    /// evaluated entirely in Rust without Python callbacks.
+    ///
+    /// # Supported syntax
+    ///
+    /// - Comparisons: `column > 90`, `name == 'Alice'`, `value != 0`
+    /// - Logical operators: `AND`, `OR`, `NOT`
+    /// - Parentheses: `(score > 90) AND (age >= 18)`
+    /// - NULL checks: `column IS NULL`, `column IS NOT NULL`
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use livetable::{Table, Schema, ColumnType, ColumnValue};
+    /// use std::collections::HashMap;
+    ///
+    /// let schema = Schema::new(vec![
+    ///     ("name".to_string(), ColumnType::String, false),
+    ///     ("score".to_string(), ColumnType::Float64, false),
+    /// ]);
+    /// let mut table = Table::new("test".to_string(), schema);
+    ///
+    /// let mut row = HashMap::new();
+    /// row.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
+    /// row.insert("score".to_string(), ColumnValue::Float64(95.0));
+    /// table.append_row(row).unwrap();
+    ///
+    /// let indices = table.filter_expr("score > 90").unwrap();
+    /// assert_eq!(indices.len(), 1);
+    /// assert_eq!(indices[0], 0);
+    /// ```
+    pub fn filter_expr(&self, expression: &str) -> Result<Vec<usize>, String> {
+        let expr = crate::expr::parse_expr(expression)?;
+
+        let mut matching_indices = Vec::new();
+        for i in 0..self.row_count {
+            if let Ok(row) = self.get_row(i) {
+                if crate::expr::eval_expr(&expr, &row) {
+                    matching_indices.push(i);
+                }
+            }
+        }
+
+        Ok(matching_indices)
     }
 }
 

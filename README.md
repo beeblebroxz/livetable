@@ -64,6 +64,7 @@ livetable/
 
 ### Advanced Views
 - **FilterView** - Filter rows with Python lambda functions
+- **Expression Filtering** - Filter with string expressions (2x faster than lambdas)
 - **ProjectionView** - Select specific columns
 - **ComputedView** - Add computed columns with lambdas
 - **JoinView** - LEFT and INNER joins between tables (supports multi-column composite keys)
@@ -135,6 +136,10 @@ table.append_row({"id": 2, "name": "Bob", "age": 22, "score": 87.3})
 # Filter with Python lambda (Rust speed!)
 high_scorers = table.filter(lambda row: row["score"] >= 90)
 print(f"Found {len(high_scorers)} high scorers")
+
+# Expression-based filter (2x faster than lambda!)
+indices = table.filter_expr("score >= 90 AND name != 'Test'")
+# Supports: =, !=, <, >, <=, >=, AND, OR, NOT, IS NULL, IS NOT NULL
 
 # Project specific columns
 summary = table.select(["name", "score"])

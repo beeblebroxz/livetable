@@ -108,6 +108,63 @@ fn py_to_column_value(_py: Python, value: &Bound<'_, PyAny>) -> PyResult<RustCol
     Err(PyValueError::new_err("Cannot convert value to ColumnValue"))
 }
 
+/// Convert Python value to ColumnValue using known column type (faster than guessing).
+/// This skips the type detection overhead by extracting directly based on expected type.
+fn py_to_column_value_typed(
+    value: &Bound<'_, PyAny>,
+    expected_type: RustColumnType,
+    nullable: bool,
+) -> PyResult<RustColumnValue> {
+    // Handle None/NULL
+    if value.is_none() {
+        if nullable {
+            return Ok(RustColumnValue::Null);
+        } else {
+            return Err(PyValueError::new_err("NULL value for non-nullable column"));
+        }
+    }
+
+    // Extract based on expected type - no guessing needed
+    match expected_type {
+        RustColumnType::Int32 => {
+            value.extract::<i32>()
+                .map(RustColumnValue::Int32)
+                .map_err(|_| PyValueError::new_err("Expected INT32 value"))
+        }
+        RustColumnType::Int64 => {
+            // Try i64 first, fall back to i32 if needed
+            if let Ok(v) = value.extract::<i64>() {
+                Ok(RustColumnValue::Int64(v))
+            } else if let Ok(v) = value.extract::<i32>() {
+                Ok(RustColumnValue::Int64(v as i64))
+            } else {
+                Err(PyValueError::new_err("Expected INT64 value"))
+            }
+        }
+        RustColumnType::Float32 => {
+            value.extract::<f32>()
+                .map(RustColumnValue::Float32)
+                .or_else(|_| value.extract::<f64>().map(|v| RustColumnValue::Float32(v as f32)))
+                .map_err(|_| PyValueError::new_err("Expected FLOAT32 value"))
+        }
+        RustColumnType::Float64 => {
+            value.extract::<f64>()
+                .map(RustColumnValue::Float64)
+                .map_err(|_| PyValueError::new_err("Expected FLOAT64 value"))
+        }
+        RustColumnType::String => {
+            value.extract::<String>()
+                .map(RustColumnValue::String)
+                .map_err(|_| PyValueError::new_err("Expected STRING value"))
+        }
+        RustColumnType::Bool => {
+            value.extract::<bool>()
+                .map(RustColumnValue::Bool)
+                .map_err(|_| PyValueError::new_err("Expected BOOL value"))
+        }
+    }
+}
+
 /// Convert ColumnValue to Python object
 fn column_value_to_py(py: Python, value: &RustColumnValue) -> PyResult<PyObject> {
     match value {
@@ -351,12 +408,31 @@ impl PyTable {
     }
 
     /// Append a row to the table
-    fn append_row(&mut self, py: Python, row: &Bound<'_, PyDict>) -> PyResult<()> {
-        let mut rust_row = HashMap::new();
+    fn append_row(&mut self, _py: Python, row: &Bound<'_, PyDict>) -> PyResult<()> {
+        // Build schema lookup upfront
+        let col_info: HashMap<String, (RustColumnType, bool)> = {
+            let table = self.inner.borrow();
+            let schema = table.schema();
+            schema.get_column_names().iter()
+                .filter_map(|name| {
+                    let col_type = schema.get_column_type(name)?;
+                    let nullable = schema.is_column_nullable(name).unwrap_or(false);
+                    Some((name.to_string(), (col_type, nullable)))
+                })
+                .collect()
+        };
 
+        let mut rust_row = HashMap::new();
         for (key, value) in row.iter() {
             let key_str: String = key.extract()?;
-            let col_value = py_to_column_value(py, &value)?;
+
+            // Use schema-aware typed conversion
+            let col_value = if let Some((col_type, nullable)) = col_info.get(&key_str) {
+                py_to_column_value_typed(&value, *col_type, *nullable)?
+            } else {
+                return Err(PyValueError::new_err(format!("Unknown column: {}", key_str)));
+            };
+
             rust_row.insert(key_str, col_value);
         }
 
@@ -384,7 +460,25 @@ impl PyTable {
     ///         {"id": 2, "name": "Bob"},
     ///         {"id": 3, "name": "Charlie"},
     ///     ])
-    fn append_rows(&mut self, py: Python, rows: &Bound<'_, PyList>) -> PyResult<usize> {
+    fn append_rows(&mut self, _py: Python, rows: &Bound<'_, PyList>) -> PyResult<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        // Build schema lookup: column_name -> (type, nullable)
+        // This avoids repeated schema lookups per row
+        let table = self.inner.borrow();
+        let schema = table.schema();
+        let col_names: Vec<String> = schema.get_column_names().iter().map(|s| s.to_string()).collect();
+        let col_info: HashMap<String, (RustColumnType, bool)> = col_names.iter()
+            .filter_map(|name| {
+                let col_type = schema.get_column_type(name)?;
+                let nullable = schema.is_column_nullable(name).unwrap_or(false);
+                Some((name.clone(), (col_type, nullable)))
+            })
+            .collect();
+        drop(table); // Release borrow before mutating
+
         let mut rust_rows = Vec::with_capacity(rows.len());
 
         for item in rows.iter() {
@@ -394,7 +488,14 @@ impl PyTable {
             let mut rust_row = HashMap::new();
             for (key, value) in row_dict.iter() {
                 let key_str: String = key.extract()?;
-                let col_value = py_to_column_value(py, &value)?;
+
+                // Use schema-aware typed conversion (faster than guessing)
+                let col_value = if let Some((col_type, nullable)) = col_info.get(&key_str) {
+                    py_to_column_value_typed(&value, *col_type, *nullable)?
+                } else {
+                    return Err(PyValueError::new_err(format!("Unknown column: {}", key_str)));
+                };
+
                 rust_row.insert(key_str, col_value);
             }
             rust_rows.push(rust_row);
@@ -474,6 +575,29 @@ impl PyTable {
     /// Create a filter view
     fn filter(&self, predicate: PyObject) -> PyResult<PyFilterView> {
         PyFilterView::new(self.clone(), predicate)
+    }
+
+    /// Filter rows using an expression string (faster than lambda-based filter).
+    ///
+    /// The expression is evaluated entirely in Rust without Python callbacks,
+    /// making it significantly faster for large datasets.
+    ///
+    /// Supported syntax:
+    /// - Comparisons: `score > 90`, `name == 'Alice'`, `value != 0`
+    /// - Logical operators: `AND`, `OR`, `NOT`
+    /// - Parentheses: `(score > 90) AND (age >= 18)`
+    /// - NULL checks: `column IS NULL`, `column IS NOT NULL`
+    ///
+    /// Returns a list of matching row indices.
+    ///
+    /// Example:
+    ///     indices = table.filter_expr("score > 90 AND name != 'Bob'")
+    ///     for idx in indices:
+    ///         print(table.get_row(idx))
+    fn filter_expr(&self, expression: &str) -> PyResult<Vec<usize>> {
+        self.inner.borrow()
+            .filter_expr(expression)
+            .map_err(|e| PyValueError::new_err(e))
     }
 
     /// Create a projection view (select specific columns)

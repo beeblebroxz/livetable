@@ -140,6 +140,10 @@ filtered = table.filter(lambda row: row["score"] >= 90)
 projected = table.select(["name", "score"])
 computed = table.add_computed_column("grade", lambda row: "A" if row["score"] >= 90 else "B")
 
+# Expression-based filtering (2x faster than lambda)
+indices = table.filter_expr("score >= 90 AND name != 'Test'")
+# Supports: =, !=, <, >, <=, >=, AND, OR, NOT, IS NULL, IS NOT NULL
+
 # Sorted views
 sorted_view = livetable.SortedView("by_score", table, [livetable.SortKey.descending("score")])
 

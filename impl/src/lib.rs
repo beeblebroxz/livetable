@@ -10,6 +10,7 @@ pub mod table;
 pub mod view;
 pub mod changeset;
 pub mod interner;
+pub mod expr;
 
 pub use sequence::{ArraySequence, Sequence, TieredVectorSequence};
 pub use column::{Column, ColumnType, ColumnValue};
