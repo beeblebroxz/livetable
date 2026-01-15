@@ -7,7 +7,7 @@ use crate::column::ColumnValue;
 use crate::table::Table;
 use crate::changeset::{TableChange, IncrementalView, IndexAdjuster};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::cell::RefCell;
 
@@ -1070,6 +1070,686 @@ impl IncrementalView for SortedView {
 
     fn rebuild(&mut self) {
         self.rebuild_index();
+    }
+}
+
+// ============================================================================
+// AggregateView - Grouped aggregations with incremental updates
+// ============================================================================
+
+/// Supported aggregation functions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunction {
+    Sum,
+    Count,
+    Avg,
+    Min,
+    Max,
+}
+
+/// Internal state for tracking aggregate statistics for one source column
+#[derive(Debug, Clone)]
+struct ColumnAggState {
+    /// Running sum for SUM and AVG calculations
+    sum: f64,
+    /// Count of non-null values
+    count: usize,
+    /// Current minimum value
+    min: Option<f64>,
+    /// Current maximum value
+    max: Option<f64>,
+}
+
+impl ColumnAggState {
+    fn new() -> Self {
+        ColumnAggState {
+            sum: 0.0,
+            count: 0,
+            min: None,
+            max: None,
+        }
+    }
+
+    /// Add a numeric value to the aggregate state
+    fn add_value(&mut self, value: f64) {
+        self.sum += value;
+        self.count += 1;
+        self.min = Some(self.min.map_or(value, |m| m.min(value)));
+        self.max = Some(self.max.map_or(value, |m| m.max(value)));
+    }
+
+    /// Remove a numeric value from the aggregate state
+    /// Returns false if MIN/MAX needs recalculation (deleted value was min or max)
+    fn remove_value(&mut self, value: f64) -> bool {
+        self.sum -= value;
+        self.count = self.count.saturating_sub(1);
+
+        // Check if we need to recalculate min/max
+        let needs_recalc = self.min.map_or(false, |m| (m - value).abs() < f64::EPSILON)
+            || self.max.map_or(false, |m| (m - value).abs() < f64::EPSILON);
+
+        !needs_recalc
+    }
+
+    /// Recalculate MIN/MAX from a set of values
+    fn recalculate_min_max(&mut self, values: &[f64]) {
+        if values.is_empty() {
+            self.min = None;
+            self.max = None;
+        } else {
+            self.min = values.iter().copied().reduce(f64::min);
+            self.max = values.iter().copied().reduce(f64::max);
+        }
+    }
+
+    fn get_result(&self, func: AggregateFunction) -> ColumnValue {
+        match func {
+            AggregateFunction::Sum => ColumnValue::Float64(self.sum),
+            AggregateFunction::Count => ColumnValue::Int64(self.count as i64),
+            AggregateFunction::Avg => {
+                if self.count > 0 {
+                    ColumnValue::Float64(self.sum / self.count as f64)
+                } else {
+                    ColumnValue::Null
+                }
+            }
+            AggregateFunction::Min => {
+                self.min.map_or(ColumnValue::Null, ColumnValue::Float64)
+            }
+            AggregateFunction::Max => {
+                self.max.map_or(ColumnValue::Null, ColumnValue::Float64)
+            }
+        }
+    }
+}
+
+/// Internal state for tracking aggregates per group
+#[derive(Debug, Clone)]
+struct GroupState {
+    /// Per-source-column aggregate statistics
+    column_stats: HashMap<String, ColumnAggState>,
+    /// Parent row indices belonging to this group (for MIN/MAX recalc on delete)
+    row_indices: HashSet<usize>,
+}
+
+impl GroupState {
+    fn new() -> Self {
+        GroupState {
+            column_stats: HashMap::new(),
+            row_indices: HashSet::new(),
+        }
+    }
+
+    /// Add a value for a specific source column
+    fn add_column_value(&mut self, source_col: &str, value: f64) {
+        let stats = self.column_stats
+            .entry(source_col.to_string())
+            .or_insert_with(ColumnAggState::new);
+        stats.add_value(value);
+    }
+
+    /// Remove a value for a specific source column
+    /// Returns false if MIN/MAX needs recalculation
+    fn remove_column_value(&mut self, source_col: &str, value: f64) -> bool {
+        if let Some(stats) = self.column_stats.get_mut(source_col) {
+            stats.remove_value(value)
+        } else {
+            true
+        }
+    }
+
+    /// Get result for a specific aggregation (source column + function)
+    fn get_result(&self, source_col: &str, func: AggregateFunction) -> ColumnValue {
+        if let Some(stats) = self.column_stats.get(source_col) {
+            stats.get_result(func)
+        } else {
+            ColumnValue::Null
+        }
+    }
+
+    /// Recalculate MIN/MAX for a source column from a set of values
+    fn recalculate_column_min_max(&mut self, source_col: &str, values: &[f64]) {
+        if let Some(stats) = self.column_stats.get_mut(source_col) {
+            stats.recalculate_min_max(values);
+        }
+    }
+}
+
+/// A key for grouping rows - vector of column values converted to comparable strings
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GroupKey(Vec<Option<String>>);
+
+impl GroupKey {
+    fn from_row(row: &HashMap<String, ColumnValue>, group_by: &[String]) -> Self {
+        let values: Vec<Option<String>> = group_by
+            .iter()
+            .map(|col| {
+                row.get(col).and_then(|v| {
+                    if v.is_null() {
+                        None
+                    } else {
+                        Some(format!("{:?}", v))
+                    }
+                })
+            })
+            .collect();
+        GroupKey(values)
+    }
+
+    fn to_column_values(&self, group_by: &[String], parent: &Table) -> HashMap<String, ColumnValue> {
+        let mut result = HashMap::new();
+        for (i, col_name) in group_by.iter().enumerate() {
+            let value = match &self.0[i] {
+                None => ColumnValue::Null,
+                Some(s) => {
+                    // Try to reconstruct the original value based on column type
+                    if let Some(col_idx) = parent.schema().get_column_index(col_name) {
+                        if let Some((_, col_type, _)) = parent.schema().get_column_info(col_idx) {
+                            // Parse the debug string back - this is a simplification
+                            // In production, we'd store actual ColumnValues
+                            match col_type {
+                                crate::column::ColumnType::String => {
+                                    // Extract string from String("value") format
+                                    if s.starts_with("String(\"") && s.ends_with("\")") {
+                                        let inner = &s[8..s.len()-2];
+                                        ColumnValue::String(inner.to_string())
+                                    } else {
+                                        ColumnValue::String(s.clone())
+                                    }
+                                }
+                                crate::column::ColumnType::Int32 => {
+                                    if s.starts_with("Int32(") && s.ends_with(")") {
+                                        let inner = &s[6..s.len()-1];
+                                        inner.parse().map(ColumnValue::Int32).unwrap_or(ColumnValue::Null)
+                                    } else {
+                                        ColumnValue::Null
+                                    }
+                                }
+                                crate::column::ColumnType::Int64 => {
+                                    if s.starts_with("Int64(") && s.ends_with(")") {
+                                        let inner = &s[6..s.len()-1];
+                                        inner.parse().map(ColumnValue::Int64).unwrap_or(ColumnValue::Null)
+                                    } else {
+                                        ColumnValue::Null
+                                    }
+                                }
+                                _ => ColumnValue::String(s.clone()),
+                            }
+                        } else {
+                            ColumnValue::String(s.clone())
+                        }
+                    } else {
+                        ColumnValue::String(s.clone())
+                    }
+                }
+            };
+            result.insert(col_name.clone(), value);
+        }
+        result
+    }
+}
+
+/// AggregateView groups rows and computes aggregate functions per group.
+/// Supports incremental updates when the parent table changes.
+///
+/// # Example
+/// ```ignore
+/// let agg = AggregateView::new(
+///     "sales_by_region".to_string(),
+///     table.clone(),
+///     vec!["region".to_string()],
+///     vec![
+///         ("total".to_string(), "amount".to_string(), AggregateFunction::Sum),
+///         ("avg_amount".to_string(), "amount".to_string(), AggregateFunction::Avg),
+///     ],
+/// )?;
+/// ```
+pub struct AggregateView {
+    name: String,
+    parent: Rc<RefCell<Table>>,
+    group_by_columns: Vec<String>,
+    /// (result_column_name, source_column_name, function)
+    aggregations: Vec<(String, String, AggregateFunction)>,
+    /// Map from group key to aggregate state
+    groups: HashMap<GroupKey, GroupState>,
+    /// Ordered list of group keys for consistent iteration
+    group_order: Vec<GroupKey>,
+    /// Map from parent row index to its group key
+    row_to_group: HashMap<usize, GroupKey>,
+    /// Last synced generation from parent's changeset
+    last_synced_generation: u64,
+    /// Number of changes already processed (to skip old changes on sync)
+    last_processed_change_count: usize,
+}
+
+impl AggregateView {
+    pub fn new(
+        name: String,
+        parent: Rc<RefCell<Table>>,
+        group_by_columns: Vec<String>,
+        aggregations: Vec<(String, String, AggregateFunction)>,
+    ) -> Result<Self, String> {
+        // Validate group_by columns exist
+        {
+            let p = parent.borrow();
+            for col in &group_by_columns {
+                if p.schema().get_column_index(col).is_none() {
+                    return Err(format!("Group-by column '{}' not found in table", col));
+                }
+            }
+            // Validate aggregation source columns exist
+            for (_, source_col, _) in &aggregations {
+                if p.schema().get_column_index(source_col).is_none() {
+                    return Err(format!("Aggregation source column '{}' not found in table", source_col));
+                }
+            }
+        }
+
+        if aggregations.is_empty() {
+            return Err("At least one aggregation is required".to_string());
+        }
+
+        let (generation, change_count) = {
+            let p = parent.borrow();
+            (p.changeset_generation(), p.changeset().changes().len())
+        };
+        let mut view = AggregateView {
+            name,
+            parent,
+            group_by_columns,
+            aggregations,
+            groups: HashMap::new(),
+            group_order: Vec::new(),
+            row_to_group: HashMap::new(),
+            last_synced_generation: generation,
+            last_processed_change_count: change_count,
+        };
+        view.rebuild_index();
+        Ok(view)
+    }
+
+    fn rebuild_index(&mut self) {
+        self.groups.clear();
+        self.group_order.clear();
+        self.row_to_group.clear();
+
+        // Collect rows first to avoid borrow conflicts
+        let (rows, generation, change_count) = {
+            let parent = self.parent.borrow();
+            let mut rows = Vec::new();
+            for row_idx in 0..parent.len() {
+                if let Ok(row) = parent.get_row(row_idx) {
+                    rows.push((row_idx, row));
+                }
+            }
+            (rows, parent.changeset_generation(), parent.changeset().changes().len())
+        };
+
+        // Now process the rows
+        for (row_idx, row) in rows {
+            self.add_row_to_aggregates(row_idx, &row);
+        }
+
+        self.last_synced_generation = generation;
+        self.last_processed_change_count = change_count;
+    }
+
+    /// Get unique source columns from aggregations
+    fn unique_source_columns(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for (_, source_col, _) in &self.aggregations {
+            if seen.insert(source_col.clone()) {
+                result.push(source_col.clone());
+            }
+        }
+        result
+    }
+
+    fn add_row_to_aggregates(&mut self, row_idx: usize, row: &HashMap<String, ColumnValue>) {
+        let key = GroupKey::from_row(row, &self.group_by_columns);
+
+        // Track which group this row belongs to
+        self.row_to_group.insert(row_idx, key.clone());
+
+        // Collect source columns and their values first
+        let source_cols = self.unique_source_columns();
+        let col_values: Vec<(String, f64)> = source_cols
+            .into_iter()
+            .filter_map(|col| {
+                row.get(&col)
+                    .and_then(|v| Self::extract_numeric(v))
+                    .map(|num| (col, num))
+            })
+            .collect();
+
+        // Get or create group state
+        let is_new_group = !self.groups.contains_key(&key);
+        let state = self.groups.entry(key.clone()).or_insert_with(GroupState::new);
+
+        // Add row index to group
+        state.row_indices.insert(row_idx);
+
+        // Add values for each unique source column (not per-aggregation!)
+        for (source_col, num) in col_values {
+            state.add_column_value(&source_col, num);
+        }
+
+        // Track group order
+        if is_new_group {
+            self.group_order.push(key);
+        }
+    }
+
+    fn remove_row_from_aggregates(&mut self, row_idx: usize, row: &HashMap<String, ColumnValue>) -> bool {
+        let key = GroupKey::from_row(row, &self.group_by_columns);
+
+        // Remove from row_to_group
+        self.row_to_group.remove(&row_idx);
+
+        // Collect source columns and their values first
+        let source_cols = self.unique_source_columns();
+        let col_values: Vec<(String, f64)> = source_cols
+            .into_iter()
+            .filter_map(|col| {
+                row.get(&col)
+                    .and_then(|v| Self::extract_numeric(v))
+                    .map(|num| (col, num))
+            })
+            .collect();
+
+        if let Some(state) = self.groups.get_mut(&key) {
+            state.row_indices.remove(&row_idx);
+
+            // Remove values for each unique source column
+            let mut cols_needing_recalc = Vec::new();
+            for (source_col, num) in col_values {
+                if !state.remove_column_value(&source_col, num) {
+                    cols_needing_recalc.push(source_col);
+                }
+            }
+
+            // If group is now empty, remove it
+            if state.row_indices.is_empty() {
+                self.groups.remove(&key);
+                self.group_order.retain(|k| k != &key);
+                return true;
+            }
+
+            // Recalculate MIN/MAX for columns that need it
+            for source_col in cols_needing_recalc {
+                self.recalculate_group_column_min_max(&key, &source_col);
+            }
+
+            true
+        } else {
+            false
+        }
+    }
+
+    fn recalculate_group_column_min_max(&mut self, key: &GroupKey, source_col: &str) {
+        // Collect row indices and values first to avoid borrow conflicts
+        let row_indices: Vec<usize> = if let Some(state) = self.groups.get(key) {
+            state.row_indices.iter().copied().collect()
+        } else {
+            return;
+        };
+
+        let values: Vec<f64> = {
+            let parent = self.parent.borrow();
+            row_indices
+                .iter()
+                .filter_map(|&row_idx| {
+                    parent.get_row(row_idx).ok().and_then(|row| {
+                        row.get(source_col).and_then(|value| Self::extract_numeric(value))
+                    })
+                })
+                .collect()
+        };
+
+        if let Some(state) = self.groups.get_mut(key) {
+            state.recalculate_column_min_max(source_col, &values);
+        }
+    }
+
+    /// Extract numeric value from ColumnValue, converting to f64
+    fn extract_numeric(value: &ColumnValue) -> Option<f64> {
+        match value {
+            ColumnValue::Int32(v) => Some(*v as f64),
+            ColumnValue::Int64(v) => Some(*v as f64),
+            ColumnValue::Float32(v) => Some(*v as f64),
+            ColumnValue::Float64(v) => Some(*v),
+            ColumnValue::Null => None,
+            _ => None, // String, Bool not numeric
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn len(&self) -> usize {
+        self.group_order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.group_order.is_empty()
+    }
+
+    /// Get column names: group-by columns + result columns
+    pub fn column_names(&self) -> Vec<String> {
+        let mut names = self.group_by_columns.clone();
+        for (result_col, _, _) in &self.aggregations {
+            names.push(result_col.clone());
+        }
+        names
+    }
+
+    pub fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String> {
+        if index >= self.group_order.len() {
+            return Err(format!("Index {} out of range [0, {})", index, self.len()));
+        }
+
+        let key = &self.group_order[index];
+        let parent = self.parent.borrow();
+        let mut result = key.to_column_values(&self.group_by_columns, &parent);
+
+        if let Some(state) = self.groups.get(key) {
+            for (result_col, source_col, func) in &self.aggregations {
+                result.insert(result_col.clone(), state.get_result(source_col, *func));
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
+        if row >= self.group_order.len() {
+            return Err(format!("Row {} out of range [0, {})", row, self.len()));
+        }
+
+        let key = &self.group_order[row];
+
+        // Check if it's a group-by column
+        if self.group_by_columns.iter().any(|c| c == column) {
+            let parent = self.parent.borrow();
+            let values = key.to_column_values(&self.group_by_columns, &parent);
+            return values.get(column).cloned().ok_or_else(|| format!("Column '{}' not found", column));
+        }
+
+        // Check if it's an aggregation result column
+        if let Some(state) = self.groups.get(key) {
+            for (result_col, source_col, func) in &self.aggregations {
+                if result_col == column {
+                    return Ok(state.get_result(source_col, *func));
+                }
+            }
+        }
+
+        Err(format!("Column '{}' not found", column))
+    }
+
+    pub fn refresh(&mut self) {
+        self.rebuild_index();
+    }
+
+    /// Incrementally sync with parent table's changes
+    pub fn sync(&mut self) -> bool {
+        let parent = self.parent.borrow();
+        let all_changes = parent.changeset().changes();
+
+        // Only process changes we haven't seen yet
+        if all_changes.len() <= self.last_processed_change_count {
+            return false;
+        }
+
+        let new_changes: Vec<TableChange> = all_changes[self.last_processed_change_count..].to_vec();
+        let new_count = all_changes.len();
+        drop(parent);
+
+        let modified = self.apply_changes(&new_changes);
+        self.last_processed_change_count = new_count;
+        modified
+    }
+}
+
+impl IncrementalView for AggregateView {
+    fn apply_changes(&mut self, changes: &[TableChange]) -> bool {
+        let mut modified = false;
+
+        for change in changes {
+            match change {
+                TableChange::RowInserted { index, data } => {
+                    // Adjust existing row indices
+                    self.adjust_indices_for_insert(*index);
+                    // Add the new row to aggregates
+                    self.add_row_to_aggregates(*index, data);
+                    modified = true;
+                }
+
+                TableChange::RowDeleted { index, data } => {
+                    // Remove from aggregates
+                    self.remove_row_from_aggregates(*index, data);
+                    // Adjust remaining row indices
+                    self.adjust_indices_for_delete(*index);
+                    modified = true;
+                }
+
+                TableChange::CellUpdated { row, column, old_value, new_value } => {
+                    // Check if group-by column changed
+                    if self.group_by_columns.contains(column) {
+                        // Need to move row to a different group
+                        if let Ok(old_row) = self.reconstruct_old_row(*row, column, old_value) {
+                            self.remove_row_from_aggregates(*row, &old_row);
+                        }
+                        // Get new row separately to avoid borrow conflicts
+                        let new_row = self.parent.borrow().get_row(*row).ok();
+                        if let Some(new_row) = new_row {
+                            self.add_row_to_aggregates(*row, &new_row);
+                        }
+                        modified = true;
+                    } else {
+                        // Check if aggregated column changed
+                        let affects_aggregation = self.aggregations.iter().any(|(_, src, _)| src == column);
+                        if affects_aggregation {
+                            // Update the aggregate values
+                            if let Some(key) = self.row_to_group.get(row).cloned() {
+                                let mut needs_recalc = false;
+
+                                // Remove old value
+                                if let Some(state) = self.groups.get_mut(&key) {
+                                    if let Some(old_num) = Self::extract_numeric(old_value) {
+                                        needs_recalc = !state.remove_column_value(column, old_num);
+                                    }
+                                }
+
+                                // Recalculate if needed (outside of the borrow)
+                                if needs_recalc {
+                                    self.recalculate_group_column_min_max(&key, column);
+                                }
+
+                                // Add new value
+                                if let Some(state) = self.groups.get_mut(&key) {
+                                    if let Some(new_num) = Self::extract_numeric(new_value) {
+                                        state.add_column_value(column, new_num);
+                                    }
+                                }
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        modified
+    }
+
+    fn last_synced_generation(&self) -> u64 {
+        self.last_synced_generation
+    }
+
+    fn rebuild(&mut self) {
+        self.rebuild_index();
+    }
+}
+
+impl AggregateView {
+    /// Adjust row indices when a row is inserted
+    fn adjust_indices_for_insert(&mut self, inserted_index: usize) {
+        // Update row_to_group keys
+        let mut new_row_to_group = HashMap::new();
+        for (idx, key) in self.row_to_group.drain() {
+            let new_idx = if idx >= inserted_index { idx + 1 } else { idx };
+            new_row_to_group.insert(new_idx, key);
+        }
+        self.row_to_group = new_row_to_group;
+
+        // Update row_indices in each group
+        for state in self.groups.values_mut() {
+            let old_indices: Vec<usize> = state.row_indices.iter().copied().collect();
+            state.row_indices.clear();
+            for idx in old_indices {
+                let new_idx = if idx >= inserted_index { idx + 1 } else { idx };
+                state.row_indices.insert(new_idx);
+            }
+        }
+    }
+
+    /// Adjust row indices when a row is deleted
+    fn adjust_indices_for_delete(&mut self, deleted_index: usize) {
+        // Update row_to_group keys
+        let mut new_row_to_group = HashMap::new();
+        for (idx, key) in self.row_to_group.drain() {
+            if idx > deleted_index {
+                new_row_to_group.insert(idx - 1, key);
+            } else if idx < deleted_index {
+                new_row_to_group.insert(idx, key);
+            }
+            // idx == deleted_index is already removed
+        }
+        self.row_to_group = new_row_to_group;
+
+        // Update row_indices in each group
+        for state in self.groups.values_mut() {
+            let old_indices: Vec<usize> = state.row_indices.iter().copied().collect();
+            state.row_indices.clear();
+            for idx in old_indices {
+                if idx > deleted_index {
+                    state.row_indices.insert(idx - 1);
+                } else if idx < deleted_index {
+                    state.row_indices.insert(idx);
+                }
+            }
+        }
+    }
+
+    /// Reconstruct what a row looked like before a cell update
+    fn reconstruct_old_row(&self, row_idx: usize, changed_col: &str, old_value: &ColumnValue) -> Result<HashMap<String, ColumnValue>, String> {
+        let parent = self.parent.borrow();
+        let mut row = parent.get_row(row_idx)?;
+        row.insert(changed_col.to_string(), old_value.clone());
+        Ok(row)
     }
 }
 

@@ -5,14 +5,14 @@
 
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError, PyIndexError, PyKeyError};
-use pyo3::types::{PyDict, PyBool};
+use pyo3::types::PyDict;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 
 use crate::column::{ColumnType as RustColumnType, ColumnValue as RustColumnValue};
 use crate::table::{Schema as RustSchema, Table as RustTable};
-use crate::view::{JoinView as RustJoinView, JoinType as RustJoinType, SortedView as RustSortedView, SortKey as RustSortKey, SortOrder as RustSortOrder};
+use crate::view::{JoinView as RustJoinView, JoinType as RustJoinType, SortedView as RustSortedView, SortKey as RustSortKey, SortOrder as RustSortOrder, AggregateFunction as RustAggregateFunction, AggregateView as RustAggregateView};
 
 // ============================================================================
 // Core Type Conversions
@@ -367,6 +367,47 @@ impl PyTable {
             }
             None => Ok(None),
         }
+    }
+
+    // === Aggregation Methods ===
+
+    /// Calculate the sum of all numeric values in a column.
+    /// NULL values are skipped.
+    fn sum(&self, column: &str) -> PyResult<f64> {
+        self.inner.borrow()
+            .sum(column)
+            .map_err(|e| PyValueError::new_err(e))
+    }
+
+    /// Count the number of non-NULL values in a column.
+    fn count_non_null(&self, column: &str) -> PyResult<usize> {
+        self.inner.borrow()
+            .count_non_null(column)
+            .map_err(|e| PyValueError::new_err(e))
+    }
+
+    /// Calculate the average of all numeric values in a column.
+    /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
+    fn avg(&self, column: &str) -> PyResult<Option<f64>> {
+        self.inner.borrow()
+            .avg(column)
+            .map_err(|e| PyValueError::new_err(e))
+    }
+
+    /// Find the minimum numeric value in a column.
+    /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
+    fn min(&self, column: &str) -> PyResult<Option<f64>> {
+        self.inner.borrow()
+            .min(column)
+            .map_err(|e| PyValueError::new_err(e))
+    }
+
+    /// Find the maximum numeric value in a column.
+    /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
+    fn max(&self, column: &str) -> PyResult<Option<f64>> {
+        self.inner.borrow()
+            .max(column)
+            .map_err(|e| PyValueError::new_err(e))
     }
 }
 
@@ -997,6 +1038,168 @@ impl PySortedView {
 }
 
 // ============================================================================
+// AggregateFunction
+// ============================================================================
+
+/// Supported aggregation functions
+#[pyclass(name = "AggregateFunction")]
+#[derive(Clone, Copy)]
+pub struct PyAggregateFunction {
+    inner: RustAggregateFunction,
+}
+
+#[pymethods]
+impl PyAggregateFunction {
+    /// Sum of values
+    #[classattr]
+    fn SUM() -> Self {
+        PyAggregateFunction { inner: RustAggregateFunction::Sum }
+    }
+
+    /// Count of non-null values
+    #[classattr]
+    fn COUNT() -> Self {
+        PyAggregateFunction { inner: RustAggregateFunction::Count }
+    }
+
+    /// Average of values
+    #[classattr]
+    fn AVG() -> Self {
+        PyAggregateFunction { inner: RustAggregateFunction::Avg }
+    }
+
+    /// Minimum value
+    #[classattr]
+    fn MIN() -> Self {
+        PyAggregateFunction { inner: RustAggregateFunction::Min }
+    }
+
+    /// Maximum value
+    #[classattr]
+    fn MAX() -> Self {
+        PyAggregateFunction { inner: RustAggregateFunction::Max }
+    }
+
+    fn __repr__(&self) -> String {
+        match self.inner {
+            RustAggregateFunction::Sum => "AggregateFunction.SUM".to_string(),
+            RustAggregateFunction::Count => "AggregateFunction.COUNT".to_string(),
+            RustAggregateFunction::Avg => "AggregateFunction.AVG".to_string(),
+            RustAggregateFunction::Min => "AggregateFunction.MIN".to_string(),
+            RustAggregateFunction::Max => "AggregateFunction.MAX".to_string(),
+        }
+    }
+}
+
+impl PyAggregateFunction {
+    fn to_rust(&self) -> RustAggregateFunction {
+        self.inner
+    }
+}
+
+// ============================================================================
+// AggregateView
+// ============================================================================
+
+/// A view that groups rows and computes aggregate functions per group.
+/// Supports incremental updates when the parent table changes.
+#[pyclass(name = "AggregateView", unsendable)]
+pub struct PyAggregateView {
+    inner: Rc<RefCell<RustAggregateView>>,
+}
+
+#[pymethods]
+impl PyAggregateView {
+    /// Create a new AggregateView
+    ///
+    /// Args:
+    ///     name: Name of the view
+    ///     table: Parent table to aggregate
+    ///     group_by: List of column names to group by
+    ///     aggregations: List of (result_name, source_column, function) tuples
+    #[new]
+    fn new(
+        name: String,
+        table: PyTable,
+        group_by: Vec<String>,
+        aggregations: Vec<(String, String, PyAggregateFunction)>,
+    ) -> PyResult<Self> {
+        let rust_aggregations: Vec<(String, String, RustAggregateFunction)> = aggregations
+            .into_iter()
+            .map(|(result, source, func)| (result, source, func.to_rust()))
+            .collect();
+
+        let view = RustAggregateView::new(
+            name,
+            table.inner.clone(),
+            group_by,
+            rust_aggregations,
+        ).map_err(|e| PyValueError::new_err(e))?;
+
+        Ok(PyAggregateView {
+            inner: Rc::new(RefCell::new(view)),
+        })
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.borrow().len()
+    }
+
+    fn __repr__(&self) -> String {
+        let view = self.inner.borrow();
+        format!("AggregateView(name='{}', groups={})", view.name(), view.len())
+    }
+
+    /// Get view name
+    fn name(&self) -> String {
+        self.inner.borrow().name().to_string()
+    }
+
+    /// Check if view is empty
+    fn is_empty(&self) -> bool {
+        self.inner.borrow().is_empty()
+    }
+
+    /// Get column names (group-by columns + result columns)
+    fn column_names(&self) -> Vec<String> {
+        self.inner.borrow().column_names()
+    }
+
+    /// Get a row by index as a dictionary
+    fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
+        let row = self.inner.borrow()
+            .get_row(index)
+            .map_err(|e| PyIndexError::new_err(e))?;
+
+        let dict = PyDict::new_bound(py);
+        for (key, value) in row.iter() {
+            dict.set_item(key, column_value_to_py(py, value)?)?;
+        }
+        Ok(dict.to_object(py))
+    }
+
+    /// Get a value at (row, column)
+    fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
+        let value = self.inner.borrow()
+            .get_value(row, column)
+            .map_err(|e| PyKeyError::new_err(e))?;
+
+        column_value_to_py(py, &value)
+    }
+
+    /// Force a full refresh of the view
+    fn refresh(&mut self) {
+        self.inner.borrow_mut().refresh();
+    }
+
+    /// Incrementally sync with parent table changes
+    /// Returns True if any changes were applied
+    fn sync(&mut self) -> bool {
+        self.inner.borrow_mut().sync()
+    }
+}
+
+// ============================================================================
 // Module Definition
 // ============================================================================
 
@@ -1014,6 +1217,8 @@ fn livetable(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySortOrder>()?;
     m.add_class::<PySortKey>()?;
     m.add_class::<PySortedView>()?;
+    m.add_class::<PyAggregateFunction>()?;
+    m.add_class::<PyAggregateView>()?;
 
     Ok(())
 }

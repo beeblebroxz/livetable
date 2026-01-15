@@ -379,6 +379,118 @@ impl Table {
     pub fn has_pending_changes(&self) -> bool {
         !self.changeset.is_empty()
     }
+
+    // ========================================================================
+    // Aggregation Methods
+    // ========================================================================
+
+    /// Extract numeric value from ColumnValue, converting to f64
+    fn extract_numeric(value: &ColumnValue) -> Option<f64> {
+        match value {
+            ColumnValue::Int32(v) => Some(*v as f64),
+            ColumnValue::Int64(v) => Some(*v as f64),
+            ColumnValue::Float32(v) => Some(*v as f64),
+            ColumnValue::Float64(v) => Some(*v),
+            ColumnValue::Null => None,
+            _ => None, // String, Bool not numeric
+        }
+    }
+
+    /// Calculate the sum of all numeric values in a column.
+    /// NULL values are skipped.
+    pub fn sum(&self, column: &str) -> Result<f64, String> {
+        let col_idx = self.schema
+            .get_column_index(column)
+            .ok_or_else(|| format!("Column '{}' not found", column))?;
+
+        let mut total = 0.0;
+        for i in 0..self.row_count {
+            if let Ok(value) = self.columns[col_idx].get(i) {
+                if let Some(num) = Self::extract_numeric(&value) {
+                    total += num;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Count the number of non-NULL values in a column.
+    pub fn count_non_null(&self, column: &str) -> Result<usize, String> {
+        let col_idx = self.schema
+            .get_column_index(column)
+            .ok_or_else(|| format!("Column '{}' not found", column))?;
+
+        let mut count = 0;
+        for i in 0..self.row_count {
+            if let Ok(value) = self.columns[col_idx].get(i) {
+                if !value.is_null() {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Calculate the average of all numeric values in a column.
+    /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
+    pub fn avg(&self, column: &str) -> Result<Option<f64>, String> {
+        let col_idx = self.schema
+            .get_column_index(column)
+            .ok_or_else(|| format!("Column '{}' not found", column))?;
+
+        let mut sum = 0.0;
+        let mut count = 0;
+        for i in 0..self.row_count {
+            if let Ok(value) = self.columns[col_idx].get(i) {
+                if let Some(num) = Self::extract_numeric(&value) {
+                    sum += num;
+                    count += 1;
+                }
+            }
+        }
+
+        if count > 0 {
+            Ok(Some(sum / count as f64))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Find the minimum numeric value in a column.
+    /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
+    pub fn min(&self, column: &str) -> Result<Option<f64>, String> {
+        let col_idx = self.schema
+            .get_column_index(column)
+            .ok_or_else(|| format!("Column '{}' not found", column))?;
+
+        let mut min_val: Option<f64> = None;
+        for i in 0..self.row_count {
+            if let Ok(value) = self.columns[col_idx].get(i) {
+                if let Some(num) = Self::extract_numeric(&value) {
+                    min_val = Some(min_val.map_or(num, |m| m.min(num)));
+                }
+            }
+        }
+        Ok(min_val)
+    }
+
+    /// Find the maximum numeric value in a column.
+    /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
+    pub fn max(&self, column: &str) -> Result<Option<f64>, String> {
+        let col_idx = self.schema
+            .get_column_index(column)
+            .ok_or_else(|| format!("Column '{}' not found", column))?;
+
+        let mut max_val: Option<f64> = None;
+        for i in 0..self.row_count {
+            if let Ok(value) = self.columns[col_idx].get(i) {
+                if let Some(num) = Self::extract_numeric(&value) {
+                    max_val = Some(max_val.map_or(num, |m| m.max(num)));
+                }
+            }
+        }
+        Ok(max_val)
+    }
 }
 
 pub struct TableRowIterator<'a> {

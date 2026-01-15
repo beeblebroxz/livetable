@@ -14,7 +14,7 @@ pub mod interner;
 pub use sequence::{ArraySequence, Sequence, TieredVectorSequence};
 pub use column::{Column, ColumnType, ColumnValue};
 pub use table::{Schema, Table};
-pub use view::{FilterView, ProjectionView, ComputedView, JoinView, JoinType, SortedView, SortKey, SortOrder};
+pub use view::{FilterView, ProjectionView, ComputedView, JoinView, JoinType, SortedView, SortKey, SortOrder, AggregateFunction, AggregateView};
 pub use changeset::{Changeset, TableChange, IncrementalView, IndexAdjuster};
 pub use interner::{StringInterner, StringId, InternerStats};
 
