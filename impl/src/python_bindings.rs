@@ -4,8 +4,8 @@
 /// allowing Python code to use the high-performance Rust table system.
 
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyValueError, PyIndexError, PyKeyError};
-use pyo3::types::{PyDict, PyList};
+use pyo3::exceptions::{PyValueError, PyIndexError, PyKeyError, PyTypeError};
+use pyo3::types::{PyDict, PyList, PySlice};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -760,9 +760,68 @@ impl PyTable {
         Ok(dict.to_object(py))
     }
 
-    /// Index access: table[idx] returns the row at idx
-    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        self.get_row(py, index)
+    /// Index access with multiple modes:
+    /// - table[idx] returns the row at idx (supports negative indexing)
+    /// - table[start:end] returns a list of rows (slicing)
+    /// - table["column_name"] returns all values in that column as a list
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let table_len = self.inner.borrow().len();
+
+        // Try integer index first (supports negative indexing)
+        if let Ok(mut idx) = key.extract::<isize>() {
+            // Handle negative indexing
+            if idx < 0 {
+                idx += table_len as isize;
+            }
+            if idx < 0 || idx as usize >= table_len {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} out of range for table with {} rows",
+                    key, table_len
+                )));
+            }
+            return self.get_row(py, idx as usize);
+        }
+
+        // Try slice
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let indices = slice.indices(table_len as isize)?;
+            let start = indices.start as usize;
+            let stop = indices.stop as usize;
+            let step = indices.step as usize;
+
+            let list = PyList::empty_bound(py);
+            let mut i = start;
+            while i < stop {
+                let row = self.get_row(py, i)?;
+                list.append(row)?;
+                i += step;
+            }
+            return Ok(list.to_object(py));
+        }
+
+        // Try string for column access
+        if let Ok(column_name) = key.extract::<String>() {
+            let table = self.inner.borrow();
+            let column_names = table.schema().get_column_names();
+            if !column_names.iter().any(|c| c == &column_name) {
+                return Err(PyKeyError::new_err(format!(
+                    "Column '{}' not found. Available columns: {:?}",
+                    column_name, column_names
+                )));
+            }
+
+            let list = PyList::empty_bound(py);
+            for i in 0..table_len {
+                let value = table.get_value(i, &column_name)
+                    .map_err(|e| PyIndexError::new_err(e))?;
+                list.append(column_value_to_py(py, &value)?)?;
+            }
+            return Ok(list.to_object(py));
+        }
+
+        Err(PyTypeError::new_err(
+            "indices must be integers, slices, or column names (strings)"
+        ))
     }
 
     /// Display table as formatted string
@@ -1180,9 +1239,40 @@ impl PyFilterView {
         self.table.get_row(py, actual_index)
     }
 
-    /// Index access: view[idx] returns the row at idx
-    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        self.get_row(py, index)
+    /// Index access with negative indexing and slicing support
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let view_len = self.indices.len();
+
+        // Try integer index (supports negative indexing)
+        if let Ok(mut idx) = key.extract::<isize>() {
+            if idx < 0 {
+                idx += view_len as isize;
+            }
+            if idx < 0 || idx as usize >= view_len {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} out of range for view with {} rows", key, view_len
+                )));
+            }
+            return self.get_row(py, idx as usize);
+        }
+
+        // Try slice
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let indices = slice.indices(view_len as isize)?;
+            let start = indices.start as usize;
+            let stop = indices.stop as usize;
+            let step = indices.step as usize;
+
+            let list = PyList::empty_bound(py);
+            let mut i = start;
+            while i < stop {
+                list.append(self.get_row(py, i)?)?;
+                i += step;
+            }
+            return Ok(list.to_object(py));
+        }
+
+        Err(PyTypeError::new_err("indices must be integers or slices"))
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
@@ -1370,9 +1460,32 @@ impl PyProjectionView {
         Ok(dict.to_object(py))
     }
 
-    /// Index access: view[idx] returns the row at idx
-    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        self.get_row(py, index)
+    /// Index access with negative indexing and slicing support
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let view_len = self.table.inner.borrow().len();
+
+        if let Ok(mut idx) = key.extract::<isize>() {
+            if idx < 0 { idx += view_len as isize; }
+            if idx < 0 || idx as usize >= view_len {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} out of range for view with {} rows", key, view_len
+                )));
+            }
+            return self.get_row(py, idx as usize);
+        }
+
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let indices = slice.indices(view_len as isize)?;
+            let list = PyList::empty_bound(py);
+            let mut i = indices.start as usize;
+            while i < indices.stop as usize {
+                list.append(self.get_row(py, i)?)?;
+                i += indices.step as usize;
+            }
+            return Ok(list.to_object(py));
+        }
+
+        Err(PyTypeError::new_err("indices must be integers or slices"))
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
@@ -1456,9 +1569,32 @@ impl PyComputedView {
         Ok(result_dict.to_object(py))
     }
 
-    /// Index access: view[idx] returns the row at idx
-    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        self.get_row(py, index)
+    /// Index access with negative indexing and slicing support
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let view_len = self.table.inner.borrow().len();
+
+        if let Ok(mut idx) = key.extract::<isize>() {
+            if idx < 0 { idx += view_len as isize; }
+            if idx < 0 || idx as usize >= view_len {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} out of range for view with {} rows", key, view_len
+                )));
+            }
+            return self.get_row(py, idx as usize);
+        }
+
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let indices = slice.indices(view_len as isize)?;
+            let list = PyList::empty_bound(py);
+            let mut i = indices.start as usize;
+            while i < indices.stop as usize {
+                list.append(self.get_row(py, i)?)?;
+                i += indices.step as usize;
+            }
+            return Ok(list.to_object(py));
+        }
+
+        Err(PyTypeError::new_err("indices must be integers or slices"))
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
@@ -1594,9 +1730,32 @@ impl PyJoinView {
         Ok(dict.to_object(py))
     }
 
-    /// Index access: view[idx] returns the row at idx
-    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        self.get_row(py, index)
+    /// Index access with negative indexing and slicing support
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let view_len = self.inner.borrow().len();
+
+        if let Ok(mut idx) = key.extract::<isize>() {
+            if idx < 0 { idx += view_len as isize; }
+            if idx < 0 || idx as usize >= view_len {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} out of range for view with {} rows", key, view_len
+                )));
+            }
+            return self.get_row(py, idx as usize);
+        }
+
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let indices = slice.indices(view_len as isize)?;
+            let list = PyList::empty_bound(py);
+            let mut i = indices.start as usize;
+            while i < indices.stop as usize {
+                list.append(self.get_row(py, i)?)?;
+                i += indices.step as usize;
+            }
+            return Ok(list.to_object(py));
+        }
+
+        Err(PyTypeError::new_err("indices must be integers or slices"))
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
@@ -1780,9 +1939,32 @@ impl PySortedView {
         Ok(dict.to_object(py))
     }
 
-    /// Index access: view[idx] returns the row at idx
-    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        self.get_row(py, index)
+    /// Index access with negative indexing and slicing support
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let view_len = self.inner.borrow().len();
+
+        if let Ok(mut idx) = key.extract::<isize>() {
+            if idx < 0 { idx += view_len as isize; }
+            if idx < 0 || idx as usize >= view_len {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} out of range for view with {} rows", key, view_len
+                )));
+            }
+            return self.get_row(py, idx as usize);
+        }
+
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let indices = slice.indices(view_len as isize)?;
+            let list = PyList::empty_bound(py);
+            let mut i = indices.start as usize;
+            while i < indices.stop as usize {
+                list.append(self.get_row(py, i)?)?;
+                i += indices.step as usize;
+            }
+            return Ok(list.to_object(py));
+        }
+
+        Err(PyTypeError::new_err("indices must be integers or slices"))
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
@@ -1963,8 +2145,45 @@ impl PyAggregateView {
     }
 
     /// Index access: view[idx] returns the row at idx
-    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        self.get_row(py, index)
+    /// Supports negative indexing (view[-1] for last row)
+    /// Supports slicing (view[1:5] for rows 1-4)
+    fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let view_len = self.inner.borrow().len();
+
+        // Try integer index first (supports negative indexing)
+        if let Ok(mut idx) = key.extract::<isize>() {
+            if idx < 0 {
+                idx += view_len as isize;
+            }
+            if idx < 0 || idx as usize >= view_len {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} out of range for view with {} rows",
+                    key, view_len
+                )));
+            }
+            return self.get_row(py, idx as usize);
+        }
+
+        // Try slice
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let indices = slice.indices(view_len as isize)?;
+            let start = indices.start as usize;
+            let stop = indices.stop as usize;
+            let step = indices.step as usize;
+
+            let list = PyList::empty_bound(py);
+            let mut i = start;
+            while i < stop {
+                let row = self.get_row(py, i)?;
+                list.append(row)?;
+                i += step;
+            }
+            return Ok(list.to_object(py));
+        }
+
+        Err(PyTypeError::new_err(
+            "indices must be integers or slices"
+        ))
     }
 
     /// Get a value at (row, column)
