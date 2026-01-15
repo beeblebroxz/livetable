@@ -35,7 +35,8 @@ table = livetable.Table("users", schema)
 
 # Add data
 table.append_row({"id": 1, "name": "Alice"})
-print(table.get_row(0))  # {'id': 1, 'name': 'Alice'}
+print(table[0])  # {'id': 1, 'name': 'Alice'} - indexing support
+print(table.get_row(0))  # Same as above
 ```
 
 ## Features
@@ -508,6 +509,7 @@ Create a new table.
 - `get_value(row: int, column: str)` - Get single value
 - `set_value(row: int, column: str, value)` - Set single value
 - `get_row(index: int) -> dict` - Get full row as dictionary
+- `table[index]` - Same as `get_row(index)` (indexing support)
 - `display()` - Get formatted table info
 - `filter(predicate: callable) -> FilterView` - Create filtered view
 - `filter_expr(expression: str) -> list[int]` - Filter using expression (2x faster)
@@ -536,6 +538,7 @@ Filtered view of a table.
 **Methods:**
 - `len()` - Number of matching rows
 - `get_row(index: int) -> dict` - Get row
+- `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get value
 - `refresh()` - Rebuild filter (if table changed)
 
@@ -551,6 +554,7 @@ View with selected columns only.
 - `len()` - Number of rows
 - `column_names()` - Selected columns
 - `get_row(index: int) -> dict` - Get row (only selected columns)
+- `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get value
 
 ### ComputedView
@@ -565,6 +569,7 @@ View with an additional computed column.
 - `len()` - Number of rows
 - `column_names()` - All columns (including computed)
 - `get_row(index: int) -> dict` - Get row with computed value
+- `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get value
 
 ### JoinView
@@ -595,6 +600,7 @@ joined = livetable.JoinView("j", sales, targets,
 - `is_empty()` - Check if empty
 - `name()` - Get join name
 - `get_row(index: int) -> dict` - Get joined row
+- `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get value
 - `refresh()` - Rebuild join
 
@@ -640,6 +646,7 @@ GROUP BY view with aggregations.
 **Methods:**
 - `len()` - Number of groups
 - `get_row(index: int) -> dict` - Get group row with aggregated values
+- `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get single value
 - `column_names()` - All columns (group-by + result columns)
 - `sync()` - Incremental update after table changes

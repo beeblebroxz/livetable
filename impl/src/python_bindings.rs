@@ -760,6 +760,11 @@ impl PyTable {
         Ok(dict.to_object(py))
     }
 
+    /// Index access: table[idx] returns the row at idx
+    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
+        self.get_row(py, index)
+    }
+
     /// Display table as formatted string
     fn display(&self) -> String {
         let table = self.inner.borrow();
@@ -1175,6 +1180,11 @@ impl PyFilterView {
         self.table.get_row(py, actual_index)
     }
 
+    /// Index access: view[idx] returns the row at idx
+    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
+        self.get_row(py, index)
+    }
+
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
         if row >= self.indices.len() {
             return Err(PyIndexError::new_err("Index out of range"));
@@ -1360,6 +1370,11 @@ impl PyProjectionView {
         Ok(dict.to_object(py))
     }
 
+    /// Index access: view[idx] returns the row at idx
+    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
+        self.get_row(py, index)
+    }
+
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
         if !self.columns.contains(&column.to_string()) {
             return Err(PyKeyError::new_err(format!("Column '{}' not in projection", column)));
@@ -1439,6 +1454,11 @@ impl PyComputedView {
         result_dict.set_item(&self.computed_column_name, computed_value)?;
 
         Ok(result_dict.to_object(py))
+    }
+
+    /// Index access: view[idx] returns the row at idx
+    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
+        self.get_row(py, index)
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
@@ -1572,6 +1592,11 @@ impl PyJoinView {
             dict.set_item(key, column_value_to_py(py, value)?)?;
         }
         Ok(dict.to_object(py))
+    }
+
+    /// Index access: view[idx] returns the row at idx
+    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
+        self.get_row(py, index)
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
@@ -1755,6 +1780,11 @@ impl PySortedView {
         Ok(dict.to_object(py))
     }
 
+    /// Index access: view[idx] returns the row at idx
+    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
+        self.get_row(py, index)
+    }
+
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
         let value = self.inner.borrow()
             .get_value(row, column)
@@ -1930,6 +1960,11 @@ impl PyAggregateView {
             dict.set_item(key, column_value_to_py(py, value)?)?;
         }
         Ok(dict.to_object(py))
+    }
+
+    /// Index access: view[idx] returns the row at idx
+    fn __getitem__(&self, py: Python, index: usize) -> PyResult<PyObject> {
+        self.get_row(py, index)
     }
 
     /// Get a value at (row, column)

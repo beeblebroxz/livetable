@@ -133,6 +133,8 @@ table = livetable.Table("students", schema)
 # CRUD operations
 table.append_row({"id": 1, "name": "Alice", "score": 95.5})
 table.set_value(0, "score", 97.0)
+row = table[0]           # Indexing: table[idx]
+row = table.get_row(0)   # Same as above
 table.delete_row(0)
 
 # Views (zero-copy)
