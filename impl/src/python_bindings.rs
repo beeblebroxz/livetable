@@ -121,6 +121,28 @@ fn column_value_to_py(py: Python, value: &RustColumnValue) -> PyResult<PyObject>
     }
 }
 
+/// Extract a string or list of strings from a Python object.
+/// Supports both single string and list of strings for backward compatibility.
+fn extract_string_or_list(value: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    // Try to extract as a single string first
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(vec![s]);
+    }
+
+    // Try to extract as a list of strings
+    if let Ok(list) = value.downcast::<PyList>() {
+        let mut result = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            let s: String = item.extract()
+                .map_err(|_| PyValueError::new_err("All items in key list must be strings"))?;
+            result.push(s);
+        }
+        return Ok(result);
+    }
+
+    Err(PyValueError::new_err("Key must be a string or list of strings"))
+}
+
 /// Convert pandas dtype string to ColumnType
 fn dtype_str_to_column_type(dtype_str: &str) -> RustColumnType {
     match dtype_str {
@@ -1163,21 +1185,34 @@ pub struct PyJoinView {
 
 #[pymethods]
 impl PyJoinView {
+    /// Create a new JoinView.
+    ///
+    /// # Arguments
+    /// * `name` - Name for this view
+    /// * `left_table` - Left table
+    /// * `right_table` - Right table
+    /// * `left_keys` - Column name(s) in left table to join on (string or list of strings)
+    /// * `right_keys` - Column name(s) in right table to join on (string or list of strings)
+    /// * `join_type` - Type of join (JoinType.LEFT or JoinType.INNER)
     #[new]
     fn new(
         name: String,
         left_table: PyTable,
         right_table: PyTable,
-        left_key: String,
-        right_key: String,
+        left_keys: &Bound<'_, PyAny>,
+        right_keys: &Bound<'_, PyAny>,
         join_type: PyJoinType,
     ) -> PyResult<Self> {
-        let join = RustJoinView::new(
+        // Convert left_keys to Vec<String>
+        let left_keys_vec = extract_string_or_list(left_keys)?;
+        let right_keys_vec = extract_string_or_list(right_keys)?;
+
+        let join = RustJoinView::new_multi(
             name,
             left_table.inner.clone(),
             right_table.inner.clone(),
-            left_key,
-            right_key,
+            left_keys_vec,
+            right_keys_vec,
             join_type.inner,
         ).map_err(|e| PyValueError::new_err(e))?;
 

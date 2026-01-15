@@ -66,7 +66,7 @@ livetable/
 - **FilterView** - Filter rows with Python lambda functions
 - **ProjectionView** - Select specific columns
 - **ComputedView** - Add computed columns with lambdas
-- **JoinView** - LEFT and INNER joins between tables
+- **JoinView** - LEFT and INNER joins between tables (supports multi-column composite keys)
 - **SortedView** - Sorted views with multi-column support
 - **AggregateView** - GROUP BY with SUM, AVG, MIN, MAX, COUNT
 
@@ -96,18 +96,23 @@ livetable/
 
 ## Performance
 
-The Rust implementation with Python bindings delivers:
-- **10-100x faster** operations compared to pure Python
-- **Zero-copy views** - no data duplication
-- **Efficient joins** - O(N+M) complexity
-- **Type safety** at compile time
-- **Sub-nanosecond** access times for individual operations
+LiveTable excels at **row-level operations** and **reactive views** - areas where pandas struggles:
 
-| Operation | Speed | Note |
-|-----------|-------|------|
-| Insert 10K rows | ~5ms | vs ~100ms in Python |
-| Filter 10K rows | ~2ms | vs ~50ms in Python |
-| Joins | O(N+M) | Algorithmic improvement |
+| Operation | LiveTable | Pandas | Speedup |
+|-----------|-----------|--------|---------|
+| Row iteration (`for row in table`) | 2.8ms | 68ms | **25x faster** |
+| Random access (`get_row(i)`) | 0.3ms | 10ms | **33x faster** |
+| Aggregations (small data) | 0.02ms | 0.03ms | 1.5x faster |
+
+*Benchmarks on 10,000 rows. See `benchmarks/benchmark_vs_pandas.py`*
+
+**Key advantages:**
+- **Zero-copy views** - FilterView, JoinView, etc. don't duplicate data
+- **Reactive updates** - Views auto-update when source table changes
+- **Type safety** - Schema-enforced types catch errors early
+- **Real-time sync** - WebSocket support for live dashboards
+
+**When to use pandas instead:** Bulk vectorized operations (filtering large datasets, aggregations at scale) where numpy's optimized C code excels.
 
 ## Example
 
@@ -147,7 +152,7 @@ sorted_view = livetable.SortedView(
     [livetable.SortKey.descending("score")]
 )
 
-# Join tables
+# Join tables (single column)
 joined = livetable.JoinView(
     "student_courses",
     students,
@@ -155,6 +160,16 @@ joined = livetable.JoinView(
     "id",           # Column in students
     "student_id",   # Column in enrollments
     livetable.JoinType.LEFT
+)
+
+# Multi-column join (composite keys)
+sales_targets_joined = livetable.JoinView(
+    "sales_vs_targets",
+    sales,
+    targets,
+    ["year", "month", "region"],  # Left keys
+    ["target_year", "target_month", "target_region"],  # Right keys
+    livetable.JoinType.INNER
 )
 
 # Simple aggregations

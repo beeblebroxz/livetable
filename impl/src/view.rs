@@ -363,8 +363,10 @@ pub struct JoinView {
     name: String,
     left_table: Rc<RefCell<Table>>,
     right_table: Rc<RefCell<Table>>,
-    left_key: String,
-    right_key: String,
+    /// Column names in left table to join on (supports multi-column joins)
+    left_keys: Vec<String>,
+    /// Column names in right table to join on (supports multi-column joins)
+    right_keys: Vec<String>,
     join_type: JoinType,
     /// Cached joined rows: (left_row_index, optional_right_row_index)
     join_index: Vec<(usize, Option<usize>)>,
@@ -375,7 +377,7 @@ pub struct JoinView {
 }
 
 impl JoinView {
-    /// Creates a new join view.
+    /// Creates a new join view with single-column join keys.
     ///
     /// # Arguments
     ///
@@ -397,17 +399,62 @@ impl JoinView {
         right_key: String,
         join_type: JoinType,
     ) -> Result<Self, String> {
-        // Validate keys exist
+        Self::new_multi(name, left_table, right_table, vec![left_key], vec![right_key], join_type)
+    }
+
+    /// Creates a new join view with multi-column join keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name for this view
+    /// * `left_table` - Left table (all rows included in left join)
+    /// * `right_table` - Right table (matched rows included)
+    /// * `left_keys` - Column names in left table to join on
+    /// * `right_keys` - Column names in right table to join on
+    /// * `join_type` - Type of join (Left or Inner)
+    ///
+    /// # Returns
+    ///
+    /// Result containing the JoinView or an error if columns don't exist
+    /// or key counts don't match
+    pub fn new_multi(
+        name: String,
+        left_table: Rc<RefCell<Table>>,
+        right_table: Rc<RefCell<Table>>,
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
+        join_type: JoinType,
+    ) -> Result<Self, String> {
+        // Validate key counts match
+        if left_keys.len() != right_keys.len() {
+            return Err(format!(
+                "Join key count mismatch: left has {} keys, right has {} keys",
+                left_keys.len(),
+                right_keys.len()
+            ));
+        }
+
+        if left_keys.is_empty() {
+            return Err("At least one join key is required".to_string());
+        }
+
+        // Validate all left keys exist
         {
             let left = left_table.borrow();
-            if left.schema().get_column_index(&left_key).is_none() {
-                return Err(format!("Left table missing column '{}'", left_key));
+            for key in &left_keys {
+                if left.schema().get_column_index(key).is_none() {
+                    return Err(format!("Left table missing column '{}'", key));
+                }
             }
         }
+
+        // Validate all right keys exist
         {
             let right = right_table.borrow();
-            if right.schema().get_column_index(&right_key).is_none() {
-                return Err(format!("Right table missing column '{}'", right_key));
+            for key in &right_keys {
+                if right.schema().get_column_index(key).is_none() {
+                    return Err(format!("Right table missing column '{}'", key));
+                }
             }
         }
 
@@ -418,8 +465,8 @@ impl JoinView {
             name,
             left_table,
             right_table,
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             join_type,
             join_index: Vec::new(),
             left_last_synced: left_gen,
@@ -428,6 +475,20 @@ impl JoinView {
 
         view.rebuild_index();
         Ok(view)
+    }
+
+    /// Build a composite key string from multiple column values.
+    /// Returns None if any key column is missing or contains NULL (SQL semantics: NULL != NULL)
+    fn build_composite_key(row: &HashMap<String, ColumnValue>, keys: &[String]) -> Option<String> {
+        let mut parts: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            match row.get(key) {
+                Some(ColumnValue::Null) => return None, // NULL doesn't match anything
+                Some(value) => parts.push(format!("{:?}", value)),
+                None => return None, // Missing key column
+            }
+        }
+        Some(parts.join("\x00")) // Use null byte as separator
     }
 
     /// Rebuilds the join index by scanning both tables
@@ -442,8 +503,7 @@ impl JoinView {
 
         for i in 0..right.len() {
             if let Ok(row) = right.get_row(i) {
-                if let Some(key_value) = row.get(&self.right_key) {
-                    let key_str = format!("{:?}", key_value); // Use debug format as key
+                if let Some(key_str) = Self::build_composite_key(&row, &self.right_keys) {
                     right_index.entry(key_str).or_insert_with(Vec::new).push(i);
                 }
             }
@@ -452,9 +512,7 @@ impl JoinView {
         // For each left row, find matching right rows
         for i in 0..left.len() {
             if let Ok(row) = left.get_row(i) {
-                if let Some(key_value) = row.get(&self.left_key) {
-                    let key_str = format!("{:?}", key_value);
-
+                if let Some(key_str) = Self::build_composite_key(&row, &self.left_keys) {
                     if let Some(matching_indices) = right_index.get(&key_str) {
                         // Found matches - add each combination
                         for &right_idx in matching_indices {
@@ -488,8 +546,7 @@ impl JoinView {
 
         for i in 0..right.len() {
             if let Ok(row) = right.get_row(i) {
-                if let Some(key_value) = row.get(&self.right_key) {
-                    let key_str = format!("{:?}", key_value);
+                if let Some(key_str) = Self::build_composite_key(&row, &self.right_keys) {
                     right_index.entry(key_str).or_insert_with(Vec::new).push(i);
                 }
             }
@@ -530,13 +587,9 @@ impl JoinView {
             let right_row = self.right_table.borrow().get_row(right_idx)?;
             // Add right columns, prefixing with "right_" to avoid collisions
             for (col_name, value) in right_row {
-                // Skip the join key from right table to avoid duplication
-                if col_name != self.right_key {
-                    result.insert(format!("right_{}", col_name), value);
-                } else {
-                    // Still include it but with prefix
-                    result.insert(format!("right_{}", col_name), value);
-                }
+                // All columns are included with "right_" prefix
+                // (join keys are included to allow verification if needed)
+                result.insert(format!("right_{}", col_name), value);
             }
         } else {
             // No match - add null values for all right columns
@@ -590,13 +643,13 @@ impl JoinView {
         // This is a conservative approach that ensures correctness
         let left_needs_rebuild = left_changes.iter().any(|c| match c {
             TableChange::RowDeleted { .. } => true,
-            TableChange::CellUpdated { column, .. } => column == &self.left_key,
+            TableChange::CellUpdated { column, .. } => self.left_keys.contains(column),
             _ => false,
         });
 
         let right_needs_rebuild = right_changes.iter().any(|c| match c {
             TableChange::RowDeleted { .. } => true,
-            TableChange::CellUpdated { column, .. } => column == &self.right_key,
+            TableChange::CellUpdated { column, .. } => self.right_keys.contains(column),
             _ => false,
         });
 
@@ -620,8 +673,7 @@ impl JoinView {
                 }
 
                 // Find matches for the new left row
-                if let Some(key_value) = data.get(&self.left_key) {
-                    let key_str = format!("{:?}", key_value);
+                if let Some(key_str) = Self::build_composite_key(data, &self.left_keys) {
                     let right_lookup = self.build_right_lookup();
 
                     if let Some(matching_indices) = right_lookup.get(&key_str) {
@@ -650,15 +702,13 @@ impl JoinView {
                 }
 
                 // Find left rows that match this new right row
-                if let Some(key_value) = data.get(&self.right_key) {
-                    let key_str = format!("{:?}", key_value);
+                if let Some(right_key_str) = Self::build_composite_key(data, &self.right_keys) {
                     let left = self.left_table.borrow();
 
                     for left_idx in 0..left.len() {
                         if let Ok(left_row) = left.get_row(left_idx) {
-                            if let Some(left_key_value) = left_row.get(&self.left_key) {
-                                let left_key_str = format!("{:?}", left_key_value);
-                                if left_key_str == key_str {
+                            if let Some(left_key_str) = Self::build_composite_key(&left_row, &self.left_keys) {
+                                if left_key_str == right_key_str {
                                     // For left joins, we might need to replace a (left_idx, None)
                                     // with (left_idx, Some(right_idx))
                                     if self.join_type == JoinType::Left {

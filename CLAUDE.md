@@ -143,8 +143,14 @@ computed = table.add_computed_column("grade", lambda row: "A" if row["score"] >=
 # Sorted views
 sorted_view = livetable.SortedView("by_score", table, [livetable.SortKey.descending("score")])
 
-# Joins
+# Joins - single column
 joined = livetable.JoinView("result", table1, table2, "id", "ref_id", livetable.JoinType.LEFT)
+
+# Joins - multi-column (composite keys)
+joined = livetable.JoinView("result", sales, targets,
+    ["year", "month", "region"],  # Left keys
+    ["target_year", "target_month", "target_region"],  # Right keys
+    livetable.JoinType.INNER)
 
 # Simple aggregations
 total = table.sum("score")

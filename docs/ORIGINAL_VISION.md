@@ -198,7 +198,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 
 ### Planned
 - [ ] RIGHT and FULL OUTER joins
-- [ ] Multi-column joins
+- [x] Multi-column joins (composite key support)
 - [ ] Date/Time column types
 - [ ] Materialized Views (cached for faster reads)
 - [x] Bulk/Batch operations (`append_rows`)

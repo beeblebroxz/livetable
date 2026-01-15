@@ -191,6 +191,37 @@ inner_joined = livetable.JoinView(
     "user_id",
     livetable.JoinType.INNER
 )
+
+# MULTI-COLUMN JOIN - composite keys
+# Useful for time-series data, hierarchical data, etc.
+sales_schema = livetable.Schema([
+    ("year", livetable.ColumnType.INT32, False),
+    ("month", livetable.ColumnType.INT32, False),
+    ("region", livetable.ColumnType.STRING, False),
+    ("sales_amount", livetable.ColumnType.FLOAT64, False),
+])
+targets_schema = livetable.Schema([
+    ("target_year", livetable.ColumnType.INT32, False),
+    ("target_month", livetable.ColumnType.INT32, False),
+    ("target_region", livetable.ColumnType.STRING, False),
+    ("target_amount", livetable.ColumnType.FLOAT64, False),
+])
+
+sales = livetable.Table("sales", sales_schema)
+targets = livetable.Table("targets", targets_schema)
+
+# Join on multiple columns (composite key)
+joined = livetable.JoinView(
+    "sales_vs_targets",
+    sales,
+    targets,
+    ["year", "month", "region"],  # Left keys (list)
+    ["target_year", "target_month", "target_region"],  # Right keys (list)
+    livetable.JoinType.LEFT
+)
+
+# Single string key still works (backward compatible)
+simple_join = livetable.JoinView("j", t1, t2, "id", "ref_id", livetable.JoinType.INNER)
 ```
 
 ### ✅ Serialization (CSV/JSON)
@@ -453,13 +484,21 @@ JoinView(
     name: str,
     left_table: Table,
     right_table: Table,
-    left_key: str,
-    right_key: str,
+    left_keys: str | list[str],   # Single key or list for composite keys
+    right_keys: str | list[str],  # Single key or list for composite keys
     join_type: JoinType
 )
 ```
 
-Join two tables on matching columns.
+Join two tables on matching columns. Supports both single-column and multi-column (composite key) joins.
+
+**Multi-column join example:**
+```python
+joined = livetable.JoinView("j", sales, targets,
+    ["year", "month"],           # Left keys
+    ["target_year", "target_month"],  # Right keys
+    livetable.JoinType.INNER)
+```
 
 **Methods:**
 - `len()` - Number of joined rows
@@ -469,7 +508,10 @@ Join two tables on matching columns.
 - `get_value(row: int, column: str)` - Get value
 - `refresh()` - Rebuild join
 
-**Note:** Right table columns are prefixed with `"right_"` to avoid conflicts.
+**Notes:**
+- Right table columns are prefixed with `"right_"` to avoid conflicts
+- NULL values in join keys don't match (SQL semantics)
+- Key counts must match between left and right
 
 ### JoinType
 

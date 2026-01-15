@@ -1,0 +1,218 @@
+[
+  {
+    "name": "insert_rows",
+    "size": 1000,
+    "livetable_ms": 1.5105205000054411,
+    "pandas_ms": 0.4257709999819781,
+    "speedup": 0.28187038837304385,
+    "winner": "pandas"
+  },
+  {
+    "name": "insert_rows",
+    "size": 10000,
+    "livetable_ms": 15.297728999939864,
+    "pandas_ms": 4.100666000113051,
+    "speedup": 0.268057173723575,
+    "winner": "pandas"
+  },
+  {
+    "name": "insert_rows",
+    "size": 100000,
+    "livetable_ms": 155.01597900038178,
+    "pandas_ms": 48.76956249995601,
+    "speedup": 0.31460990547197654,
+    "winner": "pandas"
+  },
+  {
+    "name": "bulk_insert",
+    "size": 1000,
+    "livetable_ms": 1.3096040001983056,
+    "pandas_ms": 0.27935399998568755,
+    "speedup": 0.21331181024446064,
+    "winner": "pandas"
+  },
+  {
+    "name": "bulk_insert",
+    "size": 10000,
+    "livetable_ms": 13.113416500118547,
+    "pandas_ms": 2.317749999974694,
+    "speedup": 0.17674646419975615,
+    "winner": "pandas"
+  },
+  {
+    "name": "bulk_insert",
+    "size": 100000,
+    "livetable_ms": 133.1318539998847,
+    "pandas_ms": 24.56593800002338,
+    "speedup": 0.18452336733810268,
+    "winner": "pandas"
+  },
+  {
+    "name": "filter",
+    "size": 1000,
+    "livetable_ms": 0.297103999855608,
+    "pandas_ms": 0.06297899994933687,
+    "speedup": 0.2119762775995764,
+    "winner": "pandas"
+  },
+  {
+    "name": "filter",
+    "size": 10000,
+    "livetable_ms": 3.0210415000055946,
+    "pandas_ms": 0.09068750000551518,
+    "speedup": 0.030018621063413804,
+    "winner": "pandas"
+  },
+  {
+    "name": "filter",
+    "size": 100000,
+    "livetable_ms": 30.28949949998605,
+    "pandas_ms": 0.40310450003744336,
+    "speedup": 0.013308390917374815,
+    "winner": "pandas"
+  },
+  {
+    "name": "aggregation",
+    "size": 1000,
+    "livetable_ms": 0.015250000160449417,
+    "pandas_ms": 0.027562500008571078,
+    "speedup": 1.807377030726458,
+    "winner": "livetable"
+  },
+  {
+    "name": "aggregation",
+    "size": 10000,
+    "livetable_ms": 0.15220850013974996,
+    "pandas_ms": 0.04510450003181177,
+    "speedup": 0.29633364753216246,
+    "winner": "pandas"
+  },
+  {
+    "name": "aggregation",
+    "size": 100000,
+    "livetable_ms": 1.5215625001019362,
+    "pandas_ms": 0.18056199996863143,
+    "speedup": 0.11866880260031039,
+    "winner": "pandas"
+  },
+  {
+    "name": "join",
+    "size": 1000,
+    "livetable_ms": 0.6118750000041473,
+    "pandas_ms": 0.1522920001661987,
+    "speedup": 0.24889397371222302,
+    "winner": "pandas"
+  },
+  {
+    "name": "join",
+    "size": 10000,
+    "livetable_ms": 6.206749999819294,
+    "pandas_ms": 0.1952919999439473,
+    "speedup": 0.03146445401371621,
+    "winner": "pandas"
+  },
+  {
+    "name": "join",
+    "size": 100000,
+    "livetable_ms": 64.67464599995765,
+    "pandas_ms": 0.679812500038679,
+    "speedup": 0.010511267429884721,
+    "winner": "pandas"
+  },
+  {
+    "name": "sort",
+    "size": 1000,
+    "livetable_ms": 0.07868700004109996,
+    "pandas_ms": 0.04260450009496708,
+    "speedup": 0.5414426788759745,
+    "winner": "pandas"
+  },
+  {
+    "name": "sort",
+    "size": 10000,
+    "livetable_ms": 0.7743960002244421,
+    "pandas_ms": 0.3336664999551431,
+    "speedup": 0.4308732223028489,
+    "winner": "pandas"
+  },
+  {
+    "name": "sort",
+    "size": 100000,
+    "livetable_ms": 7.892291499956627,
+    "pandas_ms": 3.4169375001056324,
+    "speedup": 0.43294618554375625,
+    "winner": "pandas"
+  },
+  {
+    "name": "iteration",
+    "size": 1000,
+    "livetable_ms": 0.27404200000091805,
+    "pandas_ms": 6.9089374999293796,
+    "speedup": 25.211235868612235,
+    "winner": "livetable"
+  },
+  {
+    "name": "iteration",
+    "size": 10000,
+    "livetable_ms": 2.760395499990409,
+    "pandas_ms": 67.86089600018386,
+    "speedup": 24.583758378254,
+    "winner": "livetable"
+  },
+  {
+    "name": "iteration",
+    "size": 100000,
+    "livetable_ms": 27.723166499981744,
+    "pandas_ms": 683.2655204998446,
+    "speedup": 24.646012947341152,
+    "winner": "livetable"
+  },
+  {
+    "name": "random_access",
+    "size": 1000,
+    "livetable_ms": 0.030249999781517545,
+    "pandas_ms": 1.008104499987894,
+    "speedup": 33.32576883533851,
+    "winner": "livetable"
+  },
+  {
+    "name": "random_access",
+    "size": 10000,
+    "livetable_ms": 0.3109584999947401,
+    "pandas_ms": 10.074437499952182,
+    "speedup": 32.398012918516756,
+    "winner": "livetable"
+  },
+  {
+    "name": "random_access",
+    "size": 100000,
+    "livetable_ms": 3.085479499986832,
+    "pandas_ms": 100.68291700008558,
+    "speedup": 32.631205944008144,
+    "winner": "livetable"
+  },
+  {
+    "name": "group_by",
+    "size": 1000,
+    "livetable_ms": 0.7161660000747361,
+    "pandas_ms": 0.333249500272359,
+    "speedup": 0.46532438043356217,
+    "winner": "pandas"
+  },
+  {
+    "name": "group_by",
+    "size": 10000,
+    "livetable_ms": 6.963895499893624,
+    "pandas_ms": 0.3785829999287671,
+    "speedup": 0.054363681926954545,
+    "winner": "pandas"
+  },
+  {
+    "name": "group_by",
+    "size": 100000,
+    "livetable_ms": 76.65768750007373,
+    "pandas_ms": 0.9359370001220668,
+    "speedup": 0.012209303862983951,
+    "winner": "pandas"
+  }
+]
