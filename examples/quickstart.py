@@ -4,6 +4,7 @@ LiveTable - Quick Start Guide
 The fastest way to get started with Rust-powered tables in Python!
 """
 
+from datetime import date
 import livetable
 
 print("🚀 LiveTable Quick Start")
@@ -21,6 +22,7 @@ schema = livetable.Schema([
     ("name", livetable.ColumnType.STRING, False),
     ("age", livetable.ColumnType.INT32, True),  # Can be NULL
     ("score", livetable.ColumnType.FLOAT64, False),
+    ("test_date", livetable.ColumnType.DATE, True),
 ])
 
 # Create table
@@ -34,9 +36,9 @@ print("\n➕ Step 2: Add data")
 print("-" * 60)
 
 # Add rows as dictionaries
-table.append_row({"id": 1, "name": "Alice", "age": 20, "score": 95.5})
-table.append_row({"id": 2, "name": "Bob", "age": 22, "score": 87.3})
-table.append_row({"id": 3, "name": "Charlie", "age": None, "score": 92.1})
+table.append_row({"id": 1, "name": "Alice", "age": 20, "score": 95.5, "test_date": date.today()})
+table.append_row({"id": 2, "name": "Bob", "age": 22, "score": 87.3, "test_date": date.today()})
+table.append_row({"id": 3, "name": "Charlie", "age": None, "score": 92.1, "test_date": date.today()})
 
 print(f"✅ Added 3 rows. Table now has {len(table)} rows")
 
