@@ -89,7 +89,7 @@ cd frontend && npm install && npm run dev
 
 ### Layered Design (impl/src/)
 - **sequence.rs** - Storage backends: `ArraySequence` (contiguous), `TieredVectorSequence` (efficient inserts)
-- **column.rs** - Strongly-typed column values with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL)
+- **column.rs** - Strongly-typed column values with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
 - **table.rs** - Row-level CRUD operations on column collections
 - **view.rs** - Zero-copy views: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView`, `SortedView`
 - **python_bindings.rs** - PyO3 bindings exposing Rust types as Python classes
@@ -192,6 +192,24 @@ rows = [
     {"id": 2, "name": "Bob", "score": 87.0},
 ]
 count = table.append_rows(rows)  # Returns number inserted
+
+# Date and DateTime columns
+from datetime import date, datetime
+
+date_schema = livetable.Schema([
+    ("id", livetable.ColumnType.INT32, False),
+    ("birth_date", livetable.ColumnType.DATE, False),
+    ("created_at", livetable.ColumnType.DATETIME, True),
+])
+events = livetable.Table("events", date_schema)
+events.append_row({
+    "id": 1,
+    "birth_date": date(1990, 5, 15),
+    "created_at": datetime(2024, 1, 15, 10, 30, 0),
+})
+
+# Dates serialize as ISO 8601 strings in CSV/JSON
+csv = events.to_csv()  # birth_date becomes "1990-05-15"
 
 # Pandas interop
 import pandas as pd

@@ -24,6 +24,10 @@ pub enum ColumnType {
     Float64,
     String,
     Bool,
+    /// Date stored as days since Unix epoch (1970-01-01)
+    Date,
+    /// DateTime stored as milliseconds since Unix epoch
+    DateTime,
 }
 
 /// Column value enum to support multiple types
@@ -35,6 +39,10 @@ pub enum ColumnValue {
     Float64(f64),
     String(String),
     Bool(bool),
+    /// Date as days since Unix epoch (1970-01-01). Positive = after, negative = before.
+    Date(i32),
+    /// DateTime as milliseconds since Unix epoch. Positive = after, negative = before.
+    DateTime(i64),
     Null,
 }
 
@@ -81,6 +89,22 @@ impl ColumnValue {
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             ColumnValue::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Get date as days since Unix epoch (1970-01-01)
+    pub fn as_date(&self) -> Option<i32> {
+        match self {
+            ColumnValue::Date(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Get datetime as milliseconds since Unix epoch
+    pub fn as_datetime(&self) -> Option<i64> {
+        match self {
+            ColumnValue::DateTime(v) => Some(*v),
             _ => None,
         }
     }
@@ -216,6 +240,8 @@ impl Column {
             (ColumnValue::Float64(_), ColumnType::Float64) => Ok(value),
             (ColumnValue::String(_), ColumnType::String) => Ok(value),
             (ColumnValue::Bool(_), ColumnType::Bool) => Ok(value),
+            (ColumnValue::Date(_), ColumnType::Date) => Ok(value),
+            (ColumnValue::DateTime(_), ColumnType::DateTime) => Ok(value),
             _ => Err(format!(
                 "Type mismatch: expected {:?}, got {:?}",
                 self.column_type, value
@@ -443,6 +469,8 @@ impl Column {
             ColumnType::Float64 => ColumnValue::Float64(0.0),
             ColumnType::String => ColumnValue::String(String::new()),
             ColumnType::Bool => ColumnValue::Bool(false),
+            ColumnType::Date => ColumnValue::Date(0),         // 1970-01-01
+            ColumnType::DateTime => ColumnValue::DateTime(0), // 1970-01-01 00:00:00
         }
     }
 

@@ -15,6 +15,84 @@ use crate::table::{Schema as RustSchema, Table as RustTable};
 use crate::view::{JoinView as RustJoinView, JoinType as RustJoinType, SortedView as RustSortedView, SortKey as RustSortKey, SortOrder as RustSortOrder, AggregateFunction as RustAggregateFunction, AggregateView as RustAggregateView};
 
 // ============================================================================
+// Date/Time Helper Functions
+// ============================================================================
+
+/// Convert a Python datetime.date to days since Unix epoch (1970-01-01)
+fn date_to_days_since_epoch(date: &Bound<'_, PyAny>) -> PyResult<i32> {
+    let year: i32 = date.getattr("year")?.extract()?;
+    let month: u32 = date.getattr("month")?.extract()?;
+    let day: u32 = date.getattr("day")?.extract()?;
+
+    // Calculate days since epoch using a simple algorithm
+    // This handles leap years correctly
+    let days = days_from_ymd(year, month, day);
+    Ok(days)
+}
+
+/// Convert a Python datetime.datetime to milliseconds since Unix epoch
+fn datetime_to_ms_since_epoch(dt: &Bound<'_, PyAny>) -> PyResult<i64> {
+    let year: i32 = dt.getattr("year")?.extract()?;
+    let month: u32 = dt.getattr("month")?.extract()?;
+    let day: u32 = dt.getattr("day")?.extract()?;
+    let hour: u32 = dt.getattr("hour")?.extract()?;
+    let minute: u32 = dt.getattr("minute")?.extract()?;
+    let second: u32 = dt.getattr("second")?.extract()?;
+    let microsecond: u32 = dt.getattr("microsecond")?.extract()?;
+
+    let days = days_from_ymd(year, month, day) as i64;
+    let ms = days * 24 * 60 * 60 * 1000
+        + (hour as i64) * 60 * 60 * 1000
+        + (minute as i64) * 60 * 1000
+        + (second as i64) * 1000
+        + (microsecond as i64) / 1000;
+    Ok(ms)
+}
+
+/// Convert days since epoch back to (year, month, day)
+fn ymd_from_days(days: i32) -> (i32, u32, u32) {
+    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i32) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d)
+}
+
+/// Convert (year, month, day) to days since Unix epoch
+fn days_from_ymd(year: i32, month: u32, day: u32) -> i32 {
+    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = (y - era * 400) as u32;
+    let m = month;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146097 + doe as i32) - 719468
+}
+
+/// Convert milliseconds since epoch to (year, month, day, hour, minute, second, microsecond)
+fn datetime_from_ms(ms: i64) -> (i32, u32, u32, u32, u32, u32, u32) {
+    let days = (ms / (24 * 60 * 60 * 1000)) as i32;
+    let remaining_ms = (ms % (24 * 60 * 60 * 1000)).abs();
+
+    let (year, month, day) = ymd_from_days(days);
+
+    let hour = (remaining_ms / (60 * 60 * 1000)) as u32;
+    let minute = ((remaining_ms % (60 * 60 * 1000)) / (60 * 1000)) as u32;
+    let second = ((remaining_ms % (60 * 1000)) / 1000) as u32;
+    let microsecond = ((remaining_ms % 1000) * 1000) as u32;
+
+    (year, month, day, hour, minute, second, microsecond)
+}
+
+// ============================================================================
 // Core Type Conversions
 // ============================================================================
 
@@ -45,6 +123,14 @@ impl PyColumnType {
     #[classattr]
     const BOOL: PyColumnType = PyColumnType { inner: RustColumnType::Bool };
 
+    /// Date type (days since 1970-01-01)
+    #[classattr]
+    const DATE: PyColumnType = PyColumnType { inner: RustColumnType::Date };
+
+    /// DateTime type (milliseconds since 1970-01-01 00:00:00 UTC)
+    #[classattr]
+    const DATETIME: PyColumnType = PyColumnType { inner: RustColumnType::DateTime };
+
     fn __repr__(&self) -> String {
         match self.inner {
             RustColumnType::Int32 => "ColumnType.INT32".to_string(),
@@ -53,6 +139,8 @@ impl PyColumnType {
             RustColumnType::Float64 => "ColumnType.FLOAT64".to_string(),
             RustColumnType::String => "ColumnType.STRING".to_string(),
             RustColumnType::Bool => "ColumnType.BOOL".to_string(),
+            RustColumnType::Date => "ColumnType.DATE".to_string(),
+            RustColumnType::DateTime => "ColumnType.DATETIME".to_string(),
         }
     }
 }
@@ -100,12 +188,30 @@ fn py_to_column_value(_py: Python, value: &Bound<'_, PyAny>) -> PyResult<RustCol
         return Ok(RustColumnValue::Float32(v));
     }
 
-    // Finally strings
-    if let Ok(v) = value.extract::<String>() {
-        return Ok(RustColumnValue::String(v));
-    }
+    // Check for datetime types (before string, since datetime has __str__)
+    Python::with_gil(|py| {
+        let datetime_mod = py.import_bound("datetime").ok()?;
+        let datetime_type = datetime_mod.getattr("datetime").ok()?;
+        let date_type = datetime_mod.getattr("date").ok()?;
 
-    Err(PyValueError::new_err("Cannot convert value to ColumnValue"))
+        // datetime must be checked before date (datetime is subclass of date)
+        if value.is_instance(&datetime_type).unwrap_or(false) {
+            let ms = datetime_to_ms_since_epoch(value).ok()?;
+            return Some(RustColumnValue::DateTime(ms));
+        }
+        if value.is_instance(&date_type).unwrap_or(false) {
+            let days = date_to_days_since_epoch(value).ok()?;
+            return Some(RustColumnValue::Date(days));
+        }
+        None
+    }).map(Ok).unwrap_or_else(|| {
+        // Finally strings
+        if let Ok(v) = value.extract::<String>() {
+            return Ok(RustColumnValue::String(v));
+        }
+
+        Err(PyValueError::new_err("Cannot convert value to ColumnValue"))
+    })
 }
 
 /// Convert Python value to ColumnValue using known column type (faster than guessing).
@@ -162,6 +268,56 @@ fn py_to_column_value_typed(
                 .map(RustColumnValue::Bool)
                 .map_err(|_| PyValueError::new_err("Expected BOOL value"))
         }
+        RustColumnType::Date => {
+            // Accept datetime.date, datetime.datetime, or integer (days since epoch)
+            // Try integer first (days since epoch)
+            if let Ok(days) = value.extract::<i32>() {
+                return Ok(RustColumnValue::Date(days));
+            }
+            // Try datetime.date or datetime.datetime
+            Python::with_gil(|py| {
+                let datetime_mod = py.import_bound("datetime")?;
+                let date_type = datetime_mod.getattr("date")?;
+                let datetime_type = datetime_mod.getattr("datetime")?;
+
+                if value.is_instance(&datetime_type)? {
+                    // datetime.datetime - extract just the date part
+                    let date_obj = value.call_method0("date")?;
+                    let days = date_to_days_since_epoch(&date_obj)?;
+                    Ok(RustColumnValue::Date(days))
+                } else if value.is_instance(&date_type)? {
+                    let days = date_to_days_since_epoch(value)?;
+                    Ok(RustColumnValue::Date(days))
+                } else {
+                    Err(PyValueError::new_err("Expected DATE value (datetime.date, datetime.datetime, or integer days since epoch)"))
+                }
+            })
+        }
+        RustColumnType::DateTime => {
+            // Accept datetime.datetime, datetime.date, or integer (milliseconds since epoch)
+            // Try integer first (milliseconds since epoch)
+            if let Ok(ms) = value.extract::<i64>() {
+                return Ok(RustColumnValue::DateTime(ms));
+            }
+            // Try datetime.datetime or datetime.date
+            Python::with_gil(|py| {
+                let datetime_mod = py.import_bound("datetime")?;
+                let datetime_type = datetime_mod.getattr("datetime")?;
+                let date_type = datetime_mod.getattr("date")?;
+
+                if value.is_instance(&datetime_type)? {
+                    let ms = datetime_to_ms_since_epoch(value)?;
+                    Ok(RustColumnValue::DateTime(ms))
+                } else if value.is_instance(&date_type)? {
+                    // date -> datetime at midnight
+                    let days = date_to_days_since_epoch(value)?;
+                    let ms = (days as i64) * 24 * 60 * 60 * 1000;
+                    Ok(RustColumnValue::DateTime(ms))
+                } else {
+                    Err(PyValueError::new_err("Expected DATETIME value (datetime.datetime, datetime.date, or integer milliseconds since epoch)"))
+                }
+            })
+        }
     }
 }
 
@@ -174,6 +330,20 @@ fn column_value_to_py(py: Python, value: &RustColumnValue) -> PyResult<PyObject>
         RustColumnValue::Float64(v) => Ok(v.to_object(py)),
         RustColumnValue::String(v) => Ok(v.to_object(py)),
         RustColumnValue::Bool(v) => Ok(v.to_object(py)),
+        RustColumnValue::Date(days) => {
+            let (year, month, day) = ymd_from_days(*days);
+            let datetime_mod = py.import_bound("datetime")?;
+            let date_class = datetime_mod.getattr("date")?;
+            let date_obj = date_class.call1((year, month, day))?;
+            Ok(date_obj.to_object(py))
+        }
+        RustColumnValue::DateTime(ms) => {
+            let (year, month, day, hour, minute, second, microsecond) = datetime_from_ms(*ms);
+            let datetime_mod = py.import_bound("datetime")?;
+            let datetime_class = datetime_mod.getattr("datetime")?;
+            let dt_obj = datetime_class.call1((year, month, day, hour, minute, second, microsecond))?;
+            Ok(dt_obj.to_object(py))
+        }
         RustColumnValue::Null => Ok(py.None()),
     }
 }
@@ -208,6 +378,7 @@ fn dtype_str_to_column_type(dtype_str: &str) -> RustColumnType {
         "float32" => RustColumnType::Float32,
         "float64" => RustColumnType::Float64,
         "bool" | "boolean" => RustColumnType::Bool,
+        s if s.starts_with("datetime64") => RustColumnType::DateTime,
         _ => RustColumnType::String, // Default for object, string, etc.
     }
 }
@@ -291,6 +462,35 @@ fn pandas_value_to_column_value(py: Python, value: &Bound<'_, PyAny>, expected_t
             if let Ok(v) = value.str() {
                 if let Ok(s) = v.extract::<String>() {
                     return Ok(RustColumnValue::String(s));
+                }
+            }
+        }
+        RustColumnType::Date => {
+            // Try to extract days since epoch directly (integer)
+            if let Ok(days) = value.extract::<i32>() {
+                return Ok(RustColumnValue::Date(days));
+            }
+            // Try datetime.date object
+            if let Ok(days) = date_to_days_since_epoch(value) {
+                return Ok(RustColumnValue::Date(days));
+            }
+        }
+        RustColumnType::DateTime => {
+            // Try to extract milliseconds since epoch directly (integer)
+            if let Ok(ms) = value.extract::<i64>() {
+                return Ok(RustColumnValue::DateTime(ms));
+            }
+            // Try datetime.datetime object
+            if let Ok(ms) = datetime_to_ms_since_epoch(value) {
+                return Ok(RustColumnValue::DateTime(ms));
+            }
+            // Try pandas Timestamp (has timestamp() method returning seconds)
+            if let Ok(ts_method) = value.getattr("timestamp") {
+                if let Ok(ts_result) = ts_method.call0() {
+                    if let Ok(seconds) = ts_result.extract::<f64>() {
+                        let ms = (seconds * 1000.0) as i64;
+                        return Ok(RustColumnValue::DateTime(ms));
+                    }
                 }
             }
         }

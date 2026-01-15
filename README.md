@@ -61,6 +61,7 @@ livetable/
 - CRUD operations (Create, Read, Update, Delete)
 - NULL value support
 - Type validation at compile time (Rust) and runtime (Python)
+- **Date and DateTime types** - Native support for dates and timestamps
 
 ### Advanced Views
 - **FilterView** - Filter rows with Python lambda functions

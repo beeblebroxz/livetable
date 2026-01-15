@@ -199,7 +199,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 ### Planned
 - [ ] RIGHT and FULL OUTER joins
 - [x] Multi-column joins (composite key support)
-- [ ] Date/Time column types
+- [x] Date/Time column types (DATE and DATETIME)
 - [ ] Materialized Views (cached for faster reads)
 - [x] Bulk/Batch operations (`append_rows`)
 - [x] Python iterator protocol (`for row in table`)

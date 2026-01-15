@@ -1029,6 +1029,8 @@ impl SortedView {
             }
             (ColumnValue::String(a), ColumnValue::String(b)) => a.cmp(b),
             (ColumnValue::Bool(a), ColumnValue::Bool(b)) => a.cmp(b),
+            (ColumnValue::Date(a), ColumnValue::Date(b)) => a.cmp(b),
+            (ColumnValue::DateTime(a), ColumnValue::DateTime(b)) => a.cmp(b),
             // Mixed types - compare type ordering for deterministic results
             _ => Ordering::Equal, // Different types are equal for stability
         };
@@ -1080,6 +1082,8 @@ impl SortedView {
             }
             (ColumnValue::String(a), ColumnValue::String(b)) => a.cmp(b),
             (ColumnValue::Bool(a), ColumnValue::Bool(b)) => a.cmp(b),
+            (ColumnValue::Date(a), ColumnValue::Date(b)) => a.cmp(b),
+            (ColumnValue::DateTime(a), ColumnValue::DateTime(b)) => a.cmp(b),
             // Mixed types - compare by type name for deterministic ordering
             (a, b) => format!("{:?}", a).cmp(&format!("{:?}", b)),
         };
@@ -1405,6 +1409,8 @@ impl GroupKey {
                         ColumnValue::Float64(f) => Some(format!("F{}", f)),
                         ColumnValue::String(s) => Some(format!("s{}", s)),
                         ColumnValue::Bool(b) => Some(if *b { "B1".to_string() } else { "B0".to_string() }),
+                        ColumnValue::Date(d) => Some(format!("d{}", d)),
+                        ColumnValue::DateTime(dt) => Some(format!("D{}", dt)),
                     }
                 })
             })
@@ -1427,6 +1433,8 @@ impl GroupKey {
                     Ok(ColumnValue::Float64(v)) => Some(format!("F{}", v)),
                     Ok(ColumnValue::String(s)) => Some(format!("s{}", s)),
                     Ok(ColumnValue::Bool(b)) => Some(if b { "B1".to_string() } else { "B0".to_string() }),
+                    Ok(ColumnValue::Date(d)) => Some(format!("d{}", d)),
+                    Ok(ColumnValue::DateTime(dt)) => Some(format!("D{}", dt)),
                     Err(_) => None,
                 }
             })
@@ -1511,6 +1519,22 @@ impl GroupKey {
                                         ColumnValue::Bool(true)
                                     } else if s == "B0" || s == "Bool(false)" {
                                         ColumnValue::Bool(false)
+                                    } else {
+                                        ColumnValue::Null
+                                    }
+                                }
+                                crate::column::ColumnType::Date => {
+                                    // New format: d<days>
+                                    if s.starts_with('d') {
+                                        s[1..].parse().map(ColumnValue::Date).unwrap_or(ColumnValue::Null)
+                                    } else {
+                                        ColumnValue::Null
+                                    }
+                                }
+                                crate::column::ColumnType::DateTime => {
+                                    // New format: D<milliseconds>
+                                    if s.starts_with('D') {
+                                        s[1..].parse().map(ColumnValue::DateTime).unwrap_or(ColumnValue::Null)
                                     } else {
                                         ColumnValue::Null
                                     }

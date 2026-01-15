@@ -304,7 +304,65 @@ with open("data.csv", "r") as f:
 - Larger integers → INT64
 - Numbers with decimals → FLOAT64
 - "true"/"false" (case-insensitive) → BOOL
+- YYYY-MM-DD → DATE
+- YYYY-MM-DDTHH:MM:SS → DATETIME
 - Everything else → STRING
+
+### ✅ Date and DateTime Types
+
+Native support for dates and timestamps:
+
+```python
+from datetime import date, datetime
+
+# Create a table with date and datetime columns
+schema = livetable.Schema([
+    ("id", livetable.ColumnType.INT32, False),
+    ("birth_date", livetable.ColumnType.DATE, False),
+    ("created_at", livetable.ColumnType.DATETIME, True),
+])
+table = livetable.Table("events", schema)
+
+# Add rows with date and datetime objects
+table.append_row({
+    "id": 1,
+    "birth_date": date(1990, 5, 15),
+    "created_at": datetime(2024, 1, 15, 10, 30, 0),
+})
+table.append_row({
+    "id": 2,
+    "birth_date": date(2000, 12, 25),
+    "created_at": None,  # Nullable
+})
+
+# Read back as Python date/datetime objects
+row = table.get_row(0)
+print(row["birth_date"])   # date(1990, 5, 15)
+print(row["created_at"])   # datetime(2024, 1, 15, 10, 30)
+
+# Dates before Unix epoch (1970-01-01) are supported
+table.append_row({
+    "id": 3,
+    "birth_date": date(1955, 3, 14),  # Einstein's death
+    "created_at": datetime(1969, 7, 20, 20, 17, 0),  # Moon landing
+})
+
+# CSV/JSON serialization uses ISO 8601 format
+csv = table.to_csv()
+# Output includes: 1990-05-15, 2024-01-15T10:30:00
+
+# Import from CSV/JSON auto-detects date/datetime strings
+csv_data = "id,date\n1,2023-06-15\n2,1970-01-01"
+imported = livetable.Table.from_csv("imported", csv_data)
+row = imported.get_row(0)
+print(row["date"])  # date(2023, 6, 15)
+```
+
+**Accepted input formats:**
+- `datetime.date` objects
+- `datetime.datetime` objects (time part used for DATETIME, discarded for DATE)
+- Integers: days since epoch for DATE, milliseconds since epoch for DATETIME
+- ISO 8601 strings in CSV/JSON: `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`
 
 ### ✅ Iterator Protocol
 
@@ -399,15 +457,17 @@ table_copy = livetable.Table.from_pandas("copy", df_copy)
 
 ## Supported Data Types
 
-| Python Type | LiveTable ColumnType | Rust Type |
-|-------------|----------------|-----------|
-| `int` | `ColumnType.INT32` | `i32` |
-| `int` | `ColumnType.INT64` | `i64` |
-| `float` | `ColumnType.FLOAT32` | `f32` |
-| `float` | `ColumnType.FLOAT64` | `f64` |
-| `str` | `ColumnType.STRING` | `String` |
-| `bool` | `ColumnType.BOOL` | `bool` |
-| `None` | (any nullable column) | `NULL` |
+| Python Type | LiveTable ColumnType | Rust Type | Notes |
+|-------------|----------------|-----------|-------|
+| `int` | `ColumnType.INT32` | `i32` | |
+| `int` | `ColumnType.INT64` | `i64` | |
+| `float` | `ColumnType.FLOAT32` | `f32` | |
+| `float` | `ColumnType.FLOAT64` | `f64` | |
+| `str` | `ColumnType.STRING` | `String` | |
+| `bool` | `ColumnType.BOOL` | `bool` | |
+| `datetime.date` | `ColumnType.DATE` | `i32` (days since 1970-01-01) | Stored as ISO 8601 in CSV/JSON |
+| `datetime.datetime` | `ColumnType.DATETIME` | `i64` (ms since 1970-01-01) | Stored as ISO 8601 in CSV/JSON |
+| `None` | (any nullable column) | `NULL` | |
 
 ## API Reference
 

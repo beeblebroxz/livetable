@@ -646,6 +646,8 @@ impl Table {
                     Some(ColumnValue::Int64(n)) => n.to_string(),
                     Some(ColumnValue::Float32(f)) => f.to_string(),
                     Some(ColumnValue::Float64(f)) => f.to_string(),
+                    Some(ColumnValue::Date(days)) => format_date(*days),
+                    Some(ColumnValue::DateTime(ms)) => format_datetime(*ms),
                 }
             }).collect();
             result.push_str(&values.join(","));
@@ -700,6 +702,8 @@ impl Table {
                             }
                             Some(ColumnValue::String(s)) => serde_json::Value::String(s.clone()),
                             Some(ColumnValue::Bool(b)) => serde_json::Value::Bool(*b),
+                            Some(ColumnValue::Date(days)) => serde_json::Value::String(format_date(*days)),
+                            Some(ColumnValue::DateTime(ms)) => serde_json::Value::String(format_datetime(*ms)),
                             Some(ColumnValue::Null) | None => serde_json::Value::Null,
                         };
                         (col.to_string(), json_val)
@@ -908,6 +912,145 @@ impl Table {
 // Helper functions for serialization
 // ============================================================================
 
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day)
+fn ymd_from_days(days: i32) -> (i32, u32, u32) {
+    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i32) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d)
+}
+
+/// Convert (year, month, day) to days since Unix epoch
+fn days_from_ymd(year: i32, month: u32, day: u32) -> i32 {
+    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = (y - era * 400) as u32;
+    let m = month;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146097 + doe as i32) - 719468
+}
+
+/// Format a date (days since epoch) as ISO 8601 date string (YYYY-MM-DD)
+fn format_date(days: i32) -> String {
+    let (year, month, day) = ymd_from_days(days);
+    format!("{:04}-{:02}-{:02}", year, month, day)
+}
+
+/// Format a datetime (milliseconds since epoch) as ISO 8601 datetime string
+fn format_datetime(ms: i64) -> String {
+    // Handle negative milliseconds (dates before epoch)
+    let (days, time_ms) = if ms >= 0 {
+        ((ms / 86_400_000) as i32, (ms % 86_400_000) as u32)
+    } else {
+        // For negative ms, we need to adjust to get correct date
+        let d = (ms / 86_400_000) as i32 - if ms % 86_400_000 != 0 { 1 } else { 0 };
+        let t = ((ms % 86_400_000) + 86_400_000) as u32 % 86_400_000;
+        (d, t)
+    };
+
+    let (year, month, day) = ymd_from_days(days);
+    let hour = time_ms / 3_600_000;
+    let minute = (time_ms % 3_600_000) / 60_000;
+    let second = (time_ms % 60_000) / 1000;
+    let millisecond = time_ms % 1000;
+
+    if millisecond > 0 {
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}",
+            year, month, day, hour, minute, second, millisecond)
+    } else {
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            year, month, day, hour, minute, second)
+    }
+}
+
+/// Parse an ISO 8601 date string (YYYY-MM-DD) to days since epoch
+fn parse_date(s: &str) -> Option<i32> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let year: i32 = parts[0].parse().ok()?;
+    let month: u32 = parts[1].parse().ok()?;
+    let day: u32 = parts[2].parse().ok()?;
+
+    if month < 1 || month > 12 || day < 1 || day > 31 {
+        return None;
+    }
+
+    Some(days_from_ymd(year, month, day))
+}
+
+/// Parse an ISO 8601 datetime string to milliseconds since epoch
+fn parse_datetime(s: &str) -> Option<i64> {
+    // Try to split on 'T' or space
+    let (date_part, time_part) = if s.contains('T') {
+        let parts: Vec<&str> = s.splitn(2, 'T').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        (parts[0], parts[1])
+    } else if s.contains(' ') {
+        let parts: Vec<&str> = s.splitn(2, ' ').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        (parts[0], parts[1])
+    } else {
+        // Just a date, treat as midnight
+        return parse_date(s).map(|d| (d as i64) * 86_400_000);
+    };
+
+    let days = parse_date(date_part)?;
+
+    // Parse time part (HH:MM:SS or HH:MM:SS.mmm)
+    let time_part = time_part.trim_end_matches('Z'); // Remove trailing Z if present
+    let (time_str, ms) = if time_part.contains('.') {
+        let parts: Vec<&str> = time_part.splitn(2, '.').collect();
+        let ms_str = parts.get(1)?;
+        // Handle variable length milliseconds (e.g., .1, .12, .123, .123456)
+        let ms: u32 = if ms_str.len() >= 3 {
+            ms_str[..3].parse().ok()?
+        } else {
+            // Pad with zeros: "1" -> 100, "12" -> 120
+            let padded = format!("{:0<3}", ms_str);
+            padded.parse().ok()?
+        };
+        (parts[0], ms)
+    } else {
+        (time_part, 0)
+    };
+
+    let time_parts: Vec<&str> = time_str.split(':').collect();
+    if time_parts.len() < 2 {
+        return None;
+    }
+
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let minute: u32 = time_parts[1].parse().ok()?;
+    let second: u32 = time_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+
+    let time_ms = (hour as i64) * 3_600_000
+        + (minute as i64) * 60_000
+        + (second as i64) * 1000
+        + (ms as i64);
+
+    Some((days as i64) * 86_400_000 + time_ms)
+}
+
 /// Parse a CSV string into rows, handling quoted fields with embedded newlines
 fn parse_csv_rows(csv: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
@@ -981,6 +1124,17 @@ fn infer_type_from_csv_value(value: &str) -> ColumnType {
     // Check for boolean
     if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
         return ColumnType::Bool;
+    }
+
+    // Check for datetime (YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS)
+    if (trimmed.contains('T') || (trimmed.contains(' ') && trimmed.contains(':')))
+        && parse_datetime(trimmed).is_some() {
+        return ColumnType::DateTime;
+    }
+
+    // Check for date (YYYY-MM-DD)
+    if trimmed.len() == 10 && trimmed.chars().nth(4) == Some('-') && parse_date(trimmed).is_some() {
+        return ColumnType::Date;
     }
 
     // Check for integer
@@ -1062,6 +1216,16 @@ fn parse_csv_value(value: &str, col_type: ColumnType) -> Result<ColumnValue, Str
         ColumnType::String => {
             Ok(ColumnValue::String(trimmed.to_string()))
         }
+        ColumnType::Date => {
+            parse_date(trimmed)
+                .map(ColumnValue::Date)
+                .ok_or_else(|| format!("Cannot parse '{}' as DATE (expected YYYY-MM-DD)", trimmed))
+        }
+        ColumnType::DateTime => {
+            parse_datetime(trimmed)
+                .map(ColumnValue::DateTime)
+                .ok_or_else(|| format!("Cannot parse '{}' as DATETIME (expected YYYY-MM-DDTHH:MM:SS)", trimmed))
+        }
     }
 }
 
@@ -1083,7 +1247,17 @@ fn infer_schema_from_json(obj: &serde_json::Map<String, serde_json::Value>) -> R
                     ColumnType::Float64
                 }
             }
-            serde_json::Value::String(_) => ColumnType::String,
+            serde_json::Value::String(s) => {
+                // Try to detect date/datetime strings
+                if (s.contains('T') || (s.contains(' ') && s.contains(':')))
+                    && parse_datetime(s).is_some() {
+                    ColumnType::DateTime
+                } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some() {
+                    ColumnType::Date
+                } else {
+                    ColumnType::String
+                }
+            }
             serde_json::Value::Bool(_) => ColumnType::Bool,
             serde_json::Value::Null => ColumnType::String, // Default to String for null
             _ => return Err(format!("Unsupported JSON value type for column '{}'", key)),
@@ -1112,7 +1286,17 @@ fn json_object_to_row_map(obj: &serde_json::Map<String, serde_json::Value>) -> R
                     ColumnValue::Float64(n.as_f64().unwrap())
                 }
             }
-            serde_json::Value::String(s) => ColumnValue::String(s.clone()),
+            serde_json::Value::String(s) => {
+                // Try to detect and parse date/datetime strings
+                if (s.contains('T') || (s.contains(' ') && s.contains(':')))
+                    && parse_datetime(s).is_some() {
+                    ColumnValue::DateTime(parse_datetime(s).unwrap())
+                } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some() {
+                    ColumnValue::Date(parse_date(s).unwrap())
+                } else {
+                    ColumnValue::String(s.clone())
+                }
+            }
             serde_json::Value::Bool(b) => ColumnValue::Bool(*b),
             serde_json::Value::Null => ColumnValue::Null,
             _ => return Err(format!("Unsupported JSON value type for key '{}'", key)),
