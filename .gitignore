@@ -35,3 +35,4 @@ frontend/dist/
 
 # Claude Code settings (local only)
 .claude/
+benchmark_results.json
