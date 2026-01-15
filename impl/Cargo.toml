@@ -1,0 +1,58 @@
+[package]
+name = "livetable"
+version = "0.1.0"
+edition = "2021"
+authors = ["LiveTable Contributors"]
+description = "High-performance columnar table system with reactive views and incremental updates"
+readme = "../README.md"
+license = "MIT"
+repository = "https://github.com/beeblebroxz/livetable"
+keywords = ["database", "table", "dataframe", "performance", "columnar", "reactive"]
+categories = ["database"]
+
+[lib]
+name = "livetable"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+actix-web = { version = "4", optional = true }
+actix-web-actors = { version = "4", optional = true }
+actix = { version = "0.13", optional = true }
+actix-cors = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+env_logger = { version = "0.11", optional = true }
+
+[features]
+default = []
+python = ["pyo3"]
+server = ["actix-web", "actix-web-actors", "actix", "actix-cors", "tokio", "env_logger"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "livetable_benchmarks"
+harness = false
+
+[[example]]
+name = "basic_table"
+path = "examples/basic_table.rs"
+
+[[example]]
+name = "views"
+path = "examples/views.rs"
+
+[[example]]
+name = "performance"
+path = "examples/performance.rs"
+
+[[example]]
+name = "joins"
+path = "examples/joins.rs"
+
+[[bin]]
+name = "livetable-server"
+path = "src/bin/livetable-server.rs"

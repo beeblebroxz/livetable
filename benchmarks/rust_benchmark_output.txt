@@ -1,0 +1,297 @@
+warning: unused variable: `logical_chunk`
+   --> src/sequence.rs:146:14
+    |
+146 |         for (logical_chunk, &physical_chunk) in self.rotation.iter().enumerate() {
+    |              ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_logical_chunk`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> src/column.rs:272:17
+    |
+272 |     pub fn iter(&self) -> ColumnIterator {
+    |                 ^^^^^     ^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+272 |     pub fn iter(&self) -> ColumnIterator<'_> {
+    |                                         ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> src/table.rs:180:22
+    |
+180 |     pub fn iter_rows(&self) -> TableRowIterator {
+    |                      ^^^^^     ^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                      |
+    |                      the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+180 |     pub fn iter_rows(&self) -> TableRowIterator<'_> {
+    |                                                ++++
+
+warning: `qzt_rust` (lib) generated 3 warnings (run `cargo fix --lib -p qzt_rust` to apply 2 suggestions)
+   Compiling qzt_rust v0.1.0 (/Users/abhishekgulati/Projects/qzt)
+warning: `qzt_rust` (lib test) generated 3 warnings (3 duplicates)
+    Finished `bench` profile [optimized] target(s) in 0.95s
+     Running unittests src/lib.rs (target/release/deps/qzt_rust-8b35c692fd9e7a64)
+
+running 9 tests
+test column::tests::test_column_basic ... ignored
+test column::tests::test_column_nullable ... ignored
+test column::tests::test_column_set ... ignored
+test sequence::tests::test_array_sequence_basic ... ignored
+test sequence::tests::test_array_sequence_insert ... ignored
+test sequence::tests::test_tiered_vector_basic ... ignored
+test sequence::tests::test_tiered_vector_insert ... ignored
+test table::tests::test_table_basic ... ignored
+test table::tests::test_table_insert ... ignored
+
+test result: ok. 0 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches/qzt_benchmarks.rs (target/release/deps/qzt_benchmarks-8f49b2bc1fed0a9a)
+Gnuplot not found, using plotters backend
+Benchmarking array_sequence_append/100
+Benchmarking array_sequence_append/100: Warming up for 3.0000 s
+Benchmarking array_sequence_append/100: Collecting 100 samples in estimated 5.0008 s (18M iterations)
+Benchmarking array_sequence_append/100: Analyzing
+array_sequence_append/100
+                        time:   [279.52 ns 279.80 ns 280.08 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) low severe
+  1 (1.00%) high mild
+Benchmarking array_sequence_append/1000
+Benchmarking array_sequence_append/1000: Warming up for 3.0000 s
+Benchmarking array_sequence_append/1000: Collecting 100 samples in estimated 5.0031 s (5.1M iterations)
+Benchmarking array_sequence_append/1000: Analyzing
+array_sequence_append/1000
+                        time:   [985.43 ns 997.13 ns 1.0095 µs]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking array_sequence_append/10000
+Benchmarking array_sequence_append/10000: Warming up for 3.0000 s
+Benchmarking array_sequence_append/10000: Collecting 100 samples in estimated 5.0098 s (732k iterations)
+Benchmarking array_sequence_append/10000: Analyzing
+array_sequence_append/10000
+                        time:   [6.8277 µs 6.8348 µs 6.8415 µs]
+Found 13 outliers among 100 measurements (13.00%)
+  1 (1.00%) low severe
+  6 (6.00%) low mild
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking tiered_vector_append/100
+Benchmarking tiered_vector_append/100: Warming up for 3.0000 s
+Benchmarking tiered_vector_append/100: Collecting 100 samples in estimated 5.0005 s (9.1M iterations)
+Benchmarking tiered_vector_append/100: Analyzing
+tiered_vector_append/100
+                        time:   [556.80 ns 557.92 ns 558.97 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+Benchmarking tiered_vector_append/1000
+Benchmarking tiered_vector_append/1000: Warming up for 3.0000 s
+Benchmarking tiered_vector_append/1000: Collecting 100 samples in estimated 5.0039 s (1.1M iterations)
+Benchmarking tiered_vector_append/1000: Analyzing
+tiered_vector_append/1000
+                        time:   [4.1467 µs 4.2124 µs 4.3020 µs]
+Found 18 outliers among 100 measurements (18.00%)
+  1 (1.00%) high mild
+  17 (17.00%) high severe
+Benchmarking tiered_vector_append/10000
+Benchmarking tiered_vector_append/10000: Warming up for 3.0000 s
+Benchmarking tiered_vector_append/10000: Collecting 100 samples in estimated 5.1652 s (136k iterations)
+Benchmarking tiered_vector_append/10000: Analyzing
+tiered_vector_append/10000
+                        time:   [41.744 µs 41.982 µs 42.218 µs]
+
+Benchmarking array_sequence_random_access/100
+Benchmarking array_sequence_random_access/100: Warming up for 3.0000 s
+Benchmarking array_sequence_random_access/100: Collecting 100 samples in estimated 5.0000 s (8.7B iterations)
+Benchmarking array_sequence_random_access/100: Analyzing
+array_sequence_random_access/100
+                        time:   [590.78 ps 648.71 ps 734.66 ps]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+Benchmarking array_sequence_random_access/1000
+Benchmarking array_sequence_random_access/1000: Warming up for 3.0000 s
+Benchmarking array_sequence_random_access/1000: Collecting 100 samples in estimated 5.0000 s (7.8B iterations)
+Benchmarking array_sequence_random_access/1000: Analyzing
+array_sequence_random_access/1000
+                        time:   [592.58 ps 634.68 ps 684.66 ps]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+Benchmarking array_sequence_random_access/10000
+Benchmarking array_sequence_random_access/10000: Warming up for 3.0000 s
+Benchmarking array_sequence_random_access/10000: Collecting 100 samples in estimated 5.0000 s (7.7B iterations)
+Benchmarking array_sequence_random_access/10000: Analyzing
+array_sequence_random_access/10000
+                        time:   [571.97 ps 600.09 ps 631.01 ps]
+
+Benchmarking tiered_vector_random_access/100
+Benchmarking tiered_vector_random_access/100: Warming up for 3.0000 s
+Benchmarking tiered_vector_random_access/100: Collecting 100 samples in estimated 5.0000 s (1.9B iterations)
+Benchmarking tiered_vector_random_access/100: Analyzing
+tiered_vector_random_access/100
+                        time:   [2.6150 ns 2.6272 ns 2.6457 ns]
+Found 11 outliers among 100 measurements (11.00%)
+  5 (5.00%) high mild
+  6 (6.00%) high severe
+Benchmarking tiered_vector_random_access/1000
+Benchmarking tiered_vector_random_access/1000: Warming up for 3.0000 s
+Benchmarking tiered_vector_random_access/1000: Collecting 100 samples in estimated 5.0000 s (876M iterations)
+Benchmarking tiered_vector_random_access/1000: Analyzing
+tiered_vector_random_access/1000
+                        time:   [5.7081 ns 5.7243 ns 5.7456 ns]
+Found 13 outliers among 100 measurements (13.00%)
+  5 (5.00%) high mild
+  8 (8.00%) high severe
+Benchmarking tiered_vector_random_access/10000
+Benchmarking tiered_vector_random_access/10000: Warming up for 3.0000 s
+Benchmarking tiered_vector_random_access/10000: Collecting 100 samples in estimated 5.0001 s (134M iterations)
+Benchmarking tiered_vector_random_access/10000: Analyzing
+tiered_vector_random_access/10000
+                        time:   [37.324 ns 37.387 ns 37.467 ns]
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) high mild
+  8 (8.00%) high severe
+
+Benchmarking array_sequence_insert/100
+Benchmarking array_sequence_insert/100: Warming up for 3.0000 s
+Benchmarking array_sequence_insert/100: Collecting 100 samples in estimated 5.0007 s (18M iterations)
+Benchmarking array_sequence_insert/100: Analyzing
+array_sequence_insert/100
+                        time:   [271.59 ns 272.44 ns 273.51 ns]
+Found 27 outliers among 100 measurements (27.00%)
+  15 (15.00%) low severe
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+Benchmarking array_sequence_insert/1000
+Benchmarking array_sequence_insert/1000: Warming up for 3.0000 s
+Benchmarking array_sequence_insert/1000: Collecting 100 samples in estimated 5.0034 s (6.2M iterations)
+Benchmarking array_sequence_insert/1000: Analyzing
+array_sequence_insert/1000
+                        time:   [809.60 ns 811.86 ns 815.18 ns]
+Found 8 outliers among 100 measurements (8.00%)
+  7 (7.00%) high mild
+  1 (1.00%) high severe
+Benchmarking array_sequence_insert/5000
+Benchmarking array_sequence_insert/5000: Warming up for 3.0000 s
+Benchmarking array_sequence_insert/5000: Collecting 100 samples in estimated 5.0111 s (1.7M iterations)
+Benchmarking array_sequence_insert/5000: Analyzing
+array_sequence_insert/5000
+                        time:   [2.9191 µs 2.9237 µs 2.9282 µs]
+
+Benchmarking tiered_vector_insert/100
+Benchmarking tiered_vector_insert/100: Warming up for 3.0000 s
+Benchmarking tiered_vector_insert/100: Collecting 100 samples in estimated 5.0014 s (9.1M iterations)
+Benchmarking tiered_vector_insert/100: Analyzing
+tiered_vector_insert/100
+                        time:   [546.81 ns 547.67 ns 548.79 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking tiered_vector_insert/1000
+Benchmarking tiered_vector_insert/1000: Warming up for 3.0000 s
+Benchmarking tiered_vector_insert/1000: Collecting 100 samples in estimated 5.0069 s (1.2M iterations)
+Benchmarking tiered_vector_insert/1000: Analyzing
+tiered_vector_insert/1000
+                        time:   [4.0192 µs 4.0278 µs 4.0391 µs]
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) high mild
+  4 (4.00%) high severe
+Benchmarking tiered_vector_insert/5000
+Benchmarking tiered_vector_insert/5000: Warming up for 3.0000 s
+Benchmarking tiered_vector_insert/5000: Collecting 100 samples in estimated 5.0041 s (268k iterations)
+Benchmarking tiered_vector_insert/5000: Analyzing
+tiered_vector_insert/5000
+                        time:   [18.653 µs 18.686 µs 18.725 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+
+Benchmarking table_append/100
+Benchmarking table_append/100: Warming up for 3.0000 s
+Benchmarking table_append/100: Collecting 100 samples in estimated 5.1651 s (157k iterations)
+Benchmarking table_append/100: Analyzing
+table_append/100        time:   [32.964 µs 33.867 µs 35.155 µs]
+Found 9 outliers among 100 measurements (9.00%)
+  2 (2.00%) high mild
+  7 (7.00%) high severe
+Benchmarking table_append/1000
+Benchmarking table_append/1000: Warming up for 3.0000 s
+Benchmarking table_append/1000: Collecting 100 samples in estimated 6.5262 s (20k iterations)
+Benchmarking table_append/1000: Analyzing
+table_append/1000       time:   [314.91 µs 316.15 µs 318.11 µs]
+Found 13 outliers among 100 measurements (13.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+  9 (9.00%) high severe
+Benchmarking table_append/10000
+Benchmarking table_append/10000: Warming up for 3.0000 s
+Benchmarking table_append/10000: Collecting 100 samples in estimated 5.0519 s (1600 iterations)
+Benchmarking table_append/10000: Analyzing
+table_append/10000      time:   [3.1758 ms 3.1892 ms 3.2068 ms]
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking table_random_access/100
+Benchmarking table_random_access/100: Warming up for 3.0000 s
+Benchmarking table_random_access/100: Collecting 100 samples in estimated 5.0009 s (27M iterations)
+Benchmarking table_random_access/100: Analyzing
+table_random_access/100 time:   [183.11 ns 183.64 ns 184.60 ns]
+Found 6 outliers among 100 measurements (6.00%)
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+Benchmarking table_random_access/1000
+Benchmarking table_random_access/1000: Warming up for 3.0000 s
+Benchmarking table_random_access/1000: Collecting 100 samples in estimated 5.0004 s (28M iterations)
+Benchmarking table_random_access/1000: Analyzing
+table_random_access/1000
+                        time:   [180.18 ns 180.41 ns 180.71 ns]
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+Benchmarking table_random_access/10000
+Benchmarking table_random_access/10000: Warming up for 3.0000 s
+Benchmarking table_random_access/10000: Collecting 100 samples in estimated 5.0003 s (28M iterations)
+Benchmarking table_random_access/10000: Analyzing
+table_random_access/10000
+                        time:   [180.17 ns 180.32 ns 180.54 ns]
+Found 7 outliers among 100 measurements (7.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking column_operations/100
+Benchmarking column_operations/100: Warming up for 3.0000 s
+Benchmarking column_operations/100: Collecting 100 samples in estimated 5.0004 s (5.9M iterations)
+Benchmarking column_operations/100: Analyzing
+column_operations/100   time:   [827.75 ns 828.11 ns 828.45 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking column_operations/1000
+Benchmarking column_operations/1000: Warming up for 3.0000 s
+Benchmarking column_operations/1000: Collecting 100 samples in estimated 5.0059 s (894k iterations)
+Benchmarking column_operations/1000: Analyzing
+column_operations/1000  time:   [5.8676 µs 6.1342 µs 6.4316 µs]
+Found 16 outliers among 100 measurements (16.00%)
+  1 (1.00%) high mild
+  15 (15.00%) high severe
+Benchmarking column_operations/10000
+Benchmarking column_operations/10000: Warming up for 3.0000 s
+Benchmarking column_operations/10000: Collecting 100 samples in estimated 5.0838 s (86k iterations)
+Benchmarking column_operations/10000: Analyzing
+column_operations/10000 time:   [50.942 µs 51.239 µs 51.565 µs]
+Found 14 outliers among 100 measurements (14.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  11 (11.00%) high severe
+
