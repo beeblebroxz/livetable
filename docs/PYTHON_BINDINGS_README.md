@@ -254,6 +254,41 @@ joined = livetable.JoinView(
 simple_join = livetable.JoinView("j", t1, t2, "id", "ref_id", livetable.JoinType.INNER)
 ```
 
+### ✅ Simplified API (sort, join, group_by)
+
+Pandas-like method-based API for common operations:
+
+```python
+# SORTING - returns a SortedView
+sorted_table = table.sort("score")                    # Ascending (default)
+sorted_table = table.sort("score", descending=True)   # Descending
+sorted_table = table.sort(["score", "name"], descending=[True, False])  # Multi-column
+
+# JOINING - returns a JoinView
+joined = students.join(grades, on="id")                                    # Same column name
+joined = students.join(enrollments, left_on="id", right_on="student_id")   # Different names
+joined = students.join(enrollments, left_on="id", right_on="student_id", how="inner")
+joined = sales.join(targets, on=["year", "month"])                         # Multi-column
+
+# GROUP BY - returns an AggregateView
+grouped = table.group_by("department", agg=[
+    ("total", "salary", "sum"),
+    ("average", "salary", "avg"),      # Aliases: avg, average, mean
+    ("headcount", "salary", "count"),
+    ("min_sal", "salary", "min"),
+    ("max_sal", "salary", "max"),
+])
+
+# Iterate over grouped results
+for row in grouped:
+    print(f"{row['department']}: {row['total']}")
+```
+
+**Key differences from explicit View constructors:**
+- No need to provide view names (auto-generated)
+- Aggregation functions as strings instead of enum values
+- Join type as string ("left", "inner") instead of enum
+
 ### ✅ Serialization (CSV/JSON)
 
 Export and import tables in CSV and JSON formats:
@@ -515,6 +550,9 @@ Create a new table.
 - `filter_expr(expression: str) -> list[int]` - Filter using expression (2x faster)
 - `select(columns: list[str]) -> ProjectionView` - Create projection
 - `add_computed_column(name: str, fn: callable) -> ComputedView` - Add computed column
+- `sort(by, descending=None) -> SortedView` - Sort by column(s)
+- `join(other, on=None, left_on=None, right_on=None, how="left") -> JoinView` - Join tables
+- `group_by(by, agg) -> AggregateView` - Group and aggregate
 - `sum(column: str) -> float` - Sum of numeric column
 - `avg(column: str) -> float | None` - Average of numeric column
 - `min(column: str) -> float | None` - Minimum of numeric column
@@ -769,6 +807,7 @@ Potential additions:
 - [x] ~~Bulk operations (append_rows)~~ ✅ **DONE!**
 - [x] ~~Multi-column joins~~ ✅ **DONE!**
 - [x] ~~Expression-based filtering~~ ✅ **DONE!**
+- [x] ~~Simplified API (sort, join, group_by)~~ ✅ **DONE!**
 - [ ] RIGHT and FULL OUTER joins
 
 ## Contributing

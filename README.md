@@ -69,14 +69,14 @@ for row in table:     # Iteration
 ```
 
 ### Views (Zero-Copy)
-| View | Description |
-|------|-------------|
-| `FilterView` | Filter rows with Python lambdas |
-| `ProjectionView` | Select specific columns |
-| `ComputedView` | Add calculated columns |
-| `JoinView` | LEFT/INNER joins (single or composite keys) |
-| `SortedView` | Multi-column sorting |
-| `AggregateView` | GROUP BY with SUM, AVG, MIN, MAX, COUNT |
+| View | Method | Description |
+|------|--------|-------------|
+| `FilterView` | `table.filter()` | Filter rows with Python lambdas |
+| `ProjectionView` | `table.select()` | Select specific columns |
+| `ComputedView` | `table.add_computed_column()` | Add calculated columns |
+| `JoinView` | `table.join()` | LEFT/INNER joins (single or composite keys) |
+| `SortedView` | `table.sort()` | Multi-column sorting |
+| `AggregateView` | `table.group_by()` | GROUP BY with SUM, AVG, MIN, MAX, COUNT |
 
 ### Filtering
 ```python
@@ -88,6 +88,31 @@ indices = table.filter_expr("score >= 90 AND name != 'Test'")
 # Supports: =, !=, <, >, <=, >=, AND, OR, NOT, IS NULL, IS NOT NULL
 ```
 
+### Sorting
+```python
+# Single column
+sorted_table = table.sort("score")                    # Ascending (default)
+sorted_table = table.sort("score", descending=True)   # Descending
+
+# Multiple columns with mixed order
+sorted_table = table.sort(["score", "name"], descending=[True, False])
+```
+
+### Joining
+```python
+# Join on same-named column
+joined = students.join(grades, on="id")
+
+# Join on different column names
+joined = students.join(enrollments, left_on="id", right_on="student_id")
+
+# Inner join (default is left)
+joined = students.join(enrollments, left_on="id", right_on="student_id", how="inner")
+
+# Multi-column join
+joined = sales.join(targets, on=["year", "month"])
+```
+
 ### Aggregations
 ```python
 # Simple aggregations
@@ -97,10 +122,10 @@ table.min("score")
 table.max("score")
 table.count_non_null("score")
 
-# GROUP BY with AggregateView
-agg = livetable.AggregateView("by_dept", table, ["department"], [
-    ("total", "salary", livetable.AggregateFunction.SUM),
-    ("avg", "salary", livetable.AggregateFunction.AVG),
+# GROUP BY
+grouped = table.group_by("department", agg=[
+    ("total", "salary", "sum"),
+    ("average", "salary", "avg"),
 ])
 ```
 
@@ -156,17 +181,18 @@ high_scorers = table.filter(lambda row: row["score"] is not None and row["score"
 print(f"High scorers: {len(high_scorers)}")
 
 # Sort by score
-sorted_view = livetable.SortedView(
-    "by_score", table, [livetable.SortKey.descending("score")]
-)
-print(f"Top student: {sorted_view[0]['name']}")
+sorted_table = table.sort("score", descending=True)
+print(f"Top student: {sorted_table[0]['name']}")
 
 # Join tables
 enrollments = livetable.Table("enrollments", enrollment_schema)
-joined = livetable.JoinView(
-    "student_courses", table, enrollments,
-    "id", "student_id", livetable.JoinType.LEFT
-)
+joined = table.join(enrollments, left_on="id", right_on="student_id")
+
+# Group by with aggregations
+by_dept = table.group_by("department", agg=[
+    ("total", "score", "sum"),
+    ("avg", "score", "avg"),
+])
 
 # Export
 with open("students.csv", "w") as f:
@@ -196,7 +222,7 @@ pip install target/wheels/livetable-*.whl
 cd tests && ./run_all.sh
 
 # Individual test suites
-cd tests && pytest python/ -v      # Python unit tests (226 tests)
+cd tests && pytest python/ -v      # Python unit tests (251 tests)
 cd tests && pytest integration/    # Integration tests (5 workflows)
 cd impl && cargo test --lib        # Rust tests (75 tests)
 ```

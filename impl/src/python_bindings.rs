@@ -874,6 +874,225 @@ impl PyTable {
         PyComputedView::new(self.clone(), name, compute_fn)
     }
 
+    // === Simplified View Methods ===
+
+    /// Sort table by one or more columns.
+    ///
+    /// Args:
+    ///     by: Column name (str) or list of column names to sort by
+    ///     descending: If True, sort descending. Can be bool or list of bools
+    ///                 matching the columns. Default: False (ascending)
+    ///
+    /// Returns:
+    ///     A sorted view of the table
+    ///
+    /// Examples:
+    ///     # Sort by single column ascending
+    ///     sorted_table = table.sort("score")
+    ///
+    ///     # Sort by single column descending
+    ///     sorted_table = table.sort("score", descending=True)
+    ///
+    ///     # Sort by multiple columns
+    ///     sorted_table = table.sort(["name", "score"], descending=[False, True])
+    #[pyo3(signature = (by, descending=None))]
+    fn sort(&self, by: &Bound<'_, PyAny>, descending: Option<&Bound<'_, PyAny>>) -> PyResult<PySortedView> {
+        // Extract column name(s)
+        let columns = extract_string_or_list(by)?;
+
+        // Extract descending flag(s)
+        let desc_flags: Vec<bool> = match descending {
+            None => vec![false; columns.len()],
+            Some(desc) => {
+                if let Ok(single) = desc.extract::<bool>() {
+                    vec![single; columns.len()]
+                } else if let Ok(list) = desc.extract::<Vec<bool>>() {
+                    if list.len() != columns.len() {
+                        return Err(PyValueError::new_err(format!(
+                            "descending list length ({}) must match columns length ({})",
+                            list.len(), columns.len()
+                        )));
+                    }
+                    list
+                } else {
+                    return Err(PyTypeError::new_err(
+                        "descending must be a bool or list of bools"
+                    ));
+                }
+            }
+        };
+
+        // Build sort keys (nulls_first=true matches SQL standard)
+        let sort_keys: Vec<RustSortKey> = columns.iter().zip(desc_flags.iter())
+            .map(|(col, desc)| {
+                let order = if *desc { RustSortOrder::Descending } else { RustSortOrder::Ascending };
+                RustSortKey::new(col.clone(), order, true)
+            })
+            .collect();
+
+        // Auto-generate name
+        let name = format!("{}_sorted", self.inner.borrow().name());
+
+        let view = RustSortedView::new(
+            name,
+            self.inner.clone(),
+            sort_keys,
+        ).map_err(|e| PyValueError::new_err(e))?;
+
+        Ok(PySortedView {
+            inner: Rc::new(RefCell::new(view)),
+        })
+    }
+
+    /// Join this table with another table.
+    ///
+    /// Args:
+    ///     other: The table to join with
+    ///     on: Column name(s) for join key (if same in both tables)
+    ///     left_on: Column name(s) in this table (if different from right)
+    ///     right_on: Column name(s) in other table (if different from left)
+    ///     how: Join type - "left" or "inner" (default: "left")
+    ///
+    /// Returns:
+    ///     A joined view of the two tables
+    ///
+    /// Examples:
+    ///     # Simple join on same column name
+    ///     joined = students.join(enrollments, on="student_id")
+    ///
+    ///     # Join with different column names
+    ///     joined = students.join(enrollments, left_on="id", right_on="student_id")
+    ///
+    ///     # Inner join
+    ///     joined = students.join(enrollments, on="id", how="inner")
+    ///
+    ///     # Multi-column join (composite key)
+    ///     joined = sales.join(targets, on=["year", "month", "region"])
+    #[pyo3(signature = (other, on=None, left_on=None, right_on=None, how="left"))]
+    fn join(
+        &self,
+        other: PyTable,
+        on: Option<&Bound<'_, PyAny>>,
+        left_on: Option<&Bound<'_, PyAny>>,
+        right_on: Option<&Bound<'_, PyAny>>,
+        how: &str,
+    ) -> PyResult<PyJoinView> {
+        // Determine left and right keys
+        let (left_keys, right_keys) = match (on, left_on, right_on) {
+            (Some(on_cols), None, None) => {
+                let cols = extract_string_or_list(on_cols)?;
+                (cols.clone(), cols)
+            }
+            (None, Some(left), Some(right)) => {
+                (extract_string_or_list(left)?, extract_string_or_list(right)?)
+            }
+            (None, None, None) => {
+                return Err(PyValueError::new_err(
+                    "Must specify either 'on' or both 'left_on' and 'right_on'"
+                ));
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both 'on' and 'left_on'/'right_on'"
+                ));
+            }
+        };
+
+        // Parse join type
+        let join_type = match how.to_lowercase().as_str() {
+            "left" => RustJoinType::Left,
+            "inner" => RustJoinType::Inner,
+            _ => return Err(PyValueError::new_err(
+                format!("Unknown join type '{}'. Use 'left' or 'inner'", how)
+            )),
+        };
+
+        // Auto-generate name
+        let name = format!(
+            "{}_{}_join",
+            self.inner.borrow().name(),
+            other.inner.borrow().name()
+        );
+
+        let join = RustJoinView::new_multi(
+            name,
+            self.inner.clone(),
+            other.inner.clone(),
+            left_keys,
+            right_keys,
+            join_type,
+        ).map_err(|e| PyValueError::new_err(e))?;
+
+        Ok(PyJoinView {
+            inner: Rc::new(RefCell::new(join)),
+        })
+    }
+
+    /// Group table by columns and compute aggregations.
+    ///
+    /// Args:
+    ///     by: Column name (str) or list of column names to group by
+    ///     agg: List of aggregation tuples: (result_name, source_column, function)
+    ///          where function is "sum", "avg", "min", "max", or "count"
+    ///
+    /// Returns:
+    ///     An aggregate view with computed groups
+    ///
+    /// Examples:
+    ///     # Single aggregation
+    ///     totals = table.group_by("department", agg=[("total", "salary", "sum")])
+    ///
+    ///     # Multiple aggregations
+    ///     stats = table.group_by("department", agg=[
+    ///         ("total_salary", "salary", "sum"),
+    ///         ("avg_salary", "salary", "avg"),
+    ///         ("headcount", "id", "count"),
+    ///     ])
+    ///
+    ///     # Group by multiple columns
+    ///     stats = table.group_by(["year", "month"], agg=[("total", "sales", "sum")])
+    #[pyo3(signature = (by, agg))]
+    fn group_by(
+        &self,
+        by: &Bound<'_, PyAny>,
+        agg: Vec<(String, String, String)>,
+    ) -> PyResult<PyAggregateView> {
+        // Extract group-by columns
+        let group_cols = extract_string_or_list(by)?;
+
+        // Convert string function names to RustAggregateFunction
+        let aggregations: Vec<(String, String, RustAggregateFunction)> = agg.iter()
+            .map(|(result_name, source_col, func_str)| {
+                let func = match func_str.to_lowercase().as_str() {
+                    "sum" => RustAggregateFunction::Sum,
+                    "avg" | "average" | "mean" => RustAggregateFunction::Avg,
+                    "min" | "minimum" => RustAggregateFunction::Min,
+                    "max" | "maximum" => RustAggregateFunction::Max,
+                    "count" => RustAggregateFunction::Count,
+                    _ => return Err(PyValueError::new_err(format!(
+                        "Unknown aggregation function '{}'. Use: sum, avg, min, max, count",
+                        func_str
+                    ))),
+                };
+                Ok((result_name.clone(), source_col.clone(), func))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        // Auto-generate name
+        let name = format!("{}_grouped", self.inner.borrow().name());
+
+        let view = RustAggregateView::new(
+            name,
+            self.inner.clone(),
+            group_cols,
+            aggregations,
+        ).map_err(|e| PyValueError::new_err(e))?;
+
+        Ok(PyAggregateView {
+            inner: Rc::new(RefCell::new(view)),
+        })
+    }
+
     // === Changeset API for incremental propagation ===
 
     /// Check if there are pending changes

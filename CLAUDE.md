@@ -146,13 +146,22 @@ computed = table.add_computed_column("grade", lambda row: "A" if row["score"] >=
 indices = table.filter_expr("score >= 90 AND name != 'Test'")
 # Supports: =, !=, <, >, <=, >=, AND, OR, NOT, IS NULL, IS NOT NULL
 
-# Sorted views
+# Sorting (simplified API)
+sorted_table = table.sort("score")                    # Ascending (default)
+sorted_table = table.sort("score", descending=True)   # Descending
+sorted_table = table.sort(["score", "name"], descending=[True, False])  # Multi-column
+
+# Sorting (explicit SortedView constructor)
 sorted_view = livetable.SortedView("by_score", table, [livetable.SortKey.descending("score")])
 
-# Joins - single column
-joined = livetable.JoinView("result", table1, table2, "id", "ref_id", livetable.JoinType.LEFT)
+# Joins (simplified API)
+joined = students.join(grades, on="id")                                    # Same column name
+joined = students.join(enrollments, left_on="id", right_on="student_id")   # Different names
+joined = students.join(enrollments, left_on="id", right_on="student_id", how="inner")
+joined = sales.join(targets, on=["year", "month"])                         # Multi-column
 
-# Joins - multi-column (composite keys)
+# Joins (explicit JoinView constructor)
+joined = livetable.JoinView("result", table1, table2, "id", "ref_id", livetable.JoinType.LEFT)
 joined = livetable.JoinView("result", sales, targets,
     ["year", "month", "region"],  # Left keys
     ["target_year", "target_month", "target_region"],  # Right keys
@@ -165,7 +174,16 @@ min_val = table.min("score")
 max_val = table.max("score")
 count = table.count_non_null("score")
 
-# GROUP BY aggregations
+# GROUP BY (simplified API)
+grouped = table.group_by("department", agg=[
+    ("total", "salary", "sum"),
+    ("average", "salary", "avg"),      # Aliases: avg, average, mean
+    ("headcount", "salary", "count"),
+    ("min_sal", "salary", "min"),
+    ("max_sal", "salary", "max"),
+])
+
+# GROUP BY (explicit AggregateView constructor)
 agg = livetable.AggregateView("by_name", table, ["name"], [
     ("total", "score", livetable.AggregateFunction.SUM),
     ("average", "score", livetable.AggregateFunction.AVG),
