@@ -85,16 +85,30 @@ livetable/
 - Proper handling of NULL values and special characters
 
 ### Data Types
-- INT32, INT64
-- FLOAT32, FLOAT64
-- STRING
-- BOOL
-- NULL support for nullable columns
+- **Integers**: INT32, INT64
+- **Floats**: FLOAT32, FLOAT64
+- **Text**: STRING (with optional interning for memory efficiency)
+- **Boolean**: BOOL
+- **Temporal**: DATE, DATETIME (native Python `date`/`datetime` support)
+- **Nullable**: Any column can be marked nullable with NULL support
 
 ### Performance Optimizations
 - **String Interning** - Memory-efficient storage for repeated strings
 - **Incremental Updates** - Views update incrementally, not rebuild
 - **TieredVector Storage** - Efficient for insert-heavy workloads
+
+### Pythonic API
+- **Indexing**: `table[0]`, `table[-1]` (negative indexing for last row)
+- **Slicing**: `table[1:5]`, `table[:10]`, `table[-3:]`
+- **Column Access**: `table["column_name"]` returns all values as a list
+- **Iteration**: `for row in table:` works on tables and all view types
+- **Comprehensions**: `[row["name"] for row in filtered]`
+- **Bulk Insert**: `table.append_rows([...])` for efficient multi-row inserts
+
+### Pandas Integration
+- **Export**: `df = table.to_pandas()` - Convert any table/view to DataFrame
+- **Import**: `table = Table.from_pandas("name", df)` - Create table from DataFrame
+- Automatic type mapping between LiveTable and pandas dtypes
 
 ## Performance
 
@@ -120,6 +134,7 @@ LiveTable excels at **row-level operations** and **reactive views** - areas wher
 
 ```python
 import livetable
+from datetime import date, datetime
 
 # Create table with schema
 schema = livetable.Schema([
@@ -127,12 +142,31 @@ schema = livetable.Schema([
     ("name", livetable.ColumnType.STRING, False),
     ("age", livetable.ColumnType.INT32, True),  # Nullable
     ("score", livetable.ColumnType.FLOAT64, False),
+    ("enrolled", livetable.ColumnType.DATE, False),
 ])
 table = livetable.Table("students", schema)
 
-# Add data
-table.append_row({"id": 1, "name": "Alice", "age": 20, "score": 95.5})
-table.append_row({"id": 2, "name": "Bob", "age": 22, "score": 87.3})
+# Add data - single row
+table.append_row({"id": 1, "name": "Alice", "age": 20, "score": 95.5, "enrolled": date(2024, 9, 1)})
+
+# Bulk insert - many rows at once (more efficient)
+table.append_rows([
+    {"id": 2, "name": "Bob", "age": 22, "score": 87.3, "enrolled": date(2024, 9, 1)},
+    {"id": 3, "name": "Charlie", "age": None, "score": 92.1, "enrolled": date(2024, 9, 15)},
+])
+
+# Pythonic access
+first = table[0]              # First row
+last = table[-1]              # Last row (negative indexing)
+subset = table[0:2]           # Slicing - rows 0 and 1
+names = table["name"]         # Column access - ["Alice", "Bob", "Charlie"]
+
+# Iterate over rows
+for row in table:
+    print(f"{row['name']}: {row['score']}")
+
+# List comprehensions work naturally
+high_scores = [row["name"] for row in table if row["score"] >= 90]
 
 # Filter with Python lambda (Rust speed!)
 high_scorers = table.filter(lambda row: row["score"] >= 90)
@@ -157,6 +191,7 @@ sorted_view = livetable.SortedView(
     table,
     [livetable.SortKey.descending("score")]
 )
+top_student = sorted_view[0]  # Highest scorer
 
 # Join tables (single column)
 joined = livetable.JoinView(
@@ -195,16 +230,21 @@ agg = livetable.AggregateView(
         ("count", "score", livetable.AggregateFunction.COUNT),
     ]
 )
-for i in range(len(agg)):
-    print(agg.get_row(i))  # {"age": 20, "total_score": 95.5, ...}
+for group in agg:
+    print(group)  # {"age": 20, "total_score": 95.5, ...}
 
 # Export to CSV/JSON
 csv_string = table.to_csv()
 json_string = table.to_json()
 
-# Import from CSV/JSON
+# Import from CSV/JSON (types auto-inferred)
 from_csv = livetable.Table.from_csv("imported", csv_string)
 from_json = livetable.Table.from_json("imported", json_string)
+
+# Pandas integration
+import pandas as pd
+df = table.to_pandas()                          # Table -> DataFrame
+new_table = livetable.Table.from_pandas("from_df", df)  # DataFrame -> Table
 
 # Save to file
 with open("data.csv", "w") as f:
@@ -240,8 +280,8 @@ cd tests
 ```
 
 This runs:
-- Rust unit tests (56 tests)
-- Python unit tests (53 tests)
+- Rust unit tests (61 tests)
+- Python unit tests (226 tests)
 - Integration tests (5 real-world workflows)
 
 ### Run Specific Test Suites
