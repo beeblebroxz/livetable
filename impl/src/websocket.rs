@@ -13,7 +13,7 @@ use crate::table::Schema;
 /// How often heartbeat pings are sent
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long before lack of client response causes a timeout
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Simple table data storage (thread-safe)
 #[derive(Clone)]
@@ -110,19 +110,32 @@ impl AppState {
     /// Subscribe a WebSocket connection to a table
     pub fn subscribe(&self, table_name: &str, addr: Addr<TableWebSocket>) {
         let mut subscribers = self.subscribers.lock().unwrap();
-        subscribers
+        let subs = subscribers
             .entry(table_name.to_string())
-            .or_insert_with(Vec::new)
-            .push(addr);
+            .or_insert_with(Vec::new);
+        subs.push(addr);
+        println!("[subscribe] {} now has {} subscriber(s)", table_name, subs.len());
     }
 
     /// Broadcast a message to all subscribers of a table
     pub fn broadcast(&self, table_name: &str, msg: ServerMessage) {
         let subscribers = self.subscribers.lock().unwrap();
         if let Some(addrs) = subscribers.get(table_name) {
+            println!("[broadcast] {} -> {} subscribers", table_name, addrs.len());
             for addr in addrs {
                 addr.do_send(BroadcastMessage(msg.clone()));
             }
+        } else {
+            println!("[broadcast] {} -> no subscribers!", table_name);
+        }
+    }
+
+    /// Unsubscribe a WebSocket connection from a table
+    pub fn unsubscribe(&self, table_name: &str, addr: &Addr<TableWebSocket>) {
+        let mut subscribers = self.subscribers.lock().unwrap();
+        if let Some(subs) = subscribers.get_mut(table_name) {
+            subs.retain(|a| a != addr);
+            println!("[unsubscribe] {} now has {} subscriber(s)", table_name, subs.len());
         }
     }
 }
@@ -294,6 +307,14 @@ impl Actor for TableWebSocket {
     fn started(&mut self, ctx: &mut Self::Context) {
         self.hb(ctx);
     }
+
+    fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
+        // Clean up subscription when connection closes
+        if let Some(ref table_name) = self.subscribed_table {
+            self.state.unsubscribe(table_name, &ctx.address());
+        }
+        Running::Stop
+    }
 }
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for TableWebSocket {
@@ -341,6 +362,48 @@ impl Handler<BroadcastMessage> for TableWebSocket {
     }
 }
 
+/// Convert days since Unix epoch to (year, month, day)
+fn ymd_from_days(days: i32) -> (i32, u32, u32) {
+    // Shift to March 1, year 0 epoch (simplifies leap year calculation)
+    let z = days + 719468;
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = (z - era * 146097) as u32; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = (yoe as i32) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month in [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d)
+}
+
+/// Format a date (days since epoch) as ISO 8601 date string (YYYY-MM-DD)
+fn format_date_from_days(days: i32) -> String {
+    let (year, month, day) = ymd_from_days(days);
+    format!("{:04}-{:02}-{:02}", year, month, day)
+}
+
+/// Format a datetime (milliseconds since epoch) as ISO 8601 datetime string
+fn format_datetime_from_millis(ms: i64) -> String {
+    let (days, time_ms) = if ms >= 0 {
+        ((ms / 86_400_000) as i32, (ms % 86_400_000) as u32)
+    } else {
+        let d = (ms / 86_400_000) as i32 - if ms % 86_400_000 != 0 { 1 } else { 0 };
+        let t = ((ms % 86_400_000) + 86_400_000) as u32 % 86_400_000;
+        (d, t)
+    };
+    let (year, month, day) = ymd_from_days(days);
+    let hours = time_ms / 3_600_000;
+    let minutes = (time_ms % 3_600_000) / 60_000;
+    let seconds = (time_ms % 60_000) / 1000;
+    let millis = time_ms % 1000;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year, month, day, hours, minutes, seconds, millis
+    )
+}
+
 /// Convert ColumnValue to JSON Value
 fn column_value_to_json(cv: &ColumnValue) -> JsonValue {
     match cv {
@@ -352,6 +415,14 @@ fn column_value_to_json(cv: &ColumnValue) -> JsonValue {
         ColumnValue::Float64(v) => JsonValue::Number(serde_json::Number::from_f64(*v).unwrap()),
         ColumnValue::String(v) => JsonValue::String(v.clone()),
         ColumnValue::Bool(v) => JsonValue::Bool(*v),
+        ColumnValue::Date(days) => {
+            // Convert days since Unix epoch to ISO 8601 date string (YYYY-MM-DD)
+            JsonValue::String(format_date_from_days(*days))
+        }
+        ColumnValue::DateTime(millis) => {
+            // Convert milliseconds since Unix epoch to ISO 8601 datetime string
+            JsonValue::String(format_datetime_from_millis(*millis))
+        }
         ColumnValue::Null => JsonValue::Null,
     }
 }

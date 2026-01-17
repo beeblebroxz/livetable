@@ -553,6 +553,53 @@ impl PySchema {
 }
 
 // ============================================================================
+// View Registry for Automatic Propagation
+// ============================================================================
+
+/// Enum to hold references to different view types for automatic tick propagation
+#[derive(Clone)]
+enum RegisteredView {
+    Filter(Rc<RefCell<PyFilterViewInner>>),
+    Sorted(Rc<RefCell<RustSortedView>>),
+    Aggregate(Rc<RefCell<RustAggregateView>>),
+    // JoinView is more complex (two parents) - not auto-registered for now
+}
+
+/// Inner state for PyFilterView that can be shared with the view registry
+struct PyFilterViewInner {
+    table_inner: Rc<RefCell<RustTable>>,
+    predicate: PyObject,
+    indices: Vec<usize>,
+    last_synced_generation: u64,
+}
+
+impl PyFilterViewInner {
+    /// Rebuild all indices by re-evaluating the predicate for all rows
+    fn refresh(&mut self, py: Python) -> PyResult<()> {
+        self.indices.clear();
+        let table_ref = self.table_inner.borrow();
+
+        for i in 0..table_ref.len() {
+            if let Ok(row) = table_ref.get_row(i) {
+                // Convert row to Python dict
+                let dict = PyDict::new_bound(py);
+                for (key, value) in row.iter() {
+                    dict.set_item(key, column_value_to_py(py, value)?)?;
+                }
+
+                let result: bool = self.predicate.call1(py, (dict,))?.extract(py)?;
+                if result {
+                    self.indices.push(i);
+                }
+            }
+        }
+
+        self.last_synced_generation = table_ref.changeset_generation();
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Table
 // ============================================================================
 
@@ -560,6 +607,8 @@ impl PySchema {
 #[pyclass(name = "Table", unsendable)]
 pub struct PyTable {
     inner: Rc<RefCell<RustTable>>,
+    /// Registry of dependent views for automatic tick propagation
+    registered_views: Rc<RefCell<Vec<RegisteredView>>>,
 }
 
 #[pymethods]
@@ -574,6 +623,7 @@ impl PyTable {
                 use_tiered_vector,
                 use_string_interning,
             ))),
+            registered_views: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -836,9 +886,16 @@ impl PyTable {
         output
     }
 
-    /// Create a filter view
+    /// Create a filter view (auto-registered for tick() propagation)
     fn filter(&self, predicate: PyObject) -> PyResult<PyFilterView> {
-        PyFilterView::new(self.clone(), predicate)
+        let view = PyFilterView::new(self.clone(), predicate)?;
+
+        // Register the view's inner state for automatic tick() propagation
+        self.registered_views.borrow_mut().push(
+            RegisteredView::Filter(Rc::clone(&view.inner))
+        );
+
+        Ok(view)
     }
 
     /// Filter rows using an expression string (faster than lambda-based filter).
@@ -939,9 +996,14 @@ impl PyTable {
             sort_keys,
         ).map_err(|e| PyValueError::new_err(e))?;
 
-        Ok(PySortedView {
-            inner: Rc::new(RefCell::new(view)),
-        })
+        let inner = Rc::new(RefCell::new(view));
+
+        // Register the view's inner state for automatic tick() propagation
+        self.registered_views.borrow_mut().push(
+            RegisteredView::Sorted(Rc::clone(&inner))
+        );
+
+        Ok(PySortedView { inner })
     }
 
     /// Join this table with another table.
@@ -1088,9 +1150,14 @@ impl PyTable {
             aggregations,
         ).map_err(|e| PyValueError::new_err(e))?;
 
-        Ok(PyAggregateView {
-            inner: Rc::new(RefCell::new(view)),
-        })
+        let inner = Rc::new(RefCell::new(view));
+
+        // Register the view's inner state for automatic tick() propagation
+        self.registered_views.borrow_mut().push(
+            RegisteredView::Aggregate(Rc::clone(&inner))
+        );
+
+        Ok(PyAggregateView { inner })
     }
 
     // === Changeset API for incremental propagation ===
@@ -1233,6 +1300,7 @@ impl PyTable {
             .map_err(|e| PyValueError::new_err(e))?;
         Ok(PyTable {
             inner: Rc::new(RefCell::new(table)),
+            registered_views: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -1251,6 +1319,7 @@ impl PyTable {
             .map_err(|e| PyValueError::new_err(e))?;
         Ok(PyTable {
             inner: Rc::new(RefCell::new(table)),
+            registered_views: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -1366,6 +1435,7 @@ impl PyTable {
 
         Ok(PyTable {
             inner: Rc::new(RefCell::new(table)),
+            registered_views: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -1378,12 +1448,62 @@ impl PyTable {
             length: slf.inner.borrow().len(),
         }
     }
+
+    /// Synchronize all registered dependent views with pending changes.
+    ///
+    /// This method propagates changes from the table through all views that were
+    /// created using the simplified API (filter(), sort(), group_by()).
+    ///
+    /// Returns the number of views that were synced.
+    fn tick(&self, py: Python) -> PyResult<usize> {
+        // Check if there are pending changes
+        let has_changes = self.inner.borrow().has_pending_changes();
+
+        if !has_changes {
+            return Ok(0);
+        }
+
+        let views = self.registered_views.borrow();
+        let mut synced_count = 0;
+
+        for view in views.iter() {
+            match view {
+                RegisteredView::Filter(inner) => {
+                    // Rebuild filter indices based on current table state
+                    inner.borrow_mut().refresh(py)?;
+                    synced_count += 1;
+                }
+                RegisteredView::Sorted(inner) => {
+                    // Use refresh() to rebuild from scratch since sync() would
+                    // reprocess all accumulated changes incorrectly
+                    inner.borrow_mut().refresh();
+                    synced_count += 1;
+                }
+                RegisteredView::Aggregate(inner) => {
+                    inner.borrow_mut().sync();
+                    synced_count += 1;
+                }
+            }
+        }
+
+        // Clear the changeset after all views have been synced
+        // This increments the generation and clears pending changes
+        self.inner.borrow_mut().clear_changeset();
+
+        Ok(synced_count)
+    }
+
+    /// Get the number of registered views that will be synced by tick().
+    fn registered_view_count(&self) -> usize {
+        self.registered_views.borrow().len()
+    }
 }
 
 impl Clone for PyTable {
     fn clone(&self) -> Self {
         PyTable {
             inner: Rc::clone(&self.inner),
+            registered_views: Rc::clone(&self.registered_views),
         }
     }
 }
@@ -1392,13 +1512,13 @@ impl Clone for PyTable {
 // FilterView
 // ============================================================================
 
+/// FilterView uses shared inner state so tick() can update registered views.
 #[pyclass(name = "FilterView", unsendable)]
 pub struct PyFilterView {
+    /// Reference to the parent table (for get_row operations)
     table: PyTable,
-    predicate: PyObject,
-    indices: Vec<usize>,
-    /// Last synced changeset generation
-    last_synced_generation: u64,
+    /// Shared inner state (can be registered with table for tick())
+    inner: Rc<RefCell<PyFilterViewInner>>,
 }
 
 #[pymethods]
@@ -1406,61 +1526,50 @@ impl PyFilterView {
     #[new]
     fn new(table: PyTable, predicate: PyObject) -> PyResult<Self> {
         let generation = table.inner.borrow().changeset_generation();
-        let mut view = PyFilterView {
-            table,
+        let inner = Rc::new(RefCell::new(PyFilterViewInner {
+            table_inner: Rc::clone(&table.inner),
             predicate,
             indices: Vec::new(),
             last_synced_generation: generation,
-        };
-        view.refresh()?;
-        Ok(view)
+        }));
+
+        // Initial refresh
+        Python::with_gil(|py| -> PyResult<()> {
+            inner.borrow_mut().refresh(py)?;
+            Ok(())
+        })?;
+
+        Ok(PyFilterView { table, inner })
     }
 
     fn __len__(&self) -> usize {
-        self.indices.len()
+        self.inner.borrow().indices.len()
     }
 
     fn __repr__(&self) -> String {
-        format!("FilterView(rows={})", self.indices.len())
+        format!("FilterView(rows={})", self.inner.borrow().indices.len())
     }
 
     fn refresh(&mut self) -> PyResult<()> {
         Python::with_gil(|py| {
-            self.indices.clear();
-            let table_ref = self.table.inner.borrow();
-
-            for i in 0..table_ref.len() {
-                let row = table_ref.get_row(i).map_err(|e| PyValueError::new_err(e))?;
-
-                // Convert row to Python dict
-                let dict = PyDict::new_bound(py);
-                for (key, value) in row.iter() {
-                    dict.set_item(key, column_value_to_py(py, value)?)?;
-                }
-
-                // Call predicate
-                let result: bool = self.predicate.call1(py, (dict,))?.extract(py)?;
-                if result {
-                    self.indices.push(i);
-                }
-            }
-
-            Ok(())
+            self.inner.borrow_mut().refresh(py)
         })
     }
 
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        if index >= self.indices.len() {
+        let inner = self.inner.borrow();
+        if index >= inner.indices.len() {
             return Err(PyIndexError::new_err("Index out of range"));
         }
 
-        let actual_index = self.indices[index];
+        let actual_index = inner.indices[index];
+        drop(inner); // Release borrow before calling table method
         self.table.get_row(py, actual_index)
     }
 
     /// Index access with negative indexing and slicing support
     fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
-        let view_len = self.indices.len();
+        let view_len = self.inner.borrow().indices.len();
 
         // Try integer index (supports negative indexing)
         if let Ok(mut idx) = key.extract::<isize>() {
@@ -1495,11 +1604,13 @@ impl PyFilterView {
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
-        if row >= self.indices.len() {
+        let inner = self.inner.borrow();
+        if row >= inner.indices.len() {
             return Err(PyIndexError::new_err("Index out of range"));
         }
 
-        let actual_index = self.indices[row];
+        let actual_index = inner.indices[row];
+        drop(inner); // Release borrow before calling table method
         self.table.get_value(py, actual_index, column)
     }
 
@@ -1517,13 +1628,14 @@ impl PyFilterView {
         }
 
         Python::with_gil(|py| {
+            let mut inner = self.inner.borrow_mut();
             let mut modified = false;
 
             for change in changes {
                 match change {
                     TableChange::RowInserted { index, data } => {
                         // Adjust existing indices
-                        for idx in self.indices.iter_mut() {
+                        for idx in inner.indices.iter_mut() {
                             if *idx >= index {
                                 *idx += 1;
                             }
@@ -1535,13 +1647,13 @@ impl PyFilterView {
                             dict.set_item(key, column_value_to_py(py, value)?)?;
                         }
 
-                        let result: bool = self.predicate.call1(py, (dict,))?.extract(py)?;
+                        let result: bool = inner.predicate.call1(py, (dict,))?.extract(py)?;
                         if result {
                             // Insert in sorted order
-                            let insert_pos = self.indices.iter()
+                            let insert_pos = inner.indices.iter()
                                 .position(|&i| i > index)
-                                .unwrap_or(self.indices.len());
-                            self.indices.insert(insert_pos, index);
+                                .unwrap_or(inner.indices.len());
+                            inner.indices.insert(insert_pos, index);
                             modified = true;
                         }
                     }
@@ -1549,7 +1661,7 @@ impl PyFilterView {
                     TableChange::RowDeleted { index, .. } => {
                         // Find and adjust indices
                         let mut to_remove = None;
-                        for (view_idx, parent_idx) in self.indices.iter_mut().enumerate() {
+                        for (view_idx, parent_idx) in inner.indices.iter_mut().enumerate() {
                             if *parent_idx == index {
                                 to_remove = Some(view_idx);
                             } else if *parent_idx > index {
@@ -1558,23 +1670,23 @@ impl PyFilterView {
                         }
 
                         if let Some(view_idx) = to_remove {
-                            self.indices.remove(view_idx);
+                            inner.indices.remove(view_idx);
                             modified = true;
                         }
                     }
 
                     TableChange::CellUpdated { row, .. } => {
                         // Re-evaluate the predicate for this row
-                        let currently_in_view = self.indices.contains(&row);
+                        let currently_in_view = inner.indices.contains(&row);
 
-                        let table_ref = self.table.inner.borrow();
+                        let table_ref = inner.table_inner.borrow();
                         let now_matches = if let Ok(row_data) = table_ref.get_row(row) {
                             let dict = PyDict::new_bound(py);
                             for (key, value) in row_data.iter() {
                                 dict.set_item(key, column_value_to_py(py, value)?)?;
                             }
                             drop(table_ref); // Release borrow before Python call
-                            self.predicate.call1(py, (dict,))?.extract::<bool>(py)?
+                            inner.predicate.call1(py, (dict,))?.extract::<bool>(py)?
                         } else {
                             drop(table_ref);
                             false
@@ -1583,16 +1695,16 @@ impl PyFilterView {
                         match (currently_in_view, now_matches) {
                             (false, true) => {
                                 // Add to view
-                                let insert_pos = self.indices.iter()
+                                let insert_pos = inner.indices.iter()
                                     .position(|&i| i > row)
-                                    .unwrap_or(self.indices.len());
-                                self.indices.insert(insert_pos, row);
+                                    .unwrap_or(inner.indices.len());
+                                inner.indices.insert(insert_pos, row);
                                 modified = true;
                             }
                             (true, false) => {
                                 // Remove from view
-                                if let Some(pos) = self.indices.iter().position(|&i| i == row) {
-                                    self.indices.remove(pos);
+                                if let Some(pos) = inner.indices.iter().position(|&i| i == row) {
+                                    inner.indices.remove(pos);
                                     modified = true;
                                 }
                             }
@@ -1602,20 +1714,20 @@ impl PyFilterView {
                 }
             }
 
-            self.last_synced_generation = self.table.inner.borrow().changeset_generation();
+            inner.last_synced_generation = self.table.inner.borrow().changeset_generation();
             Ok(modified)
         })
     }
 
     /// Get the last synced generation number
     fn last_synced_generation(&self) -> u64 {
-        self.last_synced_generation
+        self.inner.borrow().last_synced_generation
     }
 
     /// Return an iterator over the filtered rows.
     /// Enables: `for row in filter_view:`
     fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyFilterViewIterator {
-        let length = slf.indices.len();
+        let length = slf.inner.borrow().indices.len();
         PyFilterViewIterator {
             view: slf.into_py(py).extract(py).unwrap(),
             index: 0,

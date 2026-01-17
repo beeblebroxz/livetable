@@ -11,8 +11,9 @@ cd impl
 
 # Try the examples
 cd ../examples
-python3 quickstart.py      # 5-minute tutorial
-python3 playground.py      # Interactive examples
+python3 quickstart.py                # 5-minute tutorial
+python3 playground.py                # Interactive examples
+python3 demo_reactive_propagation.py # Watch changes flow through views
 ```
 
 ## Why LiveTable?
@@ -77,6 +78,8 @@ for row in table:     # Iteration
 | `JoinView` | `table.join()` | LEFT/INNER joins (single or composite keys) |
 | `SortedView` | `table.sort()` | Multi-column sorting |
 | `AggregateView` | `table.group_by()` | GROUP BY with SUM, AVG, MIN, MAX, COUNT |
+
+Views created with simplified API are auto-registered. Call `table.tick()` to propagate changes to all registered views at once.
 
 ### Filtering
 ```python

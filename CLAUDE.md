@@ -190,6 +190,19 @@ agg = livetable.AggregateView("by_name", table, ["name"], [
 ])
 agg.sync()  # Incremental update after table changes
 
+# Automatic view propagation with tick()
+# Views created via simplified API (filter, sort, group_by) are auto-registered
+filtered = table.filter(lambda row: row["amount"] > 500)
+sorted_view = table.sort("amount", descending=True)
+grouped = table.group_by("region", agg=[("total", "amount", "sum")])
+
+# After table changes, call tick() to update all views at once
+table.append_row({"region": "South", "amount": 1500})
+table.tick()  # All registered views are now updated
+
+# Check how many views are registered
+count = table.registered_view_count()  # Returns 3
+
 # Serialization - export
 csv_string = table.to_csv()
 json_string = table.to_json()

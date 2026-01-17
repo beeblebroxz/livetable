@@ -288,6 +288,45 @@ for row in grouped:
 - No need to provide view names (auto-generated)
 - Aggregation functions as strings instead of enum values
 - Join type as string ("left", "inner") instead of enum
+- Views are automatically registered for tick() propagation
+
+### ✅ Automatic View Propagation (tick)
+
+Views created using the simplified API (`filter()`, `sort()`, `group_by()`) are automatically registered with the parent table. After making changes to the table, call `tick()` to propagate changes through all registered views at once:
+
+```python
+# Create table and views
+schema = livetable.Schema([
+    ("region", livetable.ColumnType.STRING, False),
+    ("amount", livetable.ColumnType.INT32, False),
+])
+table = livetable.Table("sales", schema)
+table.append_row({"region": "West", "amount": 250})
+table.append_row({"region": "East", "amount": 1200})
+
+# Create views using simplified API (auto-registered)
+filtered = table.filter(lambda row: row["amount"] > 500)
+sorted_view = table.sort("amount", descending=True)
+grouped = table.group_by("region", agg=[("total", "amount", "sum")])
+
+print(table.registered_view_count())  # 3
+
+# Add new data
+table.append_row({"region": "South", "amount": 1500})
+
+# Before tick, views are stale
+print(len(filtered))  # Still 1
+
+# Propagate changes to all views with single tick() call
+synced = table.tick()
+print(f"Synced {synced} views")  # "Synced 3 views"
+
+# Now all views are updated
+print(len(filtered))  # Now 2 (includes new high-value sale)
+print(sorted_view[0]["amount"])  # 1500 (new top seller)
+```
+
+**Note:** Views created with explicit constructors (e.g., `FilterView(table, predicate)`) are NOT auto-registered. Use the simplified API methods on the table for automatic registration.
 
 ### ✅ Serialization (CSV/JSON)
 
@@ -564,6 +603,8 @@ Create a new table.
 - `Table.from_csv(name: str, csv: str) -> Table` - Import from CSV (static method)
 - `Table.from_json(name: str, json: str) -> Table` - Import from JSON (static method)
 - `Table.from_pandas(name: str, df: pandas.DataFrame) -> Table` - Import from DataFrame (static method)
+- `tick() -> int` - Sync all registered views with pending changes, returns count synced
+- `registered_view_count() -> int` - Number of views registered for tick() propagation
 
 ### FilterView
 

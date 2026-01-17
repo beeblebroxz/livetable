@@ -192,6 +192,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 - [x] AggregateView with GROUP BY and incremental updates (SUM, COUNT, AVG, MIN, MAX)
 - [x] String interning with reference counting
 - [x] Changesets and incremental view propagation
+- [x] Automatic view propagation via `tick()` method
 - [x] CSV/JSON serialization with type inference
 - [x] Python bindings via PyO3
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)
