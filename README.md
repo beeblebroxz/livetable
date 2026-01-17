@@ -225,7 +225,7 @@ pip install target/wheels/livetable-*.whl
 cd tests && ./run_all.sh
 
 # Individual test suites
-cd tests && pytest python/ -v      # Python unit tests (251 tests)
+cd tests && pytest python/ -v      # Python unit tests (294 tests)
 cd tests && pytest integration/    # Integration tests (5 workflows)
 cd impl && cargo test --lib        # Rust tests (75 tests)
 ```

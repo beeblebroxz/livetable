@@ -147,6 +147,53 @@ for i in range(len(joined)):
     print(f"  {row['name']}: {course}")
 
 # =============================================================================
+# 9. SIMPLIFIED API (bonus!)
+# =============================================================================
+print("\n⚡ Step 9: Simplified API")
+print("-" * 60)
+
+# Simplified sort (instead of SortedView constructor)
+sorted_table = table.sort("score", descending=True)
+print(f"Top scorer: {sorted_table[0]['name']} ({sorted_table[0]['score']})")
+
+# Simplified join (instead of JoinView constructor)
+joined_simple = table.join(enrollments, left_on="id", right_on="student_id")
+print(f"Simple join: {len(joined_simple)} rows")
+
+# GROUP BY with aggregations
+by_course = enrollments.group_by("course", agg=[
+    ("count", "student_id", "count"),
+])
+print("Enrollments by course:")
+for i in range(len(by_course)):
+    row = by_course[i]
+    print(f"  {row['course']}: {int(row['count'])} students")
+
+# =============================================================================
+# 10. REACTIVE UPDATES with tick()
+# =============================================================================
+print("\n🔄 Step 10: Reactive updates with tick()")
+print("-" * 60)
+
+# Views created with simplified API are auto-registered for tick()
+filtered = table.filter(lambda r: r["score"] >= 90)
+sorted_view = table.sort("score", descending=True)
+print(f"Registered views: {table.registered_view_count()}")
+
+# Add new data
+table.append_row({"id": 4, "name": "Diana", "age": 19, "score": 98.0, "test_date": date.today()})
+print(f"Added Diana (score: 98)")
+
+# Before tick, views haven't updated yet
+print(f"Filtered count (stale): {len(filtered)}")
+
+# tick() propagates changes to all registered views at once
+synced = table.tick()
+print(f"After tick(): synced {synced} views")
+print(f"Filtered count (fresh): {len(filtered)}")
+print(f"New top scorer: {sorted_view[0]['name']}")
+
+# =============================================================================
 # 🎓 YOU'RE READY!
 # =============================================================================
 print("\n" + "=" * 60)
@@ -161,11 +208,14 @@ You now know how to:
 ✅ Select columns (projection)
 ✅ Add computed columns
 ✅ Join tables
+✅ Use simplified API (sort, join, group_by)
+✅ Propagate changes with tick()
 
 Next steps:
-1. Try the comprehensive examples: python3 test_python_bindings.py
+1. Watch reactive propagation: python3 demo_reactive_propagation.py
 2. Experiment in the playground: python3 playground.py
-3. Read the guide: PYTHON_BINDINGS_README.md
+3. Try real-time streaming: python3 streaming_publisher.py (with WebSocket server)
+4. Read the full guide: docs/PYTHON_BINDINGS_README.md
 
 Happy coding with Rust-powered tables! 🚀
 """)
