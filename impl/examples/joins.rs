@@ -178,7 +178,7 @@ fn main() {
     println!("   Added order for Bob (user_id=2)");
     println!("   Before refresh: {} rows", left_join.len());
 
-    let mut refreshed_join = JoinView::new(
+    let refreshed_join = JoinView::new(
         "refreshed".to_string(),
         users.clone(),
         orders.clone(),

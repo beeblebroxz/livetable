@@ -23,6 +23,8 @@ pub struct FilterView {
     view_to_parent: Vec<usize>,
     /// Last synced generation from parent's changeset
     last_synced_generation: u64,
+    /// Number of changes already processed (absolute index)
+    last_processed_change_count: usize,
 }
 
 impl FilterView {
@@ -31,12 +33,14 @@ impl FilterView {
         F: Fn(&HashMap<String, ColumnValue>) -> bool + 'static,
     {
         let generation = parent.borrow().changeset_generation();
+        let change_count = parent.borrow().changeset().total_len();
         let mut view = FilterView {
             name,
             parent,
             predicate: Box::new(predicate),
             view_to_parent: Vec::new(),
             last_synced_generation: generation,
+            last_processed_change_count: change_count,
         };
         view.rebuild_index();
         view
@@ -55,6 +59,7 @@ impl FilterView {
         }
 
         self.last_synced_generation = parent.changeset_generation();
+        self.last_processed_change_count = parent.changeset().total_len();
     }
 
     pub fn len(&self) -> usize {
@@ -89,7 +94,14 @@ impl FilterView {
     /// Returns true if any changes were applied
     pub fn sync(&mut self) -> bool {
         let parent = self.parent.borrow();
-        let changes = parent.changeset().changes();
+        let changes = match parent.changeset().changes_from(self.last_processed_change_count) {
+            Some(changes) => changes,
+            None => {
+                drop(parent);
+                self.rebuild_index();
+                return true;
+            }
+        };
 
         if changes.is_empty() {
             return false;
@@ -99,11 +111,19 @@ impl FilterView {
         let changes: Vec<TableChange> = changes.to_vec();
         drop(parent);
 
-        self.apply_changes(&changes)
+        let modified = self.apply_changes(&changes);
+        let parent = self.parent.borrow();
+        self.last_processed_change_count = parent.changeset().total_len();
+        self.last_synced_generation = parent.changeset_generation();
+        modified
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn last_processed_change_count(&self) -> usize {
+        self.last_processed_change_count
     }
 }
 
@@ -374,6 +394,10 @@ pub struct JoinView {
     left_last_synced: u64,
     /// Last synced generation from right table's changeset
     right_last_synced: u64,
+    /// Number of changes already processed from left table (absolute index)
+    left_last_processed_change_count: usize,
+    /// Number of changes already processed from right table (absolute index)
+    right_last_processed_change_count: usize,
 }
 
 impl JoinView {
@@ -460,6 +484,8 @@ impl JoinView {
 
         let left_gen = left_table.borrow().changeset_generation();
         let right_gen = right_table.borrow().changeset_generation();
+        let left_change_count = left_table.borrow().changeset().total_len();
+        let right_change_count = right_table.borrow().changeset().total_len();
 
         let mut view = JoinView {
             name,
@@ -471,6 +497,8 @@ impl JoinView {
             join_index: Vec::new(),
             left_last_synced: left_gen,
             right_last_synced: right_gen,
+            left_last_processed_change_count: left_change_count,
+            right_last_processed_change_count: right_change_count,
         };
 
         view.rebuild_index();
@@ -581,6 +609,8 @@ impl JoinView {
         // Update generation trackers
         self.left_last_synced = left.changeset_generation();
         self.right_last_synced = right.changeset_generation();
+        self.left_last_processed_change_count = left.changeset().total_len();
+        self.right_last_processed_change_count = right.changeset().total_len();
     }
 
     /// Build a lookup map from right table for efficient join operations
@@ -674,14 +704,50 @@ impl JoinView {
         self.join_type
     }
 
+    pub fn last_processed_change_count(&self) -> (usize, usize) {
+        (
+            self.left_last_processed_change_count,
+            self.right_last_processed_change_count,
+        )
+    }
+
     /// Incrementally sync with both parent tables' changes
     /// Returns true if any changes were applied
     ///
     /// Note: For complex changes (deletes, updates to join keys), this falls back
     /// to a full rebuild. Only appends are handled incrementally.
     pub fn sync(&mut self) -> bool {
-        let left_changes: Vec<TableChange> = self.left_table.borrow().changeset().changes().to_vec();
-        let right_changes: Vec<TableChange> = self.right_table.borrow().changeset().changes().to_vec();
+        let left_table = self.left_table.borrow();
+        let right_table = self.right_table.borrow();
+        let left_changes = match left_table
+            .changeset()
+            .changes_from(self.left_last_processed_change_count)
+        {
+            Some(changes) => changes,
+            None => {
+                drop(left_table);
+                drop(right_table);
+                self.rebuild_index();
+                return true;
+            }
+        };
+        let right_changes = match right_table
+            .changeset()
+            .changes_from(self.right_last_processed_change_count)
+        {
+            Some(changes) => changes,
+            None => {
+                drop(left_table);
+                drop(right_table);
+                self.rebuild_index();
+                return true;
+            }
+        };
+
+        let left_changes: Vec<TableChange> = left_changes.to_vec();
+        let right_changes: Vec<TableChange> = right_changes.to_vec();
+        drop(left_table);
+        drop(right_table);
 
         if left_changes.is_empty() && right_changes.is_empty() {
             return false;
@@ -901,6 +967,8 @@ pub struct SortedView {
     sorted_index: Vec<usize>,
     /// Last synced generation from parent's changeset
     last_synced_generation: u64,
+    /// Number of changes already processed (absolute index)
+    last_processed_change_count: usize,
 }
 
 impl SortedView {
@@ -935,12 +1003,14 @@ impl SortedView {
         }
 
         let generation = parent.borrow().changeset_generation();
+        let change_count = parent.borrow().changeset().total_len();
         let mut view = SortedView {
             name,
             parent,
             sort_keys,
             sorted_index: Vec::new(),
             last_synced_generation: generation,
+            last_processed_change_count: change_count,
         };
         view.rebuild_index();
         Ok(view)
@@ -987,6 +1057,7 @@ impl SortedView {
         });
 
         self.last_synced_generation = table.changeset_generation();
+        self.last_processed_change_count = table.changeset().total_len();
     }
 
     /// Compare two column values by reference (avoids cloning)
@@ -1160,13 +1231,27 @@ impl SortedView {
     /// Incrementally sync with parent table's changes
     /// Returns true if any changes were applied
     pub fn sync(&mut self) -> bool {
-        let changes: Vec<TableChange> = self.parent.borrow().changeset().changes().to_vec();
+        let parent = self.parent.borrow();
+        let changes = match parent.changeset().changes_from(self.last_processed_change_count) {
+            Some(changes) => changes,
+            None => {
+                drop(parent);
+                self.rebuild_index();
+                return true;
+            }
+        };
 
         if changes.is_empty() {
             return false;
         }
 
-        self.apply_changes(&changes)
+        let changes: Vec<TableChange> = changes.to_vec();
+        drop(parent);
+        let modified = self.apply_changes(&changes);
+        let parent = self.parent.borrow();
+        self.last_processed_change_count = parent.changeset().total_len();
+        self.last_synced_generation = parent.changeset_generation();
+        modified
     }
 
     /// Returns the name of this view
@@ -1177,6 +1262,10 @@ impl SortedView {
     /// Returns the sort keys
     pub fn sort_keys(&self) -> &[SortKey] {
         &self.sort_keys
+    }
+
+    pub fn last_processed_change_count(&self) -> usize {
+        self.last_processed_change_count
     }
 }
 
@@ -1618,7 +1707,7 @@ impl AggregateView {
 
         let (generation, change_count) = {
             let p = parent.borrow();
-            (p.changeset_generation(), p.changeset().changes().len())
+            (p.changeset_generation(), p.changeset().total_len())
         };
         let mut view = AggregateView {
             name,
@@ -1659,7 +1748,7 @@ impl AggregateView {
 
         let num_rows = parent.len();
         let generation = parent.changeset_generation();
-        let change_count = parent.changeset().changes().len();
+        let change_count = parent.changeset().total_len();
 
         // Check for single-column integer group-by fast path
         let is_single_int_group = group_col_indices.len() == 1 && {
@@ -1931,6 +2020,10 @@ impl AggregateView {
         &self.name
     }
 
+    pub fn last_processed_change_count(&self) -> usize {
+        self.last_processed_change_count
+    }
+
     pub fn len(&self) -> usize {
         self.group_order.len()
     }
@@ -1999,15 +2092,21 @@ impl AggregateView {
     /// Incrementally sync with parent table's changes
     pub fn sync(&mut self) -> bool {
         let parent = self.parent.borrow();
-        let all_changes = parent.changeset().changes();
+        let changes = match parent.changeset().changes_from(self.last_processed_change_count) {
+            Some(changes) => changes,
+            None => {
+                drop(parent);
+                self.rebuild_index();
+                return true;
+            }
+        };
 
-        // Only process changes we haven't seen yet
-        if all_changes.len() <= self.last_processed_change_count {
+        if changes.is_empty() {
             return false;
         }
 
-        let new_changes: Vec<TableChange> = all_changes[self.last_processed_change_count..].to_vec();
-        let new_count = all_changes.len();
+        let new_changes: Vec<TableChange> = changes.to_vec();
+        let new_count = parent.changeset().total_len();
         drop(parent);
 
         // Ensure row_to_group is built before processing changes
@@ -2015,6 +2114,7 @@ impl AggregateView {
 
         let modified = self.apply_changes(&new_changes);
         self.last_processed_change_count = new_count;
+        self.last_synced_generation = self.parent.borrow().changeset_generation();
         modified
     }
 }
@@ -3214,5 +3314,257 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("At least one sort key"));
+    }
+
+    // === Changeset Compaction Tests ===
+
+    #[test]
+    fn test_filter_view_sync_incremental_with_cursor() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("value".to_string(), ColumnType::Int32, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+
+        // Add initial rows
+        {
+            let mut t = table.borrow_mut();
+            for i in 0..3 {
+                let mut row = HashMap::new();
+                row.insert("id".to_string(), ColumnValue::Int32(i));
+                row.insert("value".to_string(), ColumnValue::Int32(i * 10));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let mut view = FilterView::new(
+            "filtered".to_string(),
+            table.clone(),
+            |row| {
+                row.get("value")
+                    .and_then(|v| v.as_i32())
+                    .map(|v| v >= 10)
+                    .unwrap_or(false)
+            },
+        );
+
+        assert_eq!(view.len(), 2); // rows with value 10, 20
+        let initial_cursor = view.last_processed_change_count();
+        assert_eq!(initial_cursor, 3); // Processed 3 initial inserts
+
+        // Add a new matching row
+        {
+            let mut t = table.borrow_mut();
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(3));
+            row.insert("value".to_string(), ColumnValue::Int32(30));
+            t.append_row(row).unwrap();
+        }
+
+        // Sync should process only the new change
+        let modified = view.sync();
+        assert!(modified);
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.last_processed_change_count(), 4);
+    }
+
+    #[test]
+    fn test_filter_view_sync_fallback_to_rebuild() {
+        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+
+        // Add rows
+        {
+            let mut t = table.borrow_mut();
+            for i in 0..3 {
+                let mut row = HashMap::new();
+                row.insert("id".to_string(), ColumnValue::Int32(i));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let mut view = FilterView::new("all".to_string(), table.clone(), |_| true);
+        assert_eq!(view.len(), 3);
+
+        // Compact all changes away
+        table.borrow_mut().compact_changeset(100);
+
+        // Add more rows
+        {
+            let mut t = table.borrow_mut();
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(10));
+            t.append_row(row).unwrap();
+        }
+
+        // Sync should fallback to rebuild (returns true)
+        let modified = view.sync();
+        assert!(modified);
+        assert_eq!(view.len(), 4);
+    }
+
+    #[test]
+    fn test_sorted_view_sync_with_cursor() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("score".to_string(), ColumnType::Int32, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+
+        // Add initial rows
+        {
+            let mut t = table.borrow_mut();
+            for (id, score) in [(1, 50), (2, 30), (3, 70)] {
+                let mut row = HashMap::new();
+                row.insert("id".to_string(), ColumnValue::Int32(id));
+                row.insert("score".to_string(), ColumnValue::Int32(score));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let mut view = SortedView::new(
+            "sorted".to_string(),
+            table.clone(),
+            vec![SortKey::descending("score")],
+        )
+        .unwrap();
+
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.get_value(0, "score").unwrap().as_i32(), Some(70));
+        let initial_cursor = view.last_processed_change_count();
+
+        // Add a new highest score
+        {
+            let mut t = table.borrow_mut();
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(4));
+            row.insert("score".to_string(), ColumnValue::Int32(100));
+            t.append_row(row).unwrap();
+        }
+
+        let modified = view.sync();
+        assert!(modified);
+        assert_eq!(view.len(), 4);
+        assert_eq!(view.get_value(0, "score").unwrap().as_i32(), Some(100));
+        assert!(view.last_processed_change_count() > initial_cursor);
+    }
+
+    #[test]
+    fn test_sorted_view_sync_fallback_to_rebuild() {
+        let schema = Schema::new(vec![("value".to_string(), ColumnType::Int32, false)]);
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+
+        {
+            let mut t = table.borrow_mut();
+            for v in [30, 10, 20] {
+                let mut row = HashMap::new();
+                row.insert("value".to_string(), ColumnValue::Int32(v));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let mut view = SortedView::new(
+            "sorted".to_string(),
+            table.clone(),
+            vec![SortKey::ascending("value")],
+        )
+        .unwrap();
+
+        assert_eq!(view.get_value(0, "value").unwrap().as_i32(), Some(10));
+
+        // Compact changes away
+        table.borrow_mut().compact_changeset(100);
+
+        // Add new row
+        {
+            let mut t = table.borrow_mut();
+            let mut row = HashMap::new();
+            row.insert("value".to_string(), ColumnValue::Int32(5));
+            t.append_row(row).unwrap();
+        }
+
+        // Sync falls back to rebuild
+        let modified = view.sync();
+        assert!(modified);
+        assert_eq!(view.len(), 4);
+        assert_eq!(view.get_value(0, "value").unwrap().as_i32(), Some(5));
+    }
+
+    #[test]
+    fn test_multiple_syncs_accumulate_correctly() {
+        let schema = Schema::new(vec![("value".to_string(), ColumnType::Int32, false)]);
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+
+        {
+            let mut t = table.borrow_mut();
+            let mut row = HashMap::new();
+            row.insert("value".to_string(), ColumnValue::Int32(10));
+            t.append_row(row).unwrap();
+        }
+
+        let mut view = FilterView::new("all".to_string(), table.clone(), |_| true);
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.last_processed_change_count(), 1);
+
+        // Add row and sync
+        {
+            let mut t = table.borrow_mut();
+            let mut row = HashMap::new();
+            row.insert("value".to_string(), ColumnValue::Int32(20));
+            t.append_row(row).unwrap();
+        }
+        view.sync();
+        assert_eq!(view.len(), 2);
+        assert_eq!(view.last_processed_change_count(), 2);
+
+        // Add another row and sync again
+        {
+            let mut t = table.borrow_mut();
+            let mut row = HashMap::new();
+            row.insert("value".to_string(), ColumnValue::Int32(30));
+            t.append_row(row).unwrap();
+        }
+        view.sync();
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.last_processed_change_count(), 3);
+    }
+
+    #[test]
+    fn test_view_sync_after_partial_compaction() {
+        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+
+        // Add 5 rows
+        {
+            let mut t = table.borrow_mut();
+            for i in 0..5 {
+                let mut row = HashMap::new();
+                row.insert("id".to_string(), ColumnValue::Int32(i));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let mut view = FilterView::new("all".to_string(), table.clone(), |_| true);
+        assert_eq!(view.len(), 5);
+        assert_eq!(view.last_processed_change_count(), 5);
+
+        // Compact first 3 changes (view has already processed them)
+        table.borrow_mut().compact_changeset(3);
+
+        // Add more rows
+        {
+            let mut t = table.borrow_mut();
+            for i in 5..8 {
+                let mut row = HashMap::new();
+                row.insert("id".to_string(), ColumnValue::Int32(i));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        // Sync should still work because view's cursor (5) >= base_index (3)
+        let modified = view.sync();
+        assert!(modified);
+        assert_eq!(view.len(), 8);
+        assert_eq!(view.last_processed_change_count(), 8);
     }
 }

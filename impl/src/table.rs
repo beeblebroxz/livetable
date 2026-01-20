@@ -490,6 +490,11 @@ impl Table {
         self.changeset.clear();
     }
 
+    /// Compact the changeset up to the given absolute change index
+    pub fn compact_changeset(&mut self, up_to_index: usize) {
+        self.changeset.compact(up_to_index);
+    }
+
     /// Returns true if there are pending changes
     pub fn has_pending_changes(&self) -> bool {
         !self.changeset.is_empty()

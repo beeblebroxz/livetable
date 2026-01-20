@@ -571,6 +571,7 @@ struct PyFilterViewInner {
     predicate: PyObject,
     indices: Vec<usize>,
     last_synced_generation: u64,
+    last_processed_change_count: usize,
 }
 
 impl PyFilterViewInner {
@@ -595,7 +596,113 @@ impl PyFilterViewInner {
         }
 
         self.last_synced_generation = table_ref.changeset_generation();
+        self.last_processed_change_count = table_ref.changeset().total_len();
         Ok(())
+    }
+
+    fn sync(&mut self, py: Python) -> PyResult<bool> {
+        use crate::changeset::TableChange;
+
+        let table_ref = self.table_inner.borrow();
+        let changes = match table_ref
+            .changeset()
+            .changes_from(self.last_processed_change_count)
+        {
+            Some(changes) => changes,
+            None => {
+                drop(table_ref);
+                self.refresh(py)?;
+                return Ok(true);
+            }
+        };
+
+        if changes.is_empty() {
+            return Ok(false);
+        }
+
+        let changes: Vec<TableChange> = changes.to_vec();
+        drop(table_ref);
+
+        let mut modified = false;
+        for change in changes {
+            match change {
+                TableChange::RowInserted { index, data } => {
+                    for idx in self.indices.iter_mut() {
+                        if *idx >= index {
+                            *idx += 1;
+                        }
+                    }
+
+                    let dict = PyDict::new_bound(py);
+                    for (key, value) in data.iter() {
+                        dict.set_item(key, column_value_to_py(py, value)?)?;
+                    }
+
+                    let result: bool = self.predicate.call1(py, (dict,))?.extract(py)?;
+                    if result {
+                        let insert_pos = self.indices.iter()
+                            .position(|&i| i > index)
+                            .unwrap_or(self.indices.len());
+                        self.indices.insert(insert_pos, index);
+                        modified = true;
+                    }
+                }
+
+                TableChange::RowDeleted { index, .. } => {
+                    let mut to_remove = None;
+                    for (view_idx, parent_idx) in self.indices.iter_mut().enumerate() {
+                        if *parent_idx == index {
+                            to_remove = Some(view_idx);
+                        } else if *parent_idx > index {
+                            *parent_idx -= 1;
+                        }
+                    }
+
+                    if let Some(view_idx) = to_remove {
+                        self.indices.remove(view_idx);
+                        modified = true;
+                    }
+                }
+
+                TableChange::CellUpdated { row, .. } => {
+                    let currently_in_view = self.indices.contains(&row);
+                    let table_ref = self.table_inner.borrow();
+                    let now_matches = if let Ok(row_data) = table_ref.get_row(row) {
+                        let dict = PyDict::new_bound(py);
+                        for (key, value) in row_data.iter() {
+                            dict.set_item(key, column_value_to_py(py, value)?)?;
+                        }
+                        drop(table_ref);
+                        self.predicate.call1(py, (dict,))?.extract::<bool>(py)?
+                    } else {
+                        drop(table_ref);
+                        false
+                    };
+
+                    match (currently_in_view, now_matches) {
+                        (false, true) => {
+                            let insert_pos = self.indices.iter()
+                                .position(|&i| i > row)
+                                .unwrap_or(self.indices.len());
+                            self.indices.insert(insert_pos, row);
+                            modified = true;
+                        }
+                        (true, false) => {
+                            if let Some(pos) = self.indices.iter().position(|&i| i == row) {
+                                self.indices.remove(pos);
+                                modified = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let table_ref = self.table_inner.borrow();
+        self.last_processed_change_count = table_ref.changeset().total_len();
+        self.last_synced_generation = table_ref.changeset_generation();
+        Ok(modified)
     }
 }
 
@@ -1465,30 +1572,35 @@ impl PyTable {
 
         let views = self.registered_views.borrow();
         let mut synced_count = 0;
+        let mut min_cursor = self.inner.borrow().changeset().total_len();
+
+        if views.is_empty() {
+            self.inner.borrow_mut().clear_changeset();
+            return Ok(0);
+        }
 
         for view in views.iter() {
             match view {
                 RegisteredView::Filter(inner) => {
-                    // Rebuild filter indices based on current table state
-                    inner.borrow_mut().refresh(py)?;
+                    inner.borrow_mut().sync(py)?;
+                    min_cursor = min_cursor.min(inner.borrow().last_processed_change_count);
                     synced_count += 1;
                 }
                 RegisteredView::Sorted(inner) => {
-                    // Use refresh() to rebuild from scratch since sync() would
-                    // reprocess all accumulated changes incorrectly
-                    inner.borrow_mut().refresh();
+                    inner.borrow_mut().sync();
+                    min_cursor = min_cursor.min(inner.borrow().last_processed_change_count());
                     synced_count += 1;
                 }
                 RegisteredView::Aggregate(inner) => {
                     inner.borrow_mut().sync();
+                    min_cursor = min_cursor.min(inner.borrow().last_processed_change_count());
                     synced_count += 1;
                 }
             }
         }
 
-        // Clear the changeset after all views have been synced
-        // This increments the generation and clears pending changes
-        self.inner.borrow_mut().clear_changeset();
+        // Compact changes that all registered views have already processed
+        self.inner.borrow_mut().compact_changeset(min_cursor);
 
         Ok(synced_count)
     }
@@ -1526,11 +1638,13 @@ impl PyFilterView {
     #[new]
     fn new(table: PyTable, predicate: PyObject) -> PyResult<Self> {
         let generation = table.inner.borrow().changeset_generation();
+        let change_count = table.inner.borrow().changeset().total_len();
         let inner = Rc::new(RefCell::new(PyFilterViewInner {
             table_inner: Rc::clone(&table.inner),
             predicate,
             indices: Vec::new(),
             last_synced_generation: generation,
+            last_processed_change_count: change_count,
         }));
 
         // Initial refresh
@@ -1619,104 +1733,7 @@ impl PyFilterView {
     ///
     /// This is more efficient than refresh() when only a few changes have occurred
     fn sync(&mut self) -> PyResult<bool> {
-        use crate::changeset::TableChange;
-
-        let changes: Vec<TableChange> = self.table.inner.borrow().changeset().changes().to_vec();
-
-        if changes.is_empty() {
-            return Ok(false);
-        }
-
-        Python::with_gil(|py| {
-            let mut inner = self.inner.borrow_mut();
-            let mut modified = false;
-
-            for change in changes {
-                match change {
-                    TableChange::RowInserted { index, data } => {
-                        // Adjust existing indices
-                        for idx in inner.indices.iter_mut() {
-                            if *idx >= index {
-                                *idx += 1;
-                            }
-                        }
-
-                        // Check if new row matches predicate
-                        let dict = PyDict::new_bound(py);
-                        for (key, value) in data.iter() {
-                            dict.set_item(key, column_value_to_py(py, value)?)?;
-                        }
-
-                        let result: bool = inner.predicate.call1(py, (dict,))?.extract(py)?;
-                        if result {
-                            // Insert in sorted order
-                            let insert_pos = inner.indices.iter()
-                                .position(|&i| i > index)
-                                .unwrap_or(inner.indices.len());
-                            inner.indices.insert(insert_pos, index);
-                            modified = true;
-                        }
-                    }
-
-                    TableChange::RowDeleted { index, .. } => {
-                        // Find and adjust indices
-                        let mut to_remove = None;
-                        for (view_idx, parent_idx) in inner.indices.iter_mut().enumerate() {
-                            if *parent_idx == index {
-                                to_remove = Some(view_idx);
-                            } else if *parent_idx > index {
-                                *parent_idx -= 1;
-                            }
-                        }
-
-                        if let Some(view_idx) = to_remove {
-                            inner.indices.remove(view_idx);
-                            modified = true;
-                        }
-                    }
-
-                    TableChange::CellUpdated { row, .. } => {
-                        // Re-evaluate the predicate for this row
-                        let currently_in_view = inner.indices.contains(&row);
-
-                        let table_ref = inner.table_inner.borrow();
-                        let now_matches = if let Ok(row_data) = table_ref.get_row(row) {
-                            let dict = PyDict::new_bound(py);
-                            for (key, value) in row_data.iter() {
-                                dict.set_item(key, column_value_to_py(py, value)?)?;
-                            }
-                            drop(table_ref); // Release borrow before Python call
-                            inner.predicate.call1(py, (dict,))?.extract::<bool>(py)?
-                        } else {
-                            drop(table_ref);
-                            false
-                        };
-
-                        match (currently_in_view, now_matches) {
-                            (false, true) => {
-                                // Add to view
-                                let insert_pos = inner.indices.iter()
-                                    .position(|&i| i > row)
-                                    .unwrap_or(inner.indices.len());
-                                inner.indices.insert(insert_pos, row);
-                                modified = true;
-                            }
-                            (true, false) => {
-                                // Remove from view
-                                if let Some(pos) = inner.indices.iter().position(|&i| i == row) {
-                                    inner.indices.remove(pos);
-                                    modified = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            inner.last_synced_generation = self.table.inner.borrow().changeset_generation();
-            Ok(modified)
-        })
+        Python::with_gil(|py| self.inner.borrow_mut().sync(py))
     }
 
     /// Get the last synced generation number

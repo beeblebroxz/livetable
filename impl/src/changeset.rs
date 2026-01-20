@@ -75,6 +75,8 @@ pub struct Changeset {
     changes: Vec<TableChange>,
     /// Generation counter - incremented each time changeset is cleared
     generation: u64,
+    /// Number of changes that have been compacted away
+    base_index: usize,
 }
 
 impl Changeset {
@@ -82,6 +84,7 @@ impl Changeset {
         Changeset {
             changes: Vec::new(),
             generation: 0,
+            base_index: 0,
         }
     }
 
@@ -95,13 +98,38 @@ impl Changeset {
         &self.changes
     }
 
+    /// Returns a slice of changes since the given absolute index.
+    /// Returns None if the requested index has been compacted away.
+    pub fn changes_from(&self, index: usize) -> Option<&[TableChange]> {
+        if index < self.base_index {
+            return None;
+        }
+        let total = self.total_len();
+        if index >= total {
+            return Some(&[]);
+        }
+        let offset = index - self.base_index;
+        Some(&self.changes[offset..])
+    }
+
     /// Returns the current generation number
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
+    /// Returns the absolute index of the first stored change
+    pub fn base_index(&self) -> usize {
+        self.base_index
+    }
+
+    /// Returns the total number of changes seen (including compacted)
+    pub fn total_len(&self) -> usize {
+        self.base_index + self.changes.len()
+    }
+
     /// Clear all changes and increment generation
     pub fn clear(&mut self) {
+        self.base_index += self.changes.len();
         self.changes.clear();
         self.generation += 1;
     }
@@ -118,8 +146,27 @@ impl Changeset {
 
     /// Drain changes, returning ownership and clearing the buffer
     pub fn drain(&mut self) -> Vec<TableChange> {
+        self.base_index += self.changes.len();
         self.generation += 1;
         std::mem::take(&mut self.changes)
+    }
+
+    /// Compact changes up to (but not including) the given absolute index.
+    pub fn compact(&mut self, up_to_index: usize) {
+        if up_to_index <= self.base_index {
+            return;
+        }
+        let total = self.total_len();
+        if up_to_index >= total {
+            self.base_index = up_to_index;
+            self.changes.clear();
+            self.generation += 1;
+            return;
+        }
+        let drop_count = up_to_index - self.base_index;
+        self.changes.drain(0..drop_count);
+        self.base_index = up_to_index;
+        self.generation += 1;
     }
 }
 
@@ -255,5 +302,188 @@ mod tests {
         assert_eq!(removed, vec![2]);
         // 0 stays 0, 2 stays 2, 3 is marked for removal, 5 becomes 4, 7 becomes 6
         assert_eq!(mapping, vec![0, 2, 3, 4, 6]); // Note: 3 still here, caller removes it
+    }
+
+    #[test]
+    fn test_changeset_total_len() {
+        let mut cs = Changeset::new();
+        assert_eq!(cs.total_len(), 0);
+        assert_eq!(cs.base_index(), 0);
+
+        cs.push(TableChange::RowInserted {
+            index: 0,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 1,
+            data: HashMap::new(),
+        });
+        assert_eq!(cs.total_len(), 2);
+        assert_eq!(cs.base_index(), 0);
+    }
+
+    #[test]
+    fn test_changeset_base_index_after_clear() {
+        let mut cs = Changeset::new();
+        cs.push(TableChange::RowInserted {
+            index: 0,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 1,
+            data: HashMap::new(),
+        });
+
+        cs.clear();
+        assert_eq!(cs.base_index(), 2);
+        assert_eq!(cs.total_len(), 2);
+        assert!(cs.is_empty());
+
+        // Add more changes
+        cs.push(TableChange::RowInserted {
+            index: 2,
+            data: HashMap::new(),
+        });
+        assert_eq!(cs.total_len(), 3);
+        assert_eq!(cs.len(), 1);
+    }
+
+    #[test]
+    fn test_changeset_base_index_after_drain() {
+        let mut cs = Changeset::new();
+        cs.push(TableChange::RowInserted {
+            index: 0,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 1,
+            data: HashMap::new(),
+        });
+
+        let drained = cs.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(cs.base_index(), 2);
+        assert_eq!(cs.total_len(), 2);
+    }
+
+    #[test]
+    fn test_changeset_changes_from() {
+        let mut cs = Changeset::new();
+        cs.push(TableChange::RowInserted {
+            index: 0,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 1,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 2,
+            data: HashMap::new(),
+        });
+
+        // Get all changes
+        let all = cs.changes_from(0).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Get changes from index 1
+        let from_1 = cs.changes_from(1).unwrap();
+        assert_eq!(from_1.len(), 2);
+
+        // Get changes from index 3 (none)
+        let from_3 = cs.changes_from(3).unwrap();
+        assert_eq!(from_3.len(), 0);
+    }
+
+    #[test]
+    fn test_changeset_changes_from_compacted() {
+        let mut cs = Changeset::new();
+        cs.push(TableChange::RowInserted {
+            index: 0,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 1,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 2,
+            data: HashMap::new(),
+        });
+
+        // Compact first 2 changes
+        cs.compact(2);
+
+        // Requesting compacted index returns None
+        assert!(cs.changes_from(0).is_none());
+        assert!(cs.changes_from(1).is_none());
+
+        // Requesting from compaction point works
+        let remaining = cs.changes_from(2).unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn test_changeset_compact_partial() {
+        let mut cs = Changeset::new();
+        for i in 0..5 {
+            cs.push(TableChange::RowInserted {
+                index: i,
+                data: HashMap::new(),
+            });
+        }
+
+        // Compact first 3
+        cs.compact(3);
+        assert_eq!(cs.base_index(), 3);
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs.total_len(), 5);
+
+        // Compact 1 more
+        cs.compact(4);
+        assert_eq!(cs.base_index(), 4);
+        assert_eq!(cs.len(), 1);
+    }
+
+    #[test]
+    fn test_changeset_compact_past_end() {
+        let mut cs = Changeset::new();
+        cs.push(TableChange::RowInserted {
+            index: 0,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 1,
+            data: HashMap::new(),
+        });
+
+        // Compact past all changes
+        cs.compact(10);
+        assert_eq!(cs.base_index(), 10);
+        assert!(cs.is_empty());
+        assert_eq!(cs.total_len(), 10);
+    }
+
+    #[test]
+    fn test_changeset_compact_idempotent() {
+        let mut cs = Changeset::new();
+        cs.push(TableChange::RowInserted {
+            index: 0,
+            data: HashMap::new(),
+        });
+        cs.push(TableChange::RowInserted {
+            index: 1,
+            data: HashMap::new(),
+        });
+
+        cs.compact(1);
+        let gen_after = cs.generation();
+
+        // Compacting to same or earlier point is no-op
+        cs.compact(0);
+        assert_eq!(cs.generation(), gen_after);
+        cs.compact(1);
+        assert_eq!(cs.generation(), gen_after);
+        assert_eq!(cs.base_index(), 1);
     }
 }
