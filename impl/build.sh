@@ -25,7 +25,7 @@ if [ $? -eq 0 ]; then
     echo "📍 Wheel location: target/wheels/"
     echo ""
     echo "To install:"
-    echo "  pip3 install target/wheels/qzt_rust-*.whl --force-reinstall --break-system-packages"
+    echo "  pip3 install target/wheels/livetable-*.whl --force-reinstall --break-system-packages"
     echo ""
     echo "Or run: ./install.sh"
 else
