@@ -1096,6 +1096,7 @@ dependencies = [
  "pyo3",
  "serde",
  "serde_json",
+ "tiered-vector",
  "tokio",
 ]
 
@@ -1680,6 +1681,12 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
+
+[[package]]
+name = "tiered-vector"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bd5056137d09d70f3207d5af7ad3824be2bca36f04733de7a5d64aa4d783d51"
 
 [[package]]
 name = "time"

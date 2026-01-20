@@ -33,17 +33,22 @@ A simple contiguous array:
 - Best for read-heavy workloads or append-only patterns
 
 #### TieredVector (TieredVectorSequence)
-An unusual data structure using indirection and rotation to accelerate insert/delete:
-- **O(1)** random-access, but with a few extra instructions to find the physical address
+An unusual data structure using circular buffers to achieve true constant-time access:
+- **True O(1)** random-access via direct calculation (no binary search)
 - **O(√N)** random-access insert and delete
 - Loops over consecutive indices are efficient, but slightly less efficient than Array
 - A TieredVector of size N is represented using at most 2×√N distinct contiguous sequences
-- Requires an extra O(√N) storage to hold a rotation value table
+- Requires an extra O(√N) storage overhead
 - Best for insert-heavy workloads
+- **Implementation**: Backed by the [tiered-vector](https://crates.io/crates/tiered-vector) crate
 
 ### Choosing Between Them
 
 The system can dynamically choose good layout strategies based on the relative ratios of insert/delete vs. loops over the entire Column, random access, etc.
+
+**Current Implementation**: Users select the storage backend via `StorageHint` at table creation:
+- `storage="fast_reads"` (default): Uses ArraySequence
+- `storage="fast_updates"`: Uses TieredVectorSequence
 
 ---
 
@@ -185,7 +190,8 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 ## Implementation Status
 
 ### Completed
-- [x] Sequence layer (ArraySequence, TieredVectorSequence)
+- [x] Sequence layer (ArraySequence, TieredVectorSequence backed by tiered-vector crate)
+- [x] StorageHint API for selecting storage backend (`fast_reads` / `fast_updates`)
 - [x] Column layer with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL)
 - [x] Table layer (Root tables with CRUD operations)
 - [x] Views: FilterView, ProjectionView, ComputedView, JoinView (LEFT/INNER), SortedView

@@ -38,6 +38,51 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// Hint for selecting the underlying storage strategy.
+///
+/// This allows users to optimize for their workload without needing to
+/// understand the implementation details of the underlying data structures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageHint {
+    /// Optimized for append and read-heavy workloads (default).
+    ///
+    /// Best for: logs, time-series, analytics, streaming data.
+    /// - O(1) random access
+    /// - O(1) amortized append
+    /// - O(N) insert/delete in middle
+    #[default]
+    FastReads,
+
+    /// Optimized for frequent inserts and deletes anywhere in the table.
+    ///
+    /// Best for: order books, priority queues, ranked lists, live updates.
+    /// - O(1) random access
+    /// - O(√N) insert/delete anywhere
+    /// - O(√N) append (slightly slower than FastReads)
+    FastUpdates,
+}
+
+impl StorageHint {
+    /// Parse a storage hint from a string (for Python API).
+    ///
+    /// Accepts: "fast_reads", "fast_updates"
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "fast_reads" | "fastreads" => Ok(StorageHint::FastReads),
+            "fast_updates" | "fastupdates" => Ok(StorageHint::FastUpdates),
+            _ => Err(format!(
+                "Unknown storage hint: '{}'. Use 'fast_reads' or 'fast_updates'",
+                s
+            )),
+        }
+    }
+
+    /// Returns true if this hint uses tiered vector storage.
+    pub(crate) fn use_tiered_vector(&self) -> bool {
+        matches!(self, StorageHint::FastUpdates)
+    }
+}
+
 /// Schema definition with column names and types.
 ///
 /// A schema defines the structure of a table, specifying the name, type,
@@ -152,15 +197,39 @@ pub struct Table {
 }
 
 impl Table {
+    /// Create a new table with default settings (FastReads storage).
     pub fn new(name: String, schema: Schema) -> Self {
-        Self::new_with_options(name, schema, false)
+        Self::with_hint(name, schema, StorageHint::default())
     }
 
-    pub fn new_with_options(name: String, schema: Schema, use_tiered_vector: bool) -> Self {
-        Self::new_with_interning(name, schema, use_tiered_vector, false)
+    /// Create a new table with a storage hint.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Table name
+    /// * `schema` - Table schema
+    /// * `hint` - Storage optimization hint (FastReads or FastUpdates)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use livetable::{Table, Schema, ColumnType, StorageHint};
+    ///
+    /// let schema = Schema::new(vec![
+    ///     ("id".to_string(), ColumnType::Int32, false),
+    /// ]);
+    ///
+    /// // For append-heavy workloads (default)
+    /// let logs = Table::with_hint("logs".to_string(), schema.clone(), StorageHint::FastReads);
+    ///
+    /// // For frequent inserts/deletes
+    /// let orderbook = Table::with_hint("orders".to_string(), schema, StorageHint::FastUpdates);
+    /// ```
+    pub fn with_hint(name: String, schema: Schema, hint: StorageHint) -> Self {
+        Self::with_hint_and_interning(name, schema, hint, false)
     }
 
-    /// Create a new table with optional string interning
+    /// Create a new table with storage hint and optional string interning.
     ///
     /// When `use_string_interning` is true, all String columns will share a
     /// common string interner, reducing memory usage for repeated strings.
@@ -169,14 +238,15 @@ impl Table {
     ///
     /// * `name` - Table name
     /// * `schema` - Table schema
-    /// * `use_tiered_vector` - Use TieredVector storage (faster inserts/deletes)
+    /// * `hint` - Storage optimization hint
     /// * `use_string_interning` - Enable string interning for memory efficiency
-    pub fn new_with_interning(
+    pub fn with_hint_and_interning(
         name: String,
         schema: Schema,
-        use_tiered_vector: bool,
+        hint: StorageHint,
         use_string_interning: bool,
     ) -> Self {
+        let use_tiered_vector = hint.use_tiered_vector();
         // Create shared interner if string interning is enabled
         let interner = if use_string_interning {
             Some(Rc::new(RefCell::new(StringInterner::new())))
@@ -206,6 +276,39 @@ impl Table {
             changeset: Changeset::new(),
             interner,
         }
+    }
+
+    // ==================== Backward-compatible methods ====================
+
+    /// Create a new table with boolean storage option (deprecated).
+    ///
+    /// Prefer using `with_hint()` for clearer intent.
+    #[deprecated(since = "0.2.0", note = "Use `with_hint()` with `StorageHint` instead")]
+    pub fn new_with_options(name: String, schema: Schema, use_tiered_vector: bool) -> Self {
+        let hint = if use_tiered_vector {
+            StorageHint::FastUpdates
+        } else {
+            StorageHint::FastReads
+        };
+        Self::with_hint(name, schema, hint)
+    }
+
+    /// Create a new table with boolean storage option and interning (deprecated).
+    ///
+    /// Prefer using `with_hint_and_interning()` for clearer intent.
+    #[deprecated(since = "0.2.0", note = "Use `with_hint_and_interning()` with `StorageHint` instead")]
+    pub fn new_with_interning(
+        name: String,
+        schema: Schema,
+        use_tiered_vector: bool,
+        use_string_interning: bool,
+    ) -> Self {
+        let hint = if use_tiered_vector {
+            StorageHint::FastUpdates
+        } else {
+            StorageHint::FastReads
+        };
+        Self::with_hint_and_interning(name, schema, hint, use_string_interning)
     }
 
     /// Returns true if this table uses string interning

@@ -58,6 +58,7 @@ Any column can be marked **nullable** to support `None` values.
 - Row operations: `append_row()`, `get_row()`, `set_value()`, `delete_row()`
 - Bulk insert: `append_rows([...])` for efficient multi-row operations
 - NULL value support for nullable columns
+- Storage hints: `storage="fast_reads"` (default) or `storage="fast_updates"` for insert-heavy workloads
 
 ### Pythonic API
 ```python
@@ -166,6 +167,9 @@ schema = livetable.Schema([
 ])
 table = livetable.Table("students", schema)
 
+# For insert-heavy workloads, use fast_updates storage:
+# table = livetable.Table("orderbook", schema, storage="fast_updates")
+
 # Add data
 table.append_row({"id": 1, "name": "Alice", "score": 95.5, "joined": date(2024, 9, 1)})
 table.append_rows([
@@ -270,7 +274,9 @@ livetable/
 ## Architecture
 
 - **Language**: Rust core with PyO3 Python bindings
-- **Storage**: ArraySequence (O(1) access) or TieredVector (O(√N) insert)
+- **Storage**: Two backends selectable via `StorageHint`:
+  - `fast_reads` (default): ArraySequence - O(1) access, O(N) insert/delete
+  - `fast_updates`: TieredVectorSequence - O(1) access, O(√N) insert/delete (backed by [tiered-vector](https://crates.io/crates/tiered-vector) crate)
 - **Views**: Zero-copy references to source tables
 - **Type System**: Strongly typed with NULL support
 

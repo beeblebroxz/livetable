@@ -16,7 +16,7 @@ Key principles from the original vision:
 - Operations should be as fast as hand-coded C++
 - Large table graphs can "tick" in real time
 - Algorithms don't care about physical data layout
-- Two storage backends: Array (O(1) access) and TieredVector (O(√N) insert)
+- Two storage backends via `StorageHint`: Array (O(1) access, default) and TieredVector (O(1) access, O(√N) insert)
 - Root tables own data; Views derive from parents via DAG
 - Incremental change propagation through changesets
 - String interning for memory efficiency
@@ -88,7 +88,7 @@ cd frontend && npm install && npm run dev
 ## Architecture
 
 ### Layered Design (impl/src/)
-- **sequence.rs** - Storage backends: `ArraySequence` (contiguous), `TieredVectorSequence` (efficient inserts)
+- **sequence.rs** - Storage backends: `ArraySequence` (contiguous, default), `TieredVectorSequence` (O(√N) inserts, backed by [tiered-vector](https://crates.io/crates/tiered-vector) crate)
 - **column.rs** - Strongly-typed column values with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
 - **table.rs** - Row-level CRUD operations on column collections
 - **view.rs** - Zero-copy views: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView`, `SortedView`
@@ -129,6 +129,11 @@ schema = livetable.Schema([
     ("score", livetable.ColumnType.FLOAT64, True),
 ])
 table = livetable.Table("students", schema)
+
+# Storage hints - choose backend optimized for your workload
+# Default: "fast_reads" (ArraySequence) - O(1) access, O(N) insert/delete
+# Option: "fast_updates" (TieredVectorSequence) - O(1) access, O(√N) insert/delete
+orderbook = livetable.Table("orderbook", schema, storage="fast_updates")
 
 # CRUD operations
 table.append_row({"id": 1, "name": "Alice", "score": 95.5})

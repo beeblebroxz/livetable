@@ -3,9 +3,11 @@
 /// A Sequence is the lowest-level storage implementation for raw values.
 /// Supports two implementations:
 /// - ArraySequence: Simple contiguous array with O(1) access, O(N) insert/delete
-/// - TieredVectorSequence: Uses indirection for O(1) access, O(sqrt(N)) insert/delete
+/// - TieredVectorSequence: True tiered vector with O(1) access, O(sqrt(N)) insert/delete
+///   (backed by the tiered-vector crate)
 
 use std::fmt::Debug;
+use tiered_vector::Vector as TieredVector;
 
 /// Trait for sequence storage operations
 pub trait Sequence<T: Clone> {
@@ -114,193 +116,48 @@ impl<T: Clone + Debug> Sequence<T> for ArraySequence<T> {
     }
 }
 
-/// Tiered Vector implementation using sqrt decomposition.
+/// Tiered Vector implementation backed by the tiered-vector crate.
 ///
-/// Complexity guarantees:
-/// - O(log √N) random access via binary search on block boundaries
-///   (practically O(1) for reasonable N, e.g., log(1000) ≈ 10 comparisons)
-/// - O(√N) insert/delete (shift within block + update cumulative indices)
-/// - Good cache locality for sequential access within blocks
+/// Complexity guarantees (from the crate):
+/// - O(1) random access (true constant time via direct calculation)
+/// - O(√N) insert/delete
+/// - O(√N) space overhead
 ///
-/// The data structure maintains:
-/// - `blocks`: Vector of blocks, each containing approximately √N elements
-/// - `block_starts`: Cumulative index array where block_starts[i] is the
-///   global index where block i begins. Enables O(log √N) binary search.
-/// - Automatic splitting when blocks exceed 2√N elements
-/// - Automatic merging when blocks fall below √N/4 elements
-#[derive(Debug, Clone)]
+/// This is a thin wrapper that implements our Sequence trait using
+/// `tiered_vector::Vector<T>`, which uses circular buffers internally
+/// for true O(1) index lookup.
 pub struct TieredVectorSequence<T: Clone> {
-    blocks: Vec<Vec<T>>,
-    block_starts: Vec<usize>,  // block_starts[i] = starting global index of block i
-    size: usize,
+    inner: TieredVector<T>,
+}
+
+impl<T: Clone + Debug> Debug for TieredVectorSequence<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TieredVectorSequence")
+            .field("len", &self.inner.len())
+            .finish()
+    }
+}
+
+impl<T: Clone> Clone for TieredVectorSequence<T> {
+    fn clone(&self) -> Self {
+        let mut new_seq = TieredVectorSequence::new();
+        for item in self.inner.iter() {
+            new_seq.inner.push(item.clone());
+        }
+        new_seq
+    }
 }
 
 impl<T: Clone> TieredVectorSequence<T> {
-    /// Minimum block size to prevent excessive fragmentation
-    const MIN_BLOCK_SIZE: usize = 16;
-    /// Maximum block size to bound worst-case insert/delete
-    const MAX_BLOCK_SIZE: usize = 4096;
-
     pub fn new() -> Self {
         TieredVectorSequence {
-            blocks: Vec::new(),
-            block_starts: Vec::new(),
-            size: 0,
+            inner: TieredVector::new(),
         }
     }
 
-    /// For API compatibility - chunk_size hint is used for initial block sizing
+    /// For API compatibility - chunk_size hint is ignored (crate manages internally)
     pub fn with_chunk_size(_chunk_size_hint: usize) -> Self {
         Self::new()
-    }
-
-    /// Calculate ideal block size as √N, clamped to reasonable bounds
-    fn ideal_block_size(&self) -> usize {
-        if self.size == 0 {
-            return Self::MIN_BLOCK_SIZE;
-        }
-        let sqrt = (self.size as f64).sqrt() as usize;
-        sqrt.clamp(Self::MIN_BLOCK_SIZE, Self::MAX_BLOCK_SIZE)
-    }
-
-    /// Find which block contains the given index using binary search.
-    /// Returns (block_index, offset_within_block).
-    ///
-    /// Complexity: O(log(number of blocks)) = O(log √N) = O(½ log N)
-    fn find_block(&self, index: usize) -> Result<(usize, usize), String> {
-        if index >= self.size {
-            return Err(format!("Index {} out of range [0, {})", index, self.size));
-        }
-
-        if self.blocks.is_empty() {
-            return Err("Sequence is empty".to_string());
-        }
-
-        // Binary search: find the rightmost block where block_starts[i] <= index
-        let block_idx = match self.block_starts.binary_search(&index) {
-            Ok(i) => i,           // Exact match: index is at start of block i
-            Err(i) => i.saturating_sub(1),  // index is somewhere in block i-1
-        };
-
-        let offset = index - self.block_starts[block_idx];
-
-        // Sanity check
-        debug_assert!(offset < self.blocks[block_idx].len(),
-            "Offset {} >= block len {} for index {}",
-            offset, self.blocks[block_idx].len(), index);
-
-        Ok((block_idx, offset))
-    }
-
-    /// Update block_starts for all blocks after the given index.
-    /// Called after insert (+1) or delete (-1) to maintain cumulative indices.
-    fn update_block_starts_after(&mut self, block_idx: usize, delta: isize) {
-        for i in (block_idx + 1)..self.block_starts.len() {
-            self.block_starts[i] = (self.block_starts[i] as isize + delta) as usize;
-        }
-    }
-
-    /// Split a block that has grown too large (> 2 * ideal_size).
-    /// Maintains the sqrt(N) block size invariant.
-    fn maybe_split_block(&mut self, block_idx: usize) {
-        let ideal = self.ideal_block_size();
-        let threshold = 2 * ideal;
-
-        if self.blocks[block_idx].len() <= threshold {
-            return;
-        }
-
-        let mid = self.blocks[block_idx].len() / 2;
-        let new_block = self.blocks[block_idx].split_off(mid);
-        let new_block_start = self.block_starts[block_idx] + self.blocks[block_idx].len();
-
-        // Insert new block right after current one
-        self.blocks.insert(block_idx + 1, new_block);
-        self.block_starts.insert(block_idx + 1, new_block_start);
-    }
-
-    /// Merge a block that has become too small (< ideal_size / 4) with a neighbor.
-    /// Prevents excessive fragmentation from many deletions.
-    fn maybe_merge_block(&mut self, block_idx: usize) {
-        if self.blocks.len() <= 1 {
-            return;
-        }
-
-        // Don't merge if block is empty (will be removed separately)
-        if self.blocks[block_idx].is_empty() {
-            return;
-        }
-
-        let ideal = self.ideal_block_size();
-        let threshold = ideal / 4;
-
-        if self.blocks[block_idx].len() >= threshold {
-            return;
-        }
-
-        // Prefer merging with the smaller neighbor to keep blocks balanced
-        let merge_with_next = block_idx + 1 < self.blocks.len()
-            && (block_idx == 0
-                || self.blocks[block_idx + 1].len() <= self.blocks[block_idx - 1].len());
-
-        if merge_with_next && block_idx + 1 < self.blocks.len() {
-            let combined = self.blocks[block_idx].len() + self.blocks[block_idx + 1].len();
-            if combined <= 2 * ideal {
-                let next_block = self.blocks.remove(block_idx + 1);
-                self.block_starts.remove(block_idx + 1);
-                self.blocks[block_idx].extend(next_block);
-                return;
-            }
-        }
-
-        if block_idx > 0 {
-            let combined = self.blocks[block_idx - 1].len() + self.blocks[block_idx].len();
-            if combined <= 2 * ideal {
-                let current_block = self.blocks.remove(block_idx);
-                self.block_starts.remove(block_idx);
-                self.blocks[block_idx - 1].extend(current_block);
-            }
-        }
-    }
-
-    /// Remove an empty block entirely (proper cleanup, no memory leaks)
-    fn remove_empty_block(&mut self, block_idx: usize) {
-        if block_idx < self.blocks.len() && self.blocks[block_idx].is_empty() {
-            self.blocks.remove(block_idx);
-            self.block_starts.remove(block_idx);
-        }
-    }
-
-    /// Rebalance all blocks to have approximately equal size.
-    /// Call this periodically for optimal performance after many operations.
-    /// Complexity: O(N)
-    pub fn rebalance(&mut self) {
-        if self.size == 0 {
-            self.blocks.clear();
-            self.block_starts.clear();
-            return;
-        }
-
-        // Collect all elements
-        let all_elements: Vec<T> = self.blocks
-            .iter()
-            .flat_map(|b| b.iter().cloned())
-            .collect();
-
-        // Calculate new block configuration
-        let block_size = self.ideal_block_size();
-        let num_blocks = (self.size + block_size - 1) / block_size;
-
-        // Redistribute evenly
-        self.blocks.clear();
-        self.block_starts.clear();
-
-        for i in 0..num_blocks {
-            let start = i * block_size;
-            let end = ((i + 1) * block_size).min(self.size);
-            self.blocks.push(all_elements[start..end].to_vec());
-            self.block_starts.push(start);
-        }
     }
 }
 
@@ -312,156 +169,53 @@ impl<T: Clone> Default for TieredVectorSequence<T> {
 
 impl<T: Clone + Debug> Sequence<T> for TieredVectorSequence<T> {
     fn len(&self) -> usize {
-        self.size
+        self.inner.len()
     }
 
     fn get(&self, index: usize) -> Result<T, String> {
-        let (block_idx, offset) = self.find_block(index)?;
-        Ok(self.blocks[block_idx][offset].clone())
+        self.inner
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("Index {} out of range [0, {})", index, self.inner.len()))
     }
 
     fn get_ref(&self, index: usize) -> Option<&T> {
-        if index >= self.size {
-            return None;
-        }
-        self.find_block(index)
-            .ok()
-            .map(|(block_idx, offset)| &self.blocks[block_idx][offset])
+        self.inner.get(index)
     }
 
     fn set(&mut self, index: usize, value: T) -> Result<(), String> {
-        let (block_idx, offset) = self.find_block(index)?;
-        self.blocks[block_idx][offset] = value;
-        Ok(())
+        match self.inner.get_mut(index) {
+            Some(slot) => {
+                *slot = value;
+                Ok(())
+            }
+            None => Err(format!("Index {} out of range [0, {})", index, self.inner.len())),
+        }
     }
 
     fn insert(&mut self, index: usize, value: T) -> Result<(), String> {
-        if index > self.size {
-            return Err(format!("Index {} out of range [0, {}]", index, self.size));
+        if index > self.inner.len() {
+            return Err(format!("Index {} out of range [0, {}]", index, self.inner.len()));
         }
-
-        // Special case: empty sequence - create first block
-        if self.blocks.is_empty() {
-            self.blocks.push(vec![value]);
-            self.block_starts.push(0);
-            self.size = 1;
-            return Ok(());
-        }
-
-        // Special case: append to end
-        if index == self.size {
-            self.append(value);
-            return Ok(());
-        }
-
-        // Find the block containing this index
-        let (block_idx, offset) = self.find_block(index)?;
-
-        // Insert within the block - O(block_size) = O(√N)
-        self.blocks[block_idx].insert(offset, value);
-        self.size += 1;
-
-        // Update cumulative indices for subsequent blocks - O(num_blocks) = O(√N)
-        self.update_block_starts_after(block_idx, 1);
-
-        // Split if block is too large
-        self.maybe_split_block(block_idx);
-
+        self.inner.insert(index, value);
         Ok(())
     }
 
     fn delete(&mut self, index: usize) -> Result<T, String> {
-        if index >= self.size {
-            return Err(format!("Index {} out of range [0, {})", index, self.size));
+        if index >= self.inner.len() {
+            return Err(format!("Index {} out of range [0, {})", index, self.inner.len()));
         }
-
-        let (block_idx, offset) = self.find_block(index)?;
-
-        // Remove from block - O(block_size) = O(√N)
-        let value = self.blocks[block_idx].remove(offset);
-        self.size -= 1;
-
-        // Update cumulative indices - O(num_blocks) = O(√N)
-        self.update_block_starts_after(block_idx, -1);
-
-        // Handle empty or small blocks
-        if self.blocks[block_idx].is_empty() {
-            self.remove_empty_block(block_idx);
-        } else {
-            self.maybe_merge_block(block_idx);
-        }
-
-        Ok(value)
+        Ok(self.inner.remove(index))
     }
 
     fn append(&mut self, value: T) {
-        // Special case: empty sequence
-        if self.blocks.is_empty() {
-            self.blocks.push(vec![value]);
-            self.block_starts.push(0);
-            self.size = 1;
-            return;
-        }
-
-        // Add to last block - O(1) amortized
-        let last_block_idx = self.blocks.len() - 1;
-        self.blocks[last_block_idx].push(value);
-        self.size += 1;
-
-        // Split if needed
-        self.maybe_split_block(last_block_idx);
+        self.inner.push(value);
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = T> + '_> {
-        // Efficient iterator that walks blocks sequentially
-        Box::new(TieredVectorIterator {
-            blocks: &self.blocks,
-            block_idx: 0,
-            elem_idx: 0,
-            remaining: self.size,
-        })
+        Box::new(self.inner.iter().cloned())
     }
 }
-
-/// Efficient iterator for TieredVectorSequence.
-/// Walks blocks sequentially for O(N) total iteration (not O(N log N)).
-struct TieredVectorIterator<'a, T: Clone> {
-    blocks: &'a Vec<Vec<T>>,
-    block_idx: usize,
-    elem_idx: usize,
-    remaining: usize,
-}
-
-impl<'a, T: Clone> Iterator for TieredVectorIterator<'a, T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-
-        // Find next valid element
-        while self.block_idx < self.blocks.len() {
-            if self.elem_idx < self.blocks[self.block_idx].len() {
-                let value = self.blocks[self.block_idx][self.elem_idx].clone();
-                self.elem_idx += 1;
-                self.remaining -= 1;
-                return Some(value);
-            }
-            // Move to next block
-            self.block_idx += 1;
-            self.elem_idx = 0;
-        }
-
-        None
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl<'a, T: Clone> ExactSizeIterator for TieredVectorIterator<'a, T> {}
 
 #[cfg(test)]
 mod tests {
@@ -697,25 +451,22 @@ mod tests {
         }
     }
 
-    /// Test rebalance operation
+    /// Test many deletions (crate handles balancing internally)
     #[test]
-    fn test_tiered_vector_rebalance() {
+    fn test_tiered_vector_many_deletions() {
         let mut seq = TieredVectorSequence::<i32>::new();
 
-        // Create unbalanced structure through many deletions
+        // Create structure
         for i in 0..100 {
             seq.append(i);
         }
 
-        // Delete every other element
+        // Delete every other element (reverse order to avoid index shifting issues)
         for i in (0..50).rev() {
             seq.delete(i * 2).unwrap();
         }
 
         assert_eq!(seq.len(), 50);
-
-        // Rebalance
-        seq.rebalance();
 
         // Verify all elements still accessible and correct
         let expected: Vec<i32> = (0..100).filter(|x| x % 2 == 1).collect();

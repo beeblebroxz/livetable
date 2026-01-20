@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 
 use crate::column::{ColumnType as RustColumnType, ColumnValue as RustColumnValue};
-use crate::table::{Schema as RustSchema, Table as RustTable};
+use crate::table::{Schema as RustSchema, Table as RustTable, StorageHint};
 use crate::view::{JoinView as RustJoinView, JoinType as RustJoinType, SortedView as RustSortedView, SortKey as RustSortKey, SortOrder as RustSortOrder, AggregateFunction as RustAggregateFunction, AggregateView as RustAggregateView};
 
 // ============================================================================
@@ -720,18 +720,43 @@ pub struct PyTable {
 
 #[pymethods]
 impl PyTable {
+    /// Create a new table.
+    ///
+    /// Args:
+    ///     name: Table name
+    ///     schema: Table schema
+    ///     storage: Storage optimization hint - "fast_reads" (default) or "fast_updates"
+    ///     use_string_interning: Enable string interning for memory efficiency
+    ///
+    /// Examples:
+    ///     # Default storage (optimized for append + read)
+    ///     table = Table("logs", schema)
+    ///
+    ///     # Optimized for frequent inserts/deletes
+    ///     table = Table("orderbook", schema, storage="fast_updates")
     #[new]
-    #[pyo3(signature = (name, schema, use_tiered_vector=false, use_string_interning=false))]
-    fn new(name: String, schema: PySchema, use_tiered_vector: bool, use_string_interning: bool) -> Self {
-        PyTable {
-            inner: Rc::new(RefCell::new(RustTable::new_with_interning(
+    #[pyo3(signature = (name, schema, storage=None, use_string_interning=false))]
+    fn new(
+        name: String,
+        schema: PySchema,
+        storage: Option<&str>,
+        use_string_interning: bool,
+    ) -> PyResult<Self> {
+        let hint = match storage {
+            None => StorageHint::FastReads,
+            Some(s) => StorageHint::from_str(s)
+                .map_err(|e| PyValueError::new_err(e))?,
+        };
+
+        Ok(PyTable {
+            inner: Rc::new(RefCell::new(RustTable::with_hint_and_interning(
                 name,
                 schema.inner,
-                use_tiered_vector,
+                hint,
                 use_string_interning,
             ))),
             registered_views: Rc::new(RefCell::new(Vec::new())),
-        }
+        })
     }
 
     fn __len__(&self) -> usize {

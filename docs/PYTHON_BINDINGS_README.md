@@ -47,6 +47,7 @@ print(table.get_row(0))  # Same as above
 - **CRUD operations**: append, insert, delete, update
 - **Query data**: get rows, get individual values
 - **NULL support**: nullable columns work seamlessly
+- **Storage hints**: choose between fast reads or fast updates
 
 ```python
 # Create schema
@@ -73,6 +74,29 @@ table.set_value(1, "age", 25)
 # Delete row
 table.delete_row(1)
 ```
+
+### ✅ Storage Hints
+
+Choose the optimal storage backend for your workload:
+
+```python
+# Default: fast_reads - optimized for read-heavy workloads
+# Uses ArraySequence: O(1) access, O(N) insert/delete
+table = livetable.Table("logs", schema)
+
+# For insert-heavy workloads (order books, time series, etc.)
+# Uses TieredVectorSequence: O(1) access, O(√N) insert/delete
+# Backed by the tiered-vector crate for true constant-time access
+orderbook = livetable.Table("orderbook", schema, storage="fast_updates")
+```
+
+**When to use each:**
+| Workload | Storage Hint | Backend |
+|----------|--------------|---------|
+| Read-heavy, append-only | `"fast_reads"` (default) | ArraySequence |
+| Frequent inserts/deletes | `"fast_updates"` | TieredVectorSequence |
+| Order books, streaming data | `"fast_updates"` | TieredVectorSequence |
+| Analytics, batch processing | `"fast_reads"` | ArraySequence |
 
 ### ✅ Filter Views
 
@@ -566,10 +590,18 @@ Create a table schema.
 ### Table
 
 ```python
-Table(name: str, schema: Schema, use_tiered_vector: bool = False)
+Table(name: str, schema: Schema, storage: str = None, use_string_interning: bool = False)
 ```
 
 Create a new table.
+
+**Parameters:**
+- `name`: Table name
+- `schema`: Table schema
+- `storage`: Storage backend hint (optional)
+  - `"fast_reads"` (default): ArraySequence - O(1) access, O(N) insert/delete
+  - `"fast_updates"`: TieredVectorSequence - O(1) access, O(√N) insert/delete
+- `use_string_interning`: Enable string deduplication for memory efficiency
 
 **Methods:**
 - `len()` - Number of rows
@@ -849,6 +881,7 @@ Potential additions:
 - [x] ~~Multi-column joins~~ ✅ **DONE!**
 - [x] ~~Expression-based filtering~~ ✅ **DONE!**
 - [x] ~~Simplified API (sort, join, group_by)~~ ✅ **DONE!**
+- [x] ~~Storage hints (fast_reads/fast_updates)~~ ✅ **DONE!**
 - [ ] RIGHT and FULL OUTER joins
 
 ## Contributing
