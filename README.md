@@ -36,6 +36,53 @@ LiveTable excels at **row-level operations** and **reactive views** - areas wher
 
 **When to use pandas instead:** Bulk vectorized operations on large datasets where numpy's optimized C code excels.
 
+## Design Philosophy
+
+LiveTable makes some unusual design choices to optimize for specific workloads:
+
+### Adaptive Storage Backends
+
+Most table libraries use a single storage strategy. LiveTable lets you choose at table creation:
+
+```python
+# Default: optimized for analytics, batch processing, read-heavy workloads
+logs = livetable.Table("logs", schema)  # ArraySequence
+
+# For order books, streaming inserts, time-series with frequent updates
+orderbook = livetable.Table("orderbook", schema, storage="fast_updates")  # TieredVectorSequence
+```
+
+**Why this matters:** A contiguous array gives you cache-friendly iteration and O(1) access, but inserting in the middle requires shifting all subsequent elements (O(N)). A [tiered vector](https://crates.io/crates/tiered-vector) maintains O(1) access while reducing insert/delete to O(√N) - the difference between 1 million operations and 1,000.
+
+### True O(1) Tiered Vector Access
+
+Many "tiered vector" implementations use sqrt-decomposition with binary search, giving O(log √N) access time. LiveTable uses the [tiered-vector](https://crates.io/crates/tiered-vector) crate which employs **circular buffers** to compute indices directly - genuine constant-time access regardless of table size.
+
+### Zero-Copy View DAG
+
+Views don't copy data - they reference the source table and compute on demand:
+
+```
+┌─────────┐
+│  Table  │──┬──► FilterView ──► SortedView
+└─────────┘  │
+             ├──► JoinView
+             │
+             └──► AggregateView
+```
+
+When the source table changes, views receive **changesets** describing what changed. Smart views (like AggregateView) update incrementally - if you add one row, it adjusts the running totals rather than re-scanning everything.
+
+### String Interning
+
+For columns with repeated values (status codes, categories, country names), enable string interning:
+
+```python
+table = livetable.Table("events", schema, use_string_interning=True)
+```
+
+Each unique string is stored once; the column holds 4-byte IDs instead of full strings. This can dramatically reduce memory for high-cardinality categorical data.
+
 ## Data Types
 
 | Type | Python Type | Description |
@@ -274,11 +321,10 @@ livetable/
 ## Architecture
 
 - **Language**: Rust core with PyO3 Python bindings
-- **Storage**: Two backends selectable via `StorageHint`:
-  - `fast_reads` (default): ArraySequence - O(1) access, O(N) insert/delete
-  - `fast_updates`: TieredVectorSequence - O(1) access, O(√N) insert/delete (backed by [tiered-vector](https://crates.io/crates/tiered-vector) crate)
-- **Views**: Zero-copy references to source tables
-- **Type System**: Strongly typed with NULL support
+- **Storage**: Pluggable backends (ArraySequence / TieredVectorSequence) - see [Design Philosophy](#design-philosophy)
+- **Views**: Zero-copy DAG with incremental change propagation
+- **Type System**: Strongly typed columns with NULL support
+- **Memory**: Optional string interning for categorical data
 
 ## License
 
