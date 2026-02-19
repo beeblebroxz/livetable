@@ -1937,11 +1937,22 @@ impl PyProjectionView {
 
         if let Ok(slice) = key.downcast::<PySlice>() {
             let indices = slice.indices(view_len as isize)?;
+            let start = indices.start;
+            let stop = indices.stop;
+            let step = indices.step;
+
             let list = PyList::empty_bound(py);
-            let mut i = indices.start as usize;
-            while i < indices.stop as usize {
-                list.append(self.get_row(py, i)?)?;
-                i += indices.step as usize;
+            let mut i = start;
+            if step > 0 {
+                while i < stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
             }
             return Ok(list.to_object(py));
         }
@@ -2046,11 +2057,22 @@ impl PyComputedView {
 
         if let Ok(slice) = key.downcast::<PySlice>() {
             let indices = slice.indices(view_len as isize)?;
+            let start = indices.start;
+            let stop = indices.stop;
+            let step = indices.step;
+
             let list = PyList::empty_bound(py);
-            let mut i = indices.start as usize;
-            while i < indices.stop as usize {
-                list.append(self.get_row(py, i)?)?;
-                i += indices.step as usize;
+            let mut i = start;
+            if step > 0 {
+                while i < stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
             }
             return Ok(list.to_object(py));
         }
@@ -2207,11 +2229,22 @@ impl PyJoinView {
 
         if let Ok(slice) = key.downcast::<PySlice>() {
             let indices = slice.indices(view_len as isize)?;
+            let start = indices.start;
+            let stop = indices.stop;
+            let step = indices.step;
+
             let list = PyList::empty_bound(py);
-            let mut i = indices.start as usize;
-            while i < indices.stop as usize {
-                list.append(self.get_row(py, i)?)?;
-                i += indices.step as usize;
+            let mut i = start;
+            if step > 0 {
+                while i < stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
             }
             return Ok(list.to_object(py));
         }
@@ -2416,11 +2449,22 @@ impl PySortedView {
 
         if let Ok(slice) = key.downcast::<PySlice>() {
             let indices = slice.indices(view_len as isize)?;
+            let start = indices.start;
+            let stop = indices.stop;
+            let step = indices.step;
+
             let list = PyList::empty_bound(py);
-            let mut i = indices.start as usize;
-            while i < indices.stop as usize {
-                list.append(self.get_row(py, i)?)?;
-                i += indices.step as usize;
+            let mut i = start;
+            if step > 0 {
+                while i < stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
             }
             return Ok(list.to_object(py));
         }

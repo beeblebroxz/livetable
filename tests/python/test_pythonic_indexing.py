@@ -194,6 +194,43 @@ class TestViewIndexing:
         assert top3[1]["name"] == "Alice"  # 95
         assert top3[2]["name"] == "Charlie"  # 92
 
+    def test_projection_view_reverse_slice_with_step(self, sample_table):
+        """ProjectionView supports reverse slicing with step."""
+        projected = sample_table.select(["id"])
+        result = projected[::-2]
+        assert [row["id"] for row in result] == [5, 3, 1]
+
+    def test_computed_view_reverse_slice_with_step(self, sample_table):
+        """ComputedView supports reverse slicing with step."""
+        computed = sample_table.add_computed_column("double_id", lambda r: r["id"] * 2)
+        result = computed[::-2]
+        assert [row["id"] for row in result] == [5, 3, 1]
+        assert [row["double_id"] for row in result] == [10, 6, 2]
+
+    def test_join_view_reverse_slice_with_step(self, sample_table):
+        """JoinView supports reverse slicing with step."""
+        schema = livetable.Schema([
+            ("id", livetable.ColumnType.INT32, False),
+            ("group", livetable.ColumnType.STRING, False),
+        ])
+        right = livetable.Table("right", schema)
+        right.append_row({"id": 1, "group": "A"})
+        right.append_row({"id": 2, "group": "B"})
+        right.append_row({"id": 3, "group": "C"})
+        right.append_row({"id": 4, "group": "D"})
+        right.append_row({"id": 5, "group": "E"})
+
+        joined = sample_table.join(right, on="id")
+        result = joined[::-2]
+        assert [row["id"] for row in result] == [5, 3, 1]
+        assert [row["right_group"] for row in result] == ["E", "C", "A"]
+
+    def test_sorted_view_reverse_slice_with_step(self, sample_table):
+        """SortedView supports reverse slicing with step."""
+        sorted_view = sample_table.sort("id")
+        result = sorted_view[::-2]
+        assert [row["id"] for row in result] == [5, 3, 1]
+
 
 class TestEmptyTable:
     """Tests for indexing on empty tables."""

@@ -8,7 +8,7 @@ interface SaleRow extends TableRow {
   amount: number;
 }
 
-interface AggRow {
+interface AggRow extends TableRow {
   region: string;
   total: number;
   count: number;
@@ -130,16 +130,6 @@ function SimpleTable({
         )}
       </tbody>
     </table>
-  );
-}
-
-// Stats card
-function StatCard({ label, value, color }: { label: string; value: string | number; color: string }) {
-  return (
-    <div className={`bg-${color}-50 border border-${color}-200 rounded-lg px-4 py-2`}>
-      <div className="text-xs text-gray-500">{label}</div>
-      <div className="text-xl font-bold">{value}</div>
-    </div>
   );
 }
 
