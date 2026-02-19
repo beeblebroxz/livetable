@@ -899,12 +899,31 @@ impl PyTable {
     }
 
     /// Insert a row at a specific index
-    fn insert_row(&mut self, py: Python, index: usize, row: &Bound<'_, PyDict>) -> PyResult<()> {
+    fn insert_row(&mut self, _py: Python, index: usize, row: &Bound<'_, PyDict>) -> PyResult<()> {
+        // Build schema lookup upfront
+        let col_info: HashMap<String, (RustColumnType, bool)> = {
+            let table = self.inner.borrow();
+            let schema = table.schema();
+            schema.get_column_names().iter()
+                .filter_map(|name| {
+                    let col_type = schema.get_column_type(name)?;
+                    let nullable = schema.is_column_nullable(name).unwrap_or(false);
+                    Some((name.to_string(), (col_type, nullable)))
+                })
+                .collect()
+        };
+
         let mut rust_row = HashMap::new();
 
         for (key, value) in row.iter() {
             let key_str: String = key.extract()?;
-            let col_value = py_to_column_value(py, &value)?;
+
+            // Use schema-aware typed conversion
+            let col_value = if let Some((col_type, nullable)) = col_info.get(&key_str) {
+                py_to_column_value_typed(&value, *col_type, *nullable)?
+            } else {
+                return Err(PyValueError::new_err(format!("Unknown column: {}", key_str)));
+            };
             rust_row.insert(key_str, col_value);
         }
 
@@ -931,8 +950,18 @@ impl PyTable {
     }
 
     /// Set a value at (row, column)
-    fn set_value(&mut self, py: Python, row: usize, column: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let col_value = py_to_column_value(py, value)?;
+    fn set_value(&mut self, _py: Python, row: usize, column: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let (col_type, nullable) = {
+            let table = self.inner.borrow();
+            let schema = table.schema();
+            let col_type = schema
+                .get_column_type(column)
+                .ok_or_else(|| PyValueError::new_err(format!("Unknown column: {}", column)))?;
+            let nullable = schema.is_column_nullable(column).unwrap_or(false);
+            (col_type, nullable)
+        };
+
+        let col_value = py_to_column_value_typed(value, col_type, nullable)?;
 
         self.inner.borrow_mut()
             .set_value(row, column, col_value)

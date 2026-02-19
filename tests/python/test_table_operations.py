@@ -156,6 +156,50 @@ class TestTableUpdate:
         assert table.get_value(0, "optional") is None
 
 
+class TestSchemaAwareTypedConversion:
+    """Regression tests for schema-aware conversion in insert/update paths."""
+
+    def test_set_value_accepts_python_int_for_int64_column(self):
+        schema = livetable.Schema([
+            ("id", livetable.ColumnType.INT64, False),
+        ])
+        table = livetable.Table("int64_set", schema)
+        table.append_row({"id": 1})
+
+        table.set_value(0, "id", 2)
+        assert table.get_value(0, "id") == 2
+
+    def test_set_value_accepts_python_int_for_float64_column(self):
+        schema = livetable.Schema([
+            ("score", livetable.ColumnType.FLOAT64, False),
+        ])
+        table = livetable.Table("float64_set", schema)
+        table.append_row({"score": 1.5})
+
+        table.set_value(0, "score", 2)
+        assert table.get_value(0, "score") == 2.0
+
+    def test_insert_row_accepts_python_int_for_int64_column(self):
+        schema = livetable.Schema([
+            ("id", livetable.ColumnType.INT64, False),
+        ])
+        table = livetable.Table("int64_insert", schema)
+        table.append_row({"id": 1})
+
+        table.insert_row(1, {"id": 2})
+        assert table.get_value(1, "id") == 2
+
+    def test_insert_row_accepts_python_int_for_float64_column(self):
+        schema = livetable.Schema([
+            ("score", livetable.ColumnType.FLOAT64, False),
+        ])
+        table = livetable.Table("float64_insert", schema)
+        table.append_row({"score": 1.5})
+
+        table.insert_row(1, {"score": 2})
+        assert table.get_value(1, "score") == 2.0
+
+
 class TestTableDelete:
     """Test deleting rows from tables"""
 
