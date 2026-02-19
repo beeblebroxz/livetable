@@ -386,13 +386,9 @@ fn format_date_from_days(days: i32) -> String {
 
 /// Format a datetime (milliseconds since epoch) as ISO 8601 datetime string
 fn format_datetime_from_millis(ms: i64) -> String {
-    let (days, time_ms) = if ms >= 0 {
-        ((ms / 86_400_000) as i32, (ms % 86_400_000) as u32)
-    } else {
-        let d = (ms / 86_400_000) as i32 - if ms % 86_400_000 != 0 { 1 } else { 0 };
-        let t = ((ms % 86_400_000) + 86_400_000) as u32 % 86_400_000;
-        (d, t)
-    };
+    let ms_per_day: i64 = 86_400_000;
+    let days = ms.div_euclid(ms_per_day) as i32;
+    let time_ms = ms.rem_euclid(ms_per_day) as u32;
     let (year, month, day) = ymd_from_days(days);
     let hours = time_ms / 3_600_000;
     let minutes = (time_ms % 3_600_000) / 60_000;
@@ -410,9 +406,15 @@ fn column_value_to_json(cv: &ColumnValue) -> JsonValue {
         ColumnValue::Int32(v) => JsonValue::Number((*v).into()),
         ColumnValue::Int64(v) => JsonValue::Number((*v).into()),
         ColumnValue::Float32(v) => {
-            JsonValue::Number(serde_json::Number::from_f64(*v as f64).unwrap())
+            serde_json::Number::from_f64(*v as f64)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
         }
-        ColumnValue::Float64(v) => JsonValue::Number(serde_json::Number::from_f64(*v).unwrap()),
+        ColumnValue::Float64(v) => {
+            serde_json::Number::from_f64(*v)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
         ColumnValue::String(v) => JsonValue::String(v.clone()),
         ColumnValue::Bool(v) => JsonValue::Bool(*v),
         ColumnValue::Date(days) => {

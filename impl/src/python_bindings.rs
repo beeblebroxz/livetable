@@ -79,8 +79,12 @@ fn days_from_ymd(year: i32, month: u32, day: u32) -> i32 {
 
 /// Convert milliseconds since epoch to (year, month, day, hour, minute, second, microsecond)
 fn datetime_from_ms(ms: i64) -> (i32, u32, u32, u32, u32, u32, u32) {
-    let days = (ms / (24 * 60 * 60 * 1000)) as i32;
-    let remaining_ms = (ms % (24 * 60 * 60 * 1000)).abs();
+    let ms_per_day: i64 = 24 * 60 * 60 * 1000;
+    // Use Euclidean division so remaining_ms is always non-negative.
+    // Truncating division (/) gives wrong results for pre-epoch timestamps:
+    //   -1 / 86400000 = 0 (truncated), but we need -1 (floored) to get the prior day.
+    let days = ms.div_euclid(ms_per_day) as i32;
+    let remaining_ms = ms.rem_euclid(ms_per_day);
 
     let (year, month, day) = ymd_from_days(days);
 
@@ -964,19 +968,25 @@ impl PyTable {
             return self.get_row(py, idx as usize);
         }
 
-        // Try slice
+        // Try slice (supports negative step for reverse slicing)
         if let Ok(slice) = key.downcast::<PySlice>() {
             let indices = slice.indices(table_len as isize)?;
-            let start = indices.start as usize;
-            let stop = indices.stop as usize;
-            let step = indices.step as usize;
+            let start = indices.start;
+            let stop = indices.stop;
+            let step = indices.step;
 
             let list = PyList::empty_bound(py);
             let mut i = start;
-            while i < stop {
-                let row = self.get_row(py, i)?;
-                list.append(row)?;
-                i += step;
+            if step > 0 {
+                while i < stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
             }
             return Ok(list.to_object(py));
         }
@@ -1747,18 +1757,25 @@ impl PyFilterView {
             return self.get_row(py, idx as usize);
         }
 
-        // Try slice
+        // Try slice (supports negative step for reverse slicing)
         if let Ok(slice) = key.downcast::<PySlice>() {
             let indices = slice.indices(view_len as isize)?;
-            let start = indices.start as usize;
-            let stop = indices.stop as usize;
-            let step = indices.step as usize;
+            let start = indices.start;
+            let stop = indices.stop;
+            let step = indices.step;
 
             let list = PyList::empty_bound(py);
             let mut i = start;
-            while i < stop {
-                list.append(self.get_row(py, i)?)?;
-                i += step;
+            if step > 0 {
+                while i < stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
             }
             return Ok(list.to_object(py));
         }
@@ -2580,19 +2597,25 @@ impl PyAggregateView {
             return self.get_row(py, idx as usize);
         }
 
-        // Try slice
+        // Try slice (supports negative step for reverse slicing)
         if let Ok(slice) = key.downcast::<PySlice>() {
             let indices = slice.indices(view_len as isize)?;
-            let start = indices.start as usize;
-            let stop = indices.stop as usize;
-            let step = indices.step as usize;
+            let start = indices.start;
+            let stop = indices.stop;
+            let step = indices.step;
 
             let list = PyList::empty_bound(py);
             let mut i = start;
-            while i < stop {
-                let row = self.get_row(py, i)?;
-                list.append(row)?;
-                i += step;
+            if step > 0 {
+                while i < stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    list.append(self.get_row(py, i as usize)?)?;
+                    i += step;
+                }
             }
             return Ok(list.to_object(py));
         }

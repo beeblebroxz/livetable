@@ -422,10 +422,9 @@ pub fn eval_expr(expr: &Expr, row: &HashMap<String, ColumnValue>) -> bool {
 /// Compare a column value to a literal value.
 fn compare_values(col_val: &ColumnValue, op: &CompareOp, lit_val: &LiteralValue) -> bool {
     match (col_val, lit_val) {
-        // NULL comparisons (NULL != anything, including NULL)
-        (ColumnValue::Null, _) | (_, LiteralValue::Null) => {
-            matches!(op, CompareOp::Ne) // Only != returns true for NULL comparisons
-        }
+        // NULL comparisons: any comparison involving NULL yields UNKNOWN (treated as false).
+        // Use IS NULL / IS NOT NULL to test for nulls.
+        (ColumnValue::Null, _) | (_, LiteralValue::Null) => false,
 
         // Integer comparisons
         (ColumnValue::Int32(a), LiteralValue::Int(b)) => compare_ord(*a as i64, *b, op),

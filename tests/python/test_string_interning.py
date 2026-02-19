@@ -229,7 +229,7 @@ class TestStringInterningWithTieredVector:
         ])
         table = livetable.Table(
             "test", schema,
-            use_tiered_vector=True,
+            storage="fast_updates",
             use_string_interning=True
         )
 

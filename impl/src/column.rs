@@ -13,6 +13,10 @@ use crate::sequence::{ArraySequence, Sequence, TieredVectorSequence};
 use crate::interner::{StringInterner, StringId};
 use std::cell::RefCell;
 use std::fmt::Debug;
+
+/// Sentinel value stored in string_ids for NULL entries.
+/// Must never collide with a valid interner ID (which grows from 0 upward).
+const NULL_STRING_ID: StringId = u32::MAX;
 use std::rc::Rc;
 
 /// Column data types
@@ -223,6 +227,31 @@ impl Column {
         self.sequence.is_empty()
     }
 
+    /// Check if a value is type-compatible with this column (without consuming it).
+    pub fn check_value_type(&self, value: &ColumnValue) -> Result<(), String> {
+        if value.is_null() {
+            if !self.nullable {
+                return Err(format!("Column '{}' is not nullable", self.name));
+            }
+            return Ok(());
+        }
+
+        match (value, self.column_type) {
+            (ColumnValue::Int32(_), ColumnType::Int32) => Ok(()),
+            (ColumnValue::Int64(_), ColumnType::Int64) => Ok(()),
+            (ColumnValue::Float32(_), ColumnType::Float32) => Ok(()),
+            (ColumnValue::Float64(_), ColumnType::Float64) => Ok(()),
+            (ColumnValue::String(_), ColumnType::String) => Ok(()),
+            (ColumnValue::Bool(_), ColumnType::Bool) => Ok(()),
+            (ColumnValue::Date(_), ColumnType::Date) => Ok(()),
+            (ColumnValue::DateTime(_), ColumnType::DateTime) => Ok(()),
+            _ => Err(format!(
+                "Type mismatch for column '{}': expected {:?}, got {:?}",
+                self.name, self.column_type, value
+            )),
+        }
+    }
+
     /// Validate and convert value to appropriate type
     fn validate_value(&self, value: ColumnValue) -> Result<ColumnValue, String> {
         if value.is_null() {
@@ -322,8 +351,10 @@ impl Column {
             if let Some(ref mut string_ids) = self.string_ids {
                 if let Some(ref interner) = self.interner {
                     let old_id = string_ids.get(index)?;
-                    interner.borrow_mut().release(old_id);
-                    string_ids.set(index, 0)?; // Placeholder ID for null
+                    if old_id != NULL_STRING_ID {
+                        interner.borrow_mut().release(old_id);
+                    }
+                    string_ids.set(index, NULL_STRING_ID)?;
                 }
             }
             self.sequence.set(index, self.get_default_value())?;
@@ -334,9 +365,11 @@ impl Column {
             // Handle string interning
             if let (Some(ref mut string_ids), Some(ref interner)) = (&mut self.string_ids, &self.interner) {
                 if let ColumnValue::String(ref s) = value {
-                    // Release old string ID
+                    // Release old string ID (skip if slot was NULL)
                     let old_id = string_ids.get(index)?;
-                    interner.borrow_mut().release(old_id);
+                    if old_id != NULL_STRING_ID {
+                        interner.borrow_mut().release(old_id);
+                    }
                     // Intern new string
                     let new_id = interner.borrow_mut().intern(s);
                     string_ids.set(index, new_id)?;
@@ -358,9 +391,9 @@ impl Column {
             if let Some(ref mut null_flags) = self.null_flags {
                 null_flags.insert(index, true)?;
             }
-            // Insert placeholder ID for null
+            // Insert sentinel ID for null
             if let Some(ref mut string_ids) = self.string_ids {
-                string_ids.insert(index, 0)?;
+                string_ids.insert(index, NULL_STRING_ID)?;
             }
             self.sequence.insert(index, self.get_default_value())?;
         } else {
@@ -405,8 +438,10 @@ impl Column {
                     .map(|s| ColumnValue::String(s.to_string()))
             };
 
-            // Release the reference
-            interner.borrow_mut().release(id);
+            // Release the reference (skip sentinel for null slots)
+            if id != NULL_STRING_ID {
+                interner.borrow_mut().release(id);
+            }
 
             return result.ok_or_else(|| format!("Invalid string ID {} at index {}", id, index));
         }
@@ -427,9 +462,9 @@ impl Column {
             if let Some(ref mut null_flags) = self.null_flags {
                 null_flags.append(true);
             }
-            // Append placeholder ID for null
+            // Append sentinel ID for null
             if let Some(ref mut string_ids) = self.string_ids {
-                string_ids.append(0);
+                string_ids.append(NULL_STRING_ID);
             }
             self.sequence.append(self.get_default_value());
         } else {

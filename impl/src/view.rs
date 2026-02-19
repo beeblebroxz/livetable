@@ -507,13 +507,28 @@ impl JoinView {
 
     /// Build a composite key string from a HashMap row (for incremental sync).
     /// Returns None if any key column is missing or contains NULL.
+    /// IMPORTANT: Key format must match build_key_from_indices exactly.
     fn build_composite_key(row: &HashMap<String, ColumnValue>, keys: &[String]) -> Option<String> {
+        // Fast path for single-column join (most common case)
+        if keys.len() == 1 {
+            return match row.get(&keys[0]) {
+                Some(ColumnValue::Null) | None => None,
+                Some(ColumnValue::Int32(v)) => Some(v.to_string()),
+                Some(ColumnValue::Int64(v)) => Some(v.to_string()),
+                Some(ColumnValue::String(s)) => Some(s.clone()),
+                Some(value) => Some(format!("{:?}", value)),
+            };
+        }
+
         let mut parts: Vec<String> = Vec::with_capacity(keys.len());
         for key in keys {
             match row.get(key) {
-                Some(ColumnValue::Null) => return None, // NULL doesn't match anything
+                Some(ColumnValue::Null) => return None,
+                Some(ColumnValue::Int32(v)) => parts.push(v.to_string()),
+                Some(ColumnValue::Int64(v)) => parts.push(v.to_string()),
+                Some(ColumnValue::String(s)) => parts.push(s.clone()),
                 Some(value) => parts.push(format!("{:?}", value)),
-                None => return None, // Missing key column
+                None => return None,
             }
         }
         Some(parts.join("\x00"))

@@ -391,16 +391,18 @@ impl Table {
     }
 
     pub fn append_row(&mut self, row: HashMap<String, ColumnValue>) -> Result<(), String> {
-        // Validate all columns are present
-        for col_name in self.schema.get_column_names() {
-            if !row.contains_key(col_name) {
-                return Err(format!("Missing value for column '{}'", col_name));
+        // Validate all columns are present and type-compatible before any mutation
+        for (i, col) in self.columns.iter().enumerate() {
+            let col_name = self.schema.get_column_info(i).unwrap().0;
+            match row.get(col_name) {
+                None => return Err(format!("Missing value for column '{}'", col_name)),
+                Some(value) => col.check_value_type(value)?,
             }
         }
 
         let insert_index = self.row_count;
 
-        // Append to each column
+        // All values validated — safe to mutate
         for (i, col) in self.columns.iter_mut().enumerate() {
             let col_name = self.schema.get_column_info(i).unwrap().0;
             let value = row.get(col_name).unwrap().clone();
@@ -472,14 +474,18 @@ impl Table {
 
         let col_names: Vec<&str> = self.schema.get_column_names();
 
-        // Validate all rows first (before inserting any)
+        // Validate all rows first (presence + types) before inserting any
         for (row_idx, row) in rows.iter().enumerate() {
-            for col_name in &col_names {
-                if !row.contains_key(*col_name) {
-                    return Err(format!(
+            for (i, col) in self.columns.iter().enumerate() {
+                let col_name = col_names[i];
+                match row.get(col_name) {
+                    None => return Err(format!(
                         "Row {}: Missing value for column '{}'",
                         row_idx, col_name
-                    ));
+                    )),
+                    Some(value) => col.check_value_type(value).map_err(|e| {
+                        format!("Row {}: {}", row_idx, e)
+                    })?,
                 }
             }
         }
@@ -515,14 +521,16 @@ impl Table {
             return Err(format!("Index {} out of range [0, {}]", index, self.row_count));
         }
 
-        // Validate all columns are present
-        for col_name in self.schema.get_column_names() {
-            if !row.contains_key(col_name) {
-                return Err(format!("Missing value for column '{}'", col_name));
+        // Validate all columns are present and type-compatible before any mutation
+        for (i, col) in self.columns.iter().enumerate() {
+            let col_name = self.schema.get_column_info(i).unwrap().0;
+            match row.get(col_name) {
+                None => return Err(format!("Missing value for column '{}'", col_name)),
+                Some(value) => col.check_value_type(value)?,
             }
         }
 
-        // Insert into each column
+        // All values validated — safe to mutate
         for (i, col) in self.columns.iter_mut().enumerate() {
             let col_name = self.schema.get_column_info(i).unwrap().0;
             let value = row.get(col_name).unwrap().clone();
