@@ -100,6 +100,11 @@ cd frontend && npm install && npm run dev
 - Python lambdas are converted to Rust closures for filter/computed operations
 - Join operations use O(N+M) algorithm
 - WebSocket protocol: `UpdateCell`, `AddRow`, `DeleteRow` messages with broadcast to all clients
+- String columns use `NULL_STRING_ID` (u32::MAX) as null sentinel in `string_ids` — never use 0
+- `Column::check_value_type(&value)` validates without consuming — use before batch mutations
+- Expression parser (`expr.rs`): Lexer has `input: Vec<char>` + `pos: usize`, supports negative literals
+- `filter_expr` uses SQL NULL semantics: all comparisons with NULL return false, use IS NULL/IS NOT NULL
+- `Table.__new__` Python API: `storage=` accepts "fast_reads"|"fast_updates", `use_string_interning=` is bool
 
 ### Frontend (frontend/src/)
 - React 18 + TypeScript + Vite + Tailwind CSS
@@ -116,6 +121,14 @@ cd frontend && npm install && npm run dev
 2. **Python package must be installed** before running Python tests - if imports fail, run `cd impl && ./install.sh`
 
 3. **Port usage**: Backend WebSocket server runs on port 8080, frontend dev server on port 5173
+
+4. **RefCell borrow safety**: When holding `Rc<RefCell<Table>>` borrows in PyO3 code, release the borrow before making Python calls (e.g., pandas DataFrame construction) to avoid panics from GC reentrancy
+
+5. **Mutation safety**: Always validate all values before mutating any column — partial mutations on type errors corrupt column lengths irrecoverably. Use `Column::check_value_type()` for pre-validation.
+
+6. **Float serialization**: `serde_json::Number::from_f64()` returns `None` for NaN/Infinity — always handle with `.unwrap_or(JsonValue::Null)`, never `.unwrap()`
+
+7. **Pre-epoch datetime**: Use `div_euclid`/`rem_euclid` for ms→days decomposition, not `/`/`%` (truncating division gives wrong results for negative timestamps)
 
 ## Python API Usage
 
