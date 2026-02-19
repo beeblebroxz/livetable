@@ -102,28 +102,6 @@ impl StringInterner {
         id
     }
 
-    /// Intern a string without incrementing the reference count
-    /// Useful when copying IDs between columns
-    pub fn intern_no_ref(&mut self, s: &str) -> StringId {
-        if let Some(&id) = self.string_to_id.get(s) {
-            return id;
-        }
-
-        let id = if let Some(free_id) = self.free_ids.pop() {
-            self.id_to_string[free_id as usize] = s.to_string();
-            self.ref_counts[free_id as usize] = 0;
-            free_id
-        } else {
-            let new_id = self.id_to_string.len() as StringId;
-            self.id_to_string.push(s.to_string());
-            self.ref_counts.push(0);
-            new_id
-        };
-
-        self.string_to_id.insert(s.to_string(), id);
-        id
-    }
-
     /// Increment reference count for an existing ID
     pub fn add_ref(&mut self, id: StringId) {
         if (id as usize) < self.ref_counts.len() {

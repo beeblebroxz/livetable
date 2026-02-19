@@ -158,7 +158,7 @@ impl Changeset {
         }
         let total = self.total_len();
         if up_to_index >= total {
-            self.base_index = up_to_index;
+            self.base_index = total;
             self.changes.clear();
             self.generation += 1;
             return;
@@ -457,11 +457,11 @@ mod tests {
             data: HashMap::new(),
         });
 
-        // Compact past all changes
+        // Compact past all changes — base_index capped at actual total (2), not 10
         cs.compact(10);
-        assert_eq!(cs.base_index(), 10);
+        assert_eq!(cs.base_index(), 2);
         assert!(cs.is_empty());
-        assert_eq!(cs.total_len(), 10);
+        assert_eq!(cs.total_len(), 2);
     }
 
     #[test]

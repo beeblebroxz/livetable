@@ -91,40 +91,26 @@ impl AppState {
         }
     }
 
-    /// Get or create a table
-    pub fn get_or_create_table(&self, name: &str) -> TableData {
-        let mut tables = self.tables.lock().unwrap();
-        tables
-            .entry(name.to_string())
-            .or_insert_with(|| {
-                let schema = Schema::new(vec![
-                    ("id".to_string(), ColumnType::Int32, false),
-                    ("name".to_string(), ColumnType::String, false),
-                    ("value".to_string(), ColumnType::Float64, false),
-                ]);
-                TableData::new(name.to_string(), schema)
-            })
-            .clone()
-    }
-
     /// Subscribe a WebSocket connection to a table
     pub fn subscribe(&self, table_name: &str, addr: Addr<TableWebSocket>) {
         let mut subscribers = self.subscribers.lock().unwrap();
         let subs = subscribers
             .entry(table_name.to_string())
             .or_insert_with(Vec::new);
-        subs.push(addr);
+        // Prevent duplicate subscriptions from the same actor
+        if !subs.contains(&addr) {
+            subs.push(addr);
+        }
         println!("[subscribe] {} now has {} subscriber(s)", table_name, subs.len());
     }
 
     /// Broadcast a message to all subscribers of a table
     pub fn broadcast(&self, table_name: &str, msg: ServerMessage) {
-        let subscribers = self.subscribers.lock().unwrap();
-        if let Some(addrs) = subscribers.get(table_name) {
+        let mut subscribers = self.subscribers.lock().unwrap();
+        if let Some(addrs) = subscribers.get_mut(table_name) {
             println!("[broadcast] {} -> {} subscribers", table_name, addrs.len());
-            for addr in addrs {
-                addr.do_send(BroadcastMessage(msg.clone()));
-            }
+            // Prune dead addresses: retain only those that successfully receive
+            addrs.retain(|addr| addr.do_send(BroadcastMessage(msg.clone())).is_ok());
         } else {
             println!("[broadcast] {} -> no subscribers!", table_name);
         }
@@ -185,15 +171,23 @@ impl TableWebSocket {
             }
 
             ClientMessage::Query { table_name } => {
-                let table_data = self.state.get_or_create_table(&table_name);
-                let (columns, rows) = table_data.to_json();
-
-                let response = ServerMessage::TableData {
-                    table_name,
-                    columns,
-                    rows,
-                };
-                ctx.text(serde_json::to_string(&response).unwrap());
+                let tables = self.state.tables.lock().unwrap();
+                if let Some(table_data) = tables.get(&table_name) {
+                    let (columns, rows) = table_data.to_json();
+                    let response = ServerMessage::TableData {
+                        table_name,
+                        columns,
+                        rows,
+                    };
+                    ctx.text(serde_json::to_string(&response).unwrap());
+                } else {
+                    ctx.text(
+                        serde_json::to_string(&ServerMessage::Error {
+                            message: format!("Table '{}' not found", table_name),
+                        })
+                        .unwrap(),
+                    );
+                }
             }
 
             ClientMessage::InsertRow { table_name, row } => {
@@ -266,6 +260,13 @@ impl TableWebSocket {
                             .unwrap(),
                         );
                     }
+                } else {
+                    ctx.text(
+                        serde_json::to_string(&ServerMessage::Error {
+                            message: format!("Table '{}' not found", table_name),
+                        })
+                        .unwrap(),
+                    );
                 }
             }
 
@@ -295,6 +296,13 @@ impl TableWebSocket {
                             .unwrap(),
                         );
                     }
+                } else {
+                    ctx.text(
+                        serde_json::to_string(&ServerMessage::Error {
+                            message: format!("Table '{}' not found", table_name),
+                        })
+                        .unwrap(),
+                    );
                 }
             }
         }

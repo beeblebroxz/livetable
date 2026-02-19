@@ -224,6 +224,15 @@ impl Lexer {
                         }
                     }
                     '\'' | '"' => self.read_string(c),
+                    '-' if self.input.get(self.pos + 1).map_or(false, |c| c.is_ascii_digit() || *c == '.') => {
+                        self.advance(); // consume '-'
+                        let token = self.read_number();
+                        match token {
+                            Token::Int(v) => Ok(Token::Int(-v)),
+                            Token::Float(v) => Ok(Token::Float(-v)),
+                            other => Ok(other),
+                        }
+                    }
                     _ if c.is_ascii_digit() => Ok(self.read_number()),
                     _ if c.is_alphabetic() || c == '_' => {
                         let ident = self.read_ident();

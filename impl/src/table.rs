@@ -338,6 +338,9 @@ impl Table {
     }
 
     pub fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
+        if row >= self.row_count {
+            return Err(format!("Row {} out of range [0, {})", row, self.row_count));
+        }
         let col_idx = self.schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
@@ -355,6 +358,9 @@ impl Table {
     }
 
     pub fn set_value(&mut self, row: usize, column: &str, value: ColumnValue) -> Result<(), String> {
+        if row >= self.row_count {
+            return Err(format!("Row {} out of range [0, {})", row, self.row_count));
+        }
         let col_idx = self.schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;

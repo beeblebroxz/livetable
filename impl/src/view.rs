@@ -791,7 +791,10 @@ impl JoinView {
 
         let mut modified = false;
 
-        // Handle left table inserts
+        // Handle left table inserts — build right lookup once, not per insert
+        let has_left_inserts = left_changes.iter().any(|c| matches!(c, TableChange::RowInserted { .. }));
+        let right_lookup = if has_left_inserts { Some(self.build_right_lookup()) } else { None };
+
         for change in &left_changes {
             if let TableChange::RowInserted { index, data } = change {
                 // Adjust existing left indices
@@ -803,9 +806,9 @@ impl JoinView {
 
                 // Find matches for the new left row
                 if let Some(key_str) = Self::build_composite_key(data, &self.left_keys) {
-                    let right_lookup = self.build_right_lookup();
+                    let lookup = right_lookup.as_ref().unwrap();
 
-                    if let Some(matching_indices) = right_lookup.get(&key_str) {
+                    if let Some(matching_indices) = lookup.get(&key_str) {
                         for &right_idx in matching_indices {
                             self.join_index.push((*index, Some(right_idx)));
                             modified = true;
@@ -1415,14 +1418,14 @@ impl ColumnAggState {
 
         if let Some(ref mut sorted) = self.sorted_values {
             let pos = sorted.partition_point(|&v| v < value);
-            if pos < sorted.len() && (sorted[pos] - value).abs() < f64::EPSILON {
+            if pos < sorted.len() && sorted[pos] == value {
                 sorted.remove(pos);
             }
         }
 
         // Check if we need to recalculate min/max
-        let needs_recalc = self.min.map_or(false, |m| (m - value).abs() < f64::EPSILON)
-            || self.max.map_or(false, |m| (m - value).abs() < f64::EPSILON);
+        let needs_recalc = self.min.map_or(false, |m| m == value)
+            || self.max.map_or(false, |m| m == value);
 
         !needs_recalc
     }
@@ -2294,6 +2297,12 @@ impl IncrementalView for AggregateView {
 impl AggregateView {
     /// Adjust row indices when a row is inserted
     fn adjust_indices_for_insert(&mut self, inserted_index: usize) {
+        // Fast path: appending at the end doesn't shift any existing indices
+        let max_existing = self.row_to_group.keys().max().copied();
+        if max_existing.map_or(true, |max| inserted_index > max) {
+            return;
+        }
+
         // Update row_to_group keys
         let mut new_row_to_group = HashMap::new();
         for (idx, key) in self.row_to_group.drain() {

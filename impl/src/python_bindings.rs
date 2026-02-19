@@ -193,27 +193,33 @@ fn py_to_column_value(_py: Python, value: &Bound<'_, PyAny>) -> PyResult<RustCol
     }
 
     // Check for datetime types (before string, since datetime has __str__)
-    Python::with_gil(|py| {
-        let datetime_mod = py.import_bound("datetime").ok()?;
-        let datetime_type = datetime_mod.getattr("datetime").ok()?;
-        let date_type = datetime_mod.getattr("date").ok()?;
+    // Errors during datetime conversion must propagate, not silently fall through to string.
+    Python::with_gil(|py| -> PyResult<Option<RustColumnValue>> {
+        let datetime_mod = match py.import_bound("datetime") {
+            Ok(m) => m,
+            Err(_) => return Ok(None), // datetime module unavailable, try string
+        };
+        let datetime_type = datetime_mod.getattr("datetime")?;
+        let date_type = datetime_mod.getattr("date")?;
 
         // datetime must be checked before date (datetime is subclass of date)
         if value.is_instance(&datetime_type).unwrap_or(false) {
-            let ms = datetime_to_ms_since_epoch(value).ok()?;
-            return Some(RustColumnValue::DateTime(ms));
+            let ms = datetime_to_ms_since_epoch(value)?;
+            return Ok(Some(RustColumnValue::DateTime(ms)));
         }
         if value.is_instance(&date_type).unwrap_or(false) {
-            let days = date_to_days_since_epoch(value).ok()?;
-            return Some(RustColumnValue::Date(days));
+            let days = date_to_days_since_epoch(value)?;
+            return Ok(Some(RustColumnValue::Date(days)));
         }
-        None
-    }).map(Ok).unwrap_or_else(|| {
+        Ok(None)
+    }).and_then(|opt| {
+        if let Some(cv) = opt {
+            return Ok(cv);
+        }
         // Finally strings
         if let Ok(v) = value.extract::<String>() {
             return Ok(RustColumnValue::String(v));
         }
-
         Err(PyValueError::new_err("Cannot convert value to ColumnValue"))
     })
 }
@@ -1509,23 +1515,35 @@ impl PyTable {
                 "pandas is not installed. Install with: pip install pandas"
             ))?;
 
-        let table = self.inner.borrow();
-        let column_names = table.schema().get_column_names();
-
-        // Build column data as Python lists
-        let data_dict = PyDict::new_bound(py);
-
-        for col_name in &column_names {
-            let mut values: Vec<PyObject> = Vec::with_capacity(table.len());
-
-            for row_idx in 0..table.len() {
-                let value = table.get_value(row_idx, col_name)
-                    .map_err(|e| PyValueError::new_err(e))?;
-                values.push(column_value_to_py(py, &value)?);
+        // Collect all data into owned Rust structures while holding the borrow,
+        // then release the borrow before making Python calls (avoids RefCell
+        // conflicts if Python GC triggers a finalizer that accesses this table).
+        let (column_names, column_data): (Vec<String>, Vec<Vec<RustColumnValue>>) = {
+            let table = self.inner.borrow();
+            let names: Vec<String> = table.schema().get_column_names()
+                .iter().map(|s| s.to_string()).collect();
+            let mut data = Vec::with_capacity(names.len());
+            for col_name in &names {
+                let mut col_values = Vec::with_capacity(table.len());
+                for row_idx in 0..table.len() {
+                    let value = table.get_value(row_idx, col_name)
+                        .map_err(|e| PyValueError::new_err(e))?;
+                    col_values.push(value);
+                }
+                data.push(col_values);
             }
+            (names, data)
+        }; // borrow released here
 
-            let py_list = PyList::new_bound(py, values);
-            data_dict.set_item(*col_name, py_list)?;
+        // Now build Python objects with no borrow held
+        let data_dict = PyDict::new_bound(py);
+        for (col_name, col_values) in column_names.iter().zip(column_data.iter()) {
+            let mut py_values: Vec<PyObject> = Vec::with_capacity(col_values.len());
+            for value in col_values {
+                py_values.push(column_value_to_py(py, value)?);
+            }
+            let py_list = PyList::new_bound(py, py_values);
+            data_dict.set_item(col_name.as_str(), py_list)?;
         }
 
         // Create DataFrame
