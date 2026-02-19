@@ -1263,10 +1263,34 @@ impl PyTable {
                     "min" | "minimum" => RustAggregateFunction::Min,
                     "max" | "maximum" => RustAggregateFunction::Max,
                     "count" => RustAggregateFunction::Count,
-                    _ => return Err(PyValueError::new_err(format!(
-                        "Unknown aggregation function '{}'. Use: sum, avg, min, max, count",
-                        func_str
-                    ))),
+                    "median" | "med" => RustAggregateFunction::Median,
+                    "p25" => RustAggregateFunction::Percentile(0.25),
+                    "p50" => RustAggregateFunction::Percentile(0.50),
+                    "p75" => RustAggregateFunction::Percentile(0.75),
+                    "p90" => RustAggregateFunction::Percentile(0.90),
+                    "p95" => RustAggregateFunction::Percentile(0.95),
+                    "p99" => RustAggregateFunction::Percentile(0.99),
+                    other => {
+                        // Try to parse "percentile(X.XX)" format
+                        if let Some(inner) = other.strip_prefix("percentile(")
+                            .and_then(|s| s.strip_suffix(")"))
+                        {
+                            let p: f64 = inner.parse().map_err(|_| PyValueError::new_err(
+                                format!("Invalid percentile value '{}' in '{}'", inner, func_str)
+                            ))?;
+                            if !(0.0..=1.0).contains(&p) {
+                                return Err(PyValueError::new_err(
+                                    format!("Percentile value must be between 0.0 and 1.0, got {}", p)
+                                ));
+                            }
+                            RustAggregateFunction::Percentile(p)
+                        } else {
+                            return Err(PyValueError::new_err(format!(
+                                "Unknown aggregation function '{}'. Use: sum, avg, min, max, count, median, p25, p50, p75, p90, p95, p99, or percentile(0.XX)",
+                                func_str
+                            )));
+                        }
+                    }
                 };
                 Ok((result_name.clone(), source_col.clone(), func))
             })
@@ -2419,6 +2443,23 @@ impl PyAggregateFunction {
         PyAggregateFunction { inner: RustAggregateFunction::Max }
     }
 
+    /// Median value (equivalent to PERCENTILE(0.5))
+    #[classattr]
+    fn MEDIAN() -> Self {
+        PyAggregateFunction { inner: RustAggregateFunction::Median }
+    }
+
+    /// Percentile value. p must be between 0.0 and 1.0 inclusive.
+    #[staticmethod]
+    fn PERCENTILE(p: f64) -> PyResult<Self> {
+        if !(0.0..=1.0).contains(&p) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Percentile value must be between 0.0 and 1.0, got {}", p)
+            ));
+        }
+        Ok(PyAggregateFunction { inner: RustAggregateFunction::Percentile(p) })
+    }
+
     fn __repr__(&self) -> String {
         match self.inner {
             RustAggregateFunction::Sum => "AggregateFunction.SUM".to_string(),
@@ -2426,6 +2467,8 @@ impl PyAggregateFunction {
             RustAggregateFunction::Avg => "AggregateFunction.AVG".to_string(),
             RustAggregateFunction::Min => "AggregateFunction.MIN".to_string(),
             RustAggregateFunction::Max => "AggregateFunction.MAX".to_string(),
+            RustAggregateFunction::Median => "AggregateFunction.MEDIAN".to_string(),
+            RustAggregateFunction::Percentile(p) => format!("AggregateFunction.PERCENTILE({})", p),
         }
     }
 }

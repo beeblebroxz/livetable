@@ -125,7 +125,7 @@ for row in table:     # Iteration
 | `ComputedView` | `table.add_computed_column()` | Add calculated columns |
 | `JoinView` | `table.join()` | LEFT/INNER joins (single or composite keys) |
 | `SortedView` | `table.sort()` | Multi-column sorting |
-| `AggregateView` | `table.group_by()` | GROUP BY with SUM, AVG, MIN, MAX, COUNT |
+| `AggregateView` | `table.group_by()` | GROUP BY with SUM, AVG, MIN, MAX, COUNT, MEDIAN, PERCENTILE |
 
 Views created with simplified API are auto-registered. Call `table.tick()` to propagate changes to all registered views at once.
 

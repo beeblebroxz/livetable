@@ -195,7 +195,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 - [x] Column layer with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL)
 - [x] Table layer (Root tables with CRUD operations)
 - [x] Views: FilterView, ProjectionView, ComputedView, JoinView (LEFT/INNER), SortedView
-- [x] AggregateView with GROUP BY and incremental updates (SUM, COUNT, AVG, MIN, MAX)
+- [x] AggregateView with GROUP BY and incremental updates (SUM, COUNT, AVG, MIN, MAX, MEDIAN, PERCENTILE)
 - [x] String interning with reference counting
 - [x] Changesets and incremental view propagation
 - [x] Automatic view propagation via `tick()` method

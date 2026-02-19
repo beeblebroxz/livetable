@@ -325,7 +325,7 @@ class TestGroupBy:
         """Error on invalid aggregation function"""
         with pytest.raises(ValueError, match="Unknown aggregation function"):
             self.table.group_by("department", agg=[
-                ("x", "salary", "median")  # Not supported yet
+                ("x", "salary", "bogus_func")  # Not a valid aggregation
             ])
 
 

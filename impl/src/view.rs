@@ -1342,13 +1342,15 @@ impl IncrementalView for SortedView {
 // ============================================================================
 
 /// Supported aggregation functions
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggregateFunction {
     Sum,
     Count,
     Avg,
     Min,
     Max,
+    Percentile(f64),  // p value in 0.0..=1.0
+    Median,           // Sugar for Percentile(0.5)
 }
 
 /// Internal state for tracking aggregate statistics for one source column
@@ -1362,15 +1364,19 @@ struct ColumnAggState {
     min: Option<f64>,
     /// Current maximum value
     max: Option<f64>,
+    /// Sorted values for percentile calculations. Only populated when
+    /// a Percentile or Median aggregation targets this source column.
+    sorted_values: Option<Vec<f64>>,
 }
 
 impl ColumnAggState {
-    fn new() -> Self {
+    fn new(needs_sorted: bool) -> Self {
         ColumnAggState {
             sum: 0.0,
             count: 0,
             min: None,
             max: None,
+            sorted_values: if needs_sorted { Some(Vec::new()) } else { None },
         }
     }
 
@@ -1380,6 +1386,10 @@ impl ColumnAggState {
         self.count += 1;
         self.min = Some(self.min.map_or(value, |m| m.min(value)));
         self.max = Some(self.max.map_or(value, |m| m.max(value)));
+        if let Some(ref mut sorted) = self.sorted_values {
+            let pos = sorted.partition_point(|&v| v < value);
+            sorted.insert(pos, value);
+        }
     }
 
     /// Remove a numeric value from the aggregate state
@@ -1387,6 +1397,13 @@ impl ColumnAggState {
     fn remove_value(&mut self, value: f64) -> bool {
         self.sum -= value;
         self.count = self.count.saturating_sub(1);
+
+        if let Some(ref mut sorted) = self.sorted_values {
+            let pos = sorted.partition_point(|&v| v < value);
+            if pos < sorted.len() && (sorted[pos] - value).abs() < f64::EPSILON {
+                sorted.remove(pos);
+            }
+        }
 
         // Check if we need to recalculate min/max
         let needs_recalc = self.min.map_or(false, |m| (m - value).abs() < f64::EPSILON)
@@ -1404,6 +1421,32 @@ impl ColumnAggState {
             self.min = values.iter().copied().reduce(f64::min);
             self.max = values.iter().copied().reduce(f64::max);
         }
+        // Rebuild sorted_values if tracking percentiles
+        if self.sorted_values.is_some() {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            self.sorted_values = Some(sorted);
+        }
+    }
+
+    /// Compute percentile using linear interpolation (PERCENTILE_CONT semantics).
+    /// p must be in 0.0..=1.0. Returns None if no values.
+    fn percentile(&self, p: f64) -> Option<f64> {
+        let sorted = self.sorted_values.as_ref()?;
+        if sorted.is_empty() {
+            return None;
+        }
+        if sorted.len() == 1 {
+            return Some(sorted[0]);
+        }
+        let idx = p * (sorted.len() - 1) as f64;
+        let lo = idx.floor() as usize;
+        let hi = lo + 1;
+        if hi >= sorted.len() {
+            return Some(sorted[lo]);
+        }
+        let frac = idx - lo as f64;
+        Some(sorted[lo] * (1.0 - frac) + sorted[hi] * frac)
     }
 
     fn get_result(&self, func: AggregateFunction) -> ColumnValue {
@@ -1423,6 +1466,12 @@ impl ColumnAggState {
             AggregateFunction::Max => {
                 self.max.map_or(ColumnValue::Null, ColumnValue::Float64)
             }
+            AggregateFunction::Percentile(p) => {
+                self.percentile(p).map_or(ColumnValue::Null, ColumnValue::Float64)
+            }
+            AggregateFunction::Median => {
+                self.percentile(0.5).map_or(ColumnValue::Null, ColumnValue::Float64)
+            }
         }
     }
 }
@@ -1434,6 +1483,8 @@ struct GroupState {
     column_stats: HashMap<String, ColumnAggState>,
     /// Parent row indices belonging to this group (for MIN/MAX recalc on delete)
     row_indices: HashSet<usize>,
+    /// Source columns that need sorted_values for percentile calculations
+    percentile_columns: HashSet<String>,
 }
 
 impl GroupState {
@@ -1441,14 +1492,16 @@ impl GroupState {
         GroupState {
             column_stats: HashMap::new(),
             row_indices: HashSet::new(),
+            percentile_columns: HashSet::new(),
         }
     }
 
     /// Add a value for a specific source column
     fn add_column_value(&mut self, source_col: &str, value: f64) {
+        let needs_sorted = self.percentile_columns.contains(source_col);
         let stats = self.column_stats
             .entry(source_col.to_string())
-            .or_insert_with(ColumnAggState::new);
+            .or_insert_with(|| ColumnAggState::new(needs_sorted));
         stats.add_value(value);
     }
 
@@ -1731,6 +1784,8 @@ impl AggregateView {
         self.row_to_group.clear();
         self.row_to_group_built = false;
 
+        let pct_cols = self.percentile_source_columns();
+
         // Pre-compute column indices for fast access
         let parent = self.parent.borrow();
         let group_col_indices: Vec<usize> = self.group_by_columns
@@ -1794,7 +1849,11 @@ impl AggregateView {
 
                 // Get or create group state directly with int key
                 let is_new_group = !int_groups.contains_key(&group_val);
-                let state = int_groups.entry(group_val).or_insert_with(GroupState::new);
+                let state = int_groups.entry(group_val).or_insert_with(|| {
+                    let mut gs = GroupState::new();
+                    gs.percentile_columns = pct_cols.clone();
+                    gs
+                });
                 state.row_indices.insert(row_idx);
 
                 // Add aggregation value(s)
@@ -1847,7 +1906,11 @@ impl AggregateView {
                     .collect();
 
                 let is_new_group = !self.groups.contains_key(&key);
-                let state = self.groups.entry(key.clone()).or_insert_with(GroupState::new);
+                let state = self.groups.entry(key.clone()).or_insert_with(|| {
+                    let mut gs = GroupState::new();
+                    gs.percentile_columns = pct_cols.clone();
+                    gs
+                });
                 state.row_indices.insert(row_idx);
 
                 for (source_col, num) in col_values {
@@ -1893,6 +1956,14 @@ impl AggregateView {
         result
     }
 
+    /// Get source columns that need sorted_values for percentile/median
+    fn percentile_source_columns(&self) -> HashSet<String> {
+        self.aggregations.iter()
+            .filter(|(_, _, func)| matches!(func, AggregateFunction::Percentile(_) | AggregateFunction::Median))
+            .map(|(_, source_col, _)| source_col.clone())
+            .collect()
+    }
+
     fn add_row_to_aggregates(&mut self, row_idx: usize, row: &HashMap<String, ColumnValue>) {
         let key = GroupKey::from_row(row, &self.group_by_columns);
 
@@ -1912,7 +1983,12 @@ impl AggregateView {
 
         // Get or create group state
         let is_new_group = !self.groups.contains_key(&key);
-        let state = self.groups.entry(key.clone()).or_insert_with(GroupState::new);
+        let pct_cols = self.percentile_source_columns();
+        let state = self.groups.entry(key.clone()).or_insert_with(|| {
+            let mut gs = GroupState::new();
+            gs.percentile_columns = pct_cols;
+            gs
+        });
 
         // Add row index to group
         state.row_indices.insert(row_idx);
@@ -2264,6 +2340,189 @@ mod tests {
     use super::*;
     use crate::column::ColumnType;
     use crate::table::Schema;
+
+    // === ColumnAggState Percentile Tests ===
+
+    #[test]
+    fn test_column_agg_state_percentile() {
+        let mut state = ColumnAggState::new(true); // needs_sorted = true
+        // Values: 10, 20, 30, 40, 50
+        for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
+            state.add_value(v);
+        }
+
+        // Median (P50) of [10,20,30,40,50] = 30.0
+        let median = state.percentile(0.5).unwrap();
+        assert!((median - 30.0).abs() < 1e-9);
+
+        // P0 = 10.0 (minimum)
+        let p0 = state.percentile(0.0).unwrap();
+        assert!((p0 - 10.0).abs() < 1e-9);
+
+        // P100 = 50.0 (maximum)
+        let p100 = state.percentile(1.0).unwrap();
+        assert!((p100 - 50.0).abs() < 1e-9);
+
+        // P25 = 20.0
+        let p25 = state.percentile(0.25).unwrap();
+        assert!((p25 - 20.0).abs() < 1e-9);
+
+        // P75 = 40.0
+        let p75 = state.percentile(0.75).unwrap();
+        assert!((p75 - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_column_agg_state_percentile_interpolation() {
+        let mut state = ColumnAggState::new(true);
+        // Even number of values: 10, 20, 30, 40
+        for v in [10.0, 20.0, 30.0, 40.0] {
+            state.add_value(v);
+        }
+        // Median of [10,20,30,40] = interpolation at index 1.5 = 25.0
+        let median = state.percentile(0.5).unwrap();
+        assert!((median - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_column_agg_state_percentile_single_value() {
+        let mut state = ColumnAggState::new(true);
+        state.add_value(42.0);
+        // Any percentile of a single value = that value
+        assert!((state.percentile(0.0).unwrap() - 42.0).abs() < 1e-9);
+        assert!((state.percentile(0.5).unwrap() - 42.0).abs() < 1e-9);
+        assert!((state.percentile(1.0).unwrap() - 42.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_column_agg_state_percentile_empty() {
+        let state = ColumnAggState::new(true);
+        assert!(state.percentile(0.5).is_none());
+    }
+
+    #[test]
+    fn test_column_agg_state_no_sorted_when_not_needed() {
+        let mut state = ColumnAggState::new(false); // needs_sorted = false
+        state.add_value(10.0);
+        assert!(state.sorted_values.is_none());
+        assert!(state.percentile(0.5).is_none());
+    }
+
+    // === AggregateView Percentile Integration Tests ===
+
+    #[test]
+    fn test_aggregate_view_percentile() {
+        let schema = Schema::new(vec![
+            ("region".to_string(), ColumnType::String, false),
+            ("amount".to_string(), ColumnType::Float64, false),
+        ]);
+
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+        {
+            let mut t = table.borrow_mut();
+            // North: 10, 20, 30, 40, 50  (median=30, p90=46)
+            for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
+                let mut row = HashMap::new();
+                row.insert("region".to_string(), ColumnValue::String("North".to_string()));
+                row.insert("amount".to_string(), ColumnValue::Float64(v));
+                t.append_row(row).unwrap();
+            }
+            // South: 100, 200  (median=150)
+            for v in [100.0, 200.0] {
+                let mut row = HashMap::new();
+                row.insert("region".to_string(), ColumnValue::String("South".to_string()));
+                row.insert("amount".to_string(), ColumnValue::Float64(v));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let agg = AggregateView::new(
+            "by_region".to_string(),
+            table.clone(),
+            vec!["region".to_string()],
+            vec![
+                ("median_amount".to_string(), "amount".to_string(), AggregateFunction::Median),
+                ("p90_amount".to_string(), "amount".to_string(), AggregateFunction::Percentile(0.9)),
+            ],
+        ).unwrap();
+
+        assert_eq!(agg.len(), 2);
+
+        for i in 0..agg.len() {
+            let row = agg.get_row(i).unwrap();
+            match row.get("region").unwrap() {
+                ColumnValue::String(s) if s == "North" => {
+                    let median = match row.get("median_amount").unwrap() {
+                        ColumnValue::Float64(v) => *v,
+                        _ => panic!("Expected Float64"),
+                    };
+                    assert!((median - 30.0).abs() < 1e-9);
+                }
+                ColumnValue::String(s) if s == "South" => {
+                    let median = match row.get("median_amount").unwrap() {
+                        ColumnValue::Float64(v) => *v,
+                        _ => panic!("Expected Float64"),
+                    };
+                    assert!((median - 150.0).abs() < 1e-9);
+                }
+                _ => panic!("Unexpected region"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_aggregate_view_percentile_incremental() {
+        let schema = Schema::new(vec![
+            ("group".to_string(), ColumnType::String, false),
+            ("val".to_string(), ColumnType::Float64, false),
+        ]);
+
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+        {
+            let mut t = table.borrow_mut();
+            for v in [10.0, 20.0, 30.0] {
+                let mut row = HashMap::new();
+                row.insert("group".to_string(), ColumnValue::String("A".to_string()));
+                row.insert("val".to_string(), ColumnValue::Float64(v));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let mut agg = AggregateView::new(
+            "test_agg".to_string(),
+            table.clone(),
+            vec!["group".to_string()],
+            vec![("median_val".to_string(), "val".to_string(), AggregateFunction::Median)],
+        ).unwrap();
+
+        // Median of [10, 20, 30] = 20.0
+        let row = agg.get_row(0).unwrap();
+        let median = match row.get("median_val").unwrap() {
+            ColumnValue::Float64(v) => *v,
+            _ => panic!("Expected Float64"),
+        };
+        assert!((median - 20.0).abs() < 1e-9);
+
+        // Add a value and sync
+        {
+            let mut t = table.borrow_mut();
+            let mut row = HashMap::new();
+            row.insert("group".to_string(), ColumnValue::String("A".to_string()));
+            row.insert("val".to_string(), ColumnValue::Float64(40.0));
+            t.append_row(row).unwrap();
+        }
+        agg.sync();
+
+        // Median of [10, 20, 30, 40] = 25.0
+        let row = agg.get_row(0).unwrap();
+        let median = match row.get("median_val").unwrap() {
+            ColumnValue::Float64(v) => *v,
+            _ => panic!("Expected Float64"),
+        };
+        assert!((median - 25.0).abs() < 1e-9);
+    }
+
+    // === Existing Tests ===
 
     #[test]
     fn test_filter_view() {

@@ -188,10 +188,21 @@ grouped = table.group_by("department", agg=[
     ("max_sal", "salary", "max"),
 ])
 
+# Percentile / Median aggregations
+stats = table.group_by("month", agg=[
+    ("median_tokens", "tokens_used", "median"),
+    ("p95_tokens", "tokens_used", "p95"),
+    ("p99_latency", "latency_ms", "p99"),
+    ("p25_tokens", "tokens_used", "percentile(0.25)"),  # Explicit percentile
+])
+# Shorthand strings: median, p25, p50, p75, p90, p95, p99, percentile(X.XX)
+
 # GROUP BY (explicit AggregateView constructor)
 agg = livetable.AggregateView("by_name", table, ["name"], [
     ("total", "score", livetable.AggregateFunction.SUM),
     ("average", "score", livetable.AggregateFunction.AVG),
+    ("p95", "score", livetable.AggregateFunction.PERCENTILE(0.95)),
+    ("median", "score", livetable.AggregateFunction.MEDIAN),
 ])
 agg.sync()  # Incremental update after table changes
 

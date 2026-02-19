@@ -193,6 +193,8 @@ agg = livetable.AggregateView(
         ("count", "score", livetable.AggregateFunction.COUNT),
         ("min_score", "score", livetable.AggregateFunction.MIN),
         ("max_score", "score", livetable.AggregateFunction.MAX),
+        ("median_score", "score", livetable.AggregateFunction.MEDIAN),
+        ("p95_score", "score", livetable.AggregateFunction.PERCENTILE(0.95)),
     ]
 )
 
@@ -301,6 +303,13 @@ grouped = table.group_by("department", agg=[
     ("headcount", "salary", "count"),
     ("min_sal", "salary", "min"),
     ("max_sal", "salary", "max"),
+    ("median_sal", "salary", "median"),
+    ("p95_sal", "salary", "p95"),
+])
+
+# Percentile shorthand strings: median, p25, p50, p75, p90, p95, p99, percentile(X.XX)
+percentiles = table.group_by("department", agg=[
+    ("p10_sal", "salary", "percentile(0.1)"),
 ])
 
 # Iterate over grouped results
@@ -734,6 +743,8 @@ Enum for aggregation types:
 - `AggregateFunction.AVG` - Average of numeric values
 - `AggregateFunction.MIN` - Minimum numeric value
 - `AggregateFunction.MAX` - Maximum numeric value
+- `AggregateFunction.MEDIAN` - Median value (equivalent to PERCENTILE(0.5))
+- `AggregateFunction.PERCENTILE(p)` - Percentile value (p in 0.0..1.0, uses linear interpolation)
 
 ### AggregateView
 
@@ -882,6 +893,7 @@ Potential additions:
 - [x] ~~Expression-based filtering~~ ✅ **DONE!**
 - [x] ~~Simplified API (sort, join, group_by)~~ ✅ **DONE!**
 - [x] ~~Storage hints (fast_reads/fast_updates)~~ ✅ **DONE!**
+- [x] ~~Percentile/Median aggregations (P25, P50, P75, P90, P95, P99)~~ ✅ **DONE!**
 - [ ] RIGHT and FULL OUTER joins
 
 ## Contributing
