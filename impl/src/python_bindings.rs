@@ -1,18 +1,21 @@
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
 /// Python bindings for LiveTable using PyO3
 ///
 /// This module provides Python-friendly APIs for the Rust implementation,
 /// allowing Python code to use the high-performance Rust table system.
-
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyValueError, PyIndexError, PyKeyError, PyTypeError};
 use pyo3::types::{PyDict, PyList, PySlice};
-use std::collections::HashMap;
-use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 
 use crate::column::{ColumnType as RustColumnType, ColumnValue as RustColumnValue};
-use crate::table::{Schema as RustSchema, Table as RustTable, StorageHint};
-use crate::view::{JoinView as RustJoinView, JoinType as RustJoinType, SortedView as RustSortedView, SortKey as RustSortKey, SortOrder as RustSortOrder, AggregateFunction as RustAggregateFunction, AggregateView as RustAggregateView};
+use crate::table::{Schema as RustSchema, StorageHint, Table as RustTable};
+use crate::view::{
+    AggregateFunction as RustAggregateFunction, AggregateView as RustAggregateView,
+    JoinType as RustJoinType, JoinView as RustJoinView, SortKey as RustSortKey,
+    SortOrder as RustSortOrder, SortedView as RustSortedView,
+};
 
 // ============================================================================
 // Date/Time Helper Functions
@@ -53,7 +56,11 @@ fn datetime_to_ms_since_epoch(dt: &Bound<'_, PyAny>) -> PyResult<i64> {
 fn ymd_from_days(days: i32) -> (i32, u32, u32) {
     // Algorithm from https://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
     let doe = (z - era * 146097) as u32;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = (yoe as i32) + era * 400;
@@ -110,30 +117,46 @@ pub struct PyColumnType {
 #[pymethods]
 impl PyColumnType {
     #[classattr]
-    const INT32: PyColumnType = PyColumnType { inner: RustColumnType::Int32 };
+    const INT32: PyColumnType = PyColumnType {
+        inner: RustColumnType::Int32,
+    };
 
     #[classattr]
-    const INT64: PyColumnType = PyColumnType { inner: RustColumnType::Int64 };
+    const INT64: PyColumnType = PyColumnType {
+        inner: RustColumnType::Int64,
+    };
 
     #[classattr]
-    const FLOAT32: PyColumnType = PyColumnType { inner: RustColumnType::Float32 };
+    const FLOAT32: PyColumnType = PyColumnType {
+        inner: RustColumnType::Float32,
+    };
 
     #[classattr]
-    const FLOAT64: PyColumnType = PyColumnType { inner: RustColumnType::Float64 };
+    const FLOAT64: PyColumnType = PyColumnType {
+        inner: RustColumnType::Float64,
+    };
 
     #[classattr]
-    const STRING: PyColumnType = PyColumnType { inner: RustColumnType::String };
+    const STRING: PyColumnType = PyColumnType {
+        inner: RustColumnType::String,
+    };
 
     #[classattr]
-    const BOOL: PyColumnType = PyColumnType { inner: RustColumnType::Bool };
+    const BOOL: PyColumnType = PyColumnType {
+        inner: RustColumnType::Bool,
+    };
 
     /// Date type (days since 1970-01-01)
     #[classattr]
-    const DATE: PyColumnType = PyColumnType { inner: RustColumnType::Date };
+    const DATE: PyColumnType = PyColumnType {
+        inner: RustColumnType::Date,
+    };
 
     /// DateTime type (milliseconds since 1970-01-01 00:00:00 UTC)
     #[classattr]
-    const DATETIME: PyColumnType = PyColumnType { inner: RustColumnType::DateTime };
+    const DATETIME: PyColumnType = PyColumnType {
+        inner: RustColumnType::DateTime,
+    };
 
     fn __repr__(&self) -> String {
         match self.inner {
@@ -212,7 +235,8 @@ fn py_to_column_value(_py: Python, value: &Bound<'_, PyAny>) -> PyResult<RustCol
             return Ok(Some(RustColumnValue::Date(days)));
         }
         Ok(None)
-    }).and_then(|opt| {
+    })
+    .and_then(|opt| {
         if let Some(cv) = opt {
             return Ok(cv);
         }
@@ -242,11 +266,10 @@ fn py_to_column_value_typed(
 
     // Extract based on expected type - no guessing needed
     match expected_type {
-        RustColumnType::Int32 => {
-            value.extract::<i32>()
-                .map(RustColumnValue::Int32)
-                .map_err(|_| PyValueError::new_err("Expected INT32 value"))
-        }
+        RustColumnType::Int32 => value
+            .extract::<i32>()
+            .map(RustColumnValue::Int32)
+            .map_err(|_| PyValueError::new_err("Expected INT32 value")),
         RustColumnType::Int64 => {
             // Try i64 first, fall back to i32 if needed
             if let Ok(v) = value.extract::<i64>() {
@@ -257,27 +280,27 @@ fn py_to_column_value_typed(
                 Err(PyValueError::new_err("Expected INT64 value"))
             }
         }
-        RustColumnType::Float32 => {
-            value.extract::<f32>()
-                .map(RustColumnValue::Float32)
-                .or_else(|_| value.extract::<f64>().map(|v| RustColumnValue::Float32(v as f32)))
-                .map_err(|_| PyValueError::new_err("Expected FLOAT32 value"))
-        }
-        RustColumnType::Float64 => {
-            value.extract::<f64>()
-                .map(RustColumnValue::Float64)
-                .map_err(|_| PyValueError::new_err("Expected FLOAT64 value"))
-        }
-        RustColumnType::String => {
-            value.extract::<String>()
-                .map(RustColumnValue::String)
-                .map_err(|_| PyValueError::new_err("Expected STRING value"))
-        }
-        RustColumnType::Bool => {
-            value.extract::<bool>()
-                .map(RustColumnValue::Bool)
-                .map_err(|_| PyValueError::new_err("Expected BOOL value"))
-        }
+        RustColumnType::Float32 => value
+            .extract::<f32>()
+            .map(RustColumnValue::Float32)
+            .or_else(|_| {
+                value
+                    .extract::<f64>()
+                    .map(|v| RustColumnValue::Float32(v as f32))
+            })
+            .map_err(|_| PyValueError::new_err("Expected FLOAT32 value")),
+        RustColumnType::Float64 => value
+            .extract::<f64>()
+            .map(RustColumnValue::Float64)
+            .map_err(|_| PyValueError::new_err("Expected FLOAT64 value")),
+        RustColumnType::String => value
+            .extract::<String>()
+            .map(RustColumnValue::String)
+            .map_err(|_| PyValueError::new_err("Expected STRING value")),
+        RustColumnType::Bool => value
+            .extract::<bool>()
+            .map(RustColumnValue::Bool)
+            .map_err(|_| PyValueError::new_err("Expected BOOL value")),
         RustColumnType::Date => {
             // Accept datetime.date, datetime.datetime, or integer (days since epoch)
             // Try integer first (days since epoch)
@@ -351,7 +374,8 @@ fn column_value_to_py(py: Python, value: &RustColumnValue) -> PyResult<PyObject>
             let (year, month, day, hour, minute, second, microsecond) = datetime_from_ms(*ms);
             let datetime_mod = py.import_bound("datetime")?;
             let datetime_class = datetime_mod.getattr("datetime")?;
-            let dt_obj = datetime_class.call1((year, month, day, hour, minute, second, microsecond))?;
+            let dt_obj =
+                datetime_class.call1((year, month, day, hour, minute, second, microsecond))?;
             Ok(dt_obj.to_object(py))
         }
         RustColumnValue::Null => Ok(py.None()),
@@ -370,14 +394,17 @@ fn extract_string_or_list(value: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
     if let Ok(list) = value.downcast::<PyList>() {
         let mut result = Vec::with_capacity(list.len());
         for item in list.iter() {
-            let s: String = item.extract()
+            let s: String = item
+                .extract()
                 .map_err(|_| PyValueError::new_err("All items in key list must be strings"))?;
             result.push(s);
         }
         return Ok(result);
     }
 
-    Err(PyValueError::new_err("Key must be a string or list of strings"))
+    Err(PyValueError::new_err(
+        "Key must be a string or list of strings",
+    ))
 }
 
 /// Convert pandas dtype string to ColumnType
@@ -394,7 +421,11 @@ fn dtype_str_to_column_type(dtype_str: &str) -> RustColumnType {
 }
 
 /// Convert pandas value to ColumnValue, handling NaN and special types
-fn pandas_value_to_column_value(py: Python, value: &Bound<'_, PyAny>, expected_type: RustColumnType) -> PyResult<RustColumnValue> {
+fn pandas_value_to_column_value(
+    py: Python,
+    value: &Bound<'_, PyAny>,
+    expected_type: RustColumnType,
+) -> PyResult<RustColumnValue> {
     // Check for pandas NA/NaN/None
     if value.is_none() {
         return Ok(RustColumnValue::Null);
@@ -547,7 +578,11 @@ impl PySchema {
 
     /// Get column names as a list
     fn get_column_names(&self) -> Vec<String> {
-        self.inner.get_column_names().iter().map(|s| s.to_string()).collect()
+        self.inner
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Get column index by name
@@ -557,8 +592,15 @@ impl PySchema {
 
     /// Get column info (name, type, nullable) by index
     fn get_column_info(&self, index: usize) -> Option<(String, PyColumnType, bool)> {
-        self.inner.get_column_info(index)
-            .map(|(name, col_type, nullable)| (name.to_string(), PyColumnType::from_rust(col_type), nullable))
+        self.inner
+            .get_column_info(index)
+            .map(|(name, col_type, nullable)| {
+                (
+                    name.to_string(),
+                    PyColumnType::from_rust(col_type),
+                    nullable,
+                )
+            })
     }
 }
 
@@ -569,10 +611,36 @@ impl PySchema {
 /// Enum to hold references to different view types for automatic tick propagation
 #[derive(Clone)]
 enum RegisteredView {
+    Filter(Weak<RefCell<PyFilterViewInner>>),
+    Sorted(Weak<RefCell<RustSortedView>>),
+    Aggregate(Weak<RefCell<RustAggregateView>>),
+    // JoinView is more complex (two parents) - not auto-registered for now
+}
+
+enum ActiveRegisteredView {
     Filter(Rc<RefCell<PyFilterViewInner>>),
     Sorted(Rc<RefCell<RustSortedView>>),
     Aggregate(Rc<RefCell<RustAggregateView>>),
-    // JoinView is more complex (two parents) - not auto-registered for now
+}
+
+impl RegisteredView {
+    fn is_alive(&self) -> bool {
+        match self {
+            RegisteredView::Filter(inner) => inner.strong_count() > 0,
+            RegisteredView::Sorted(inner) => inner.strong_count() > 0,
+            RegisteredView::Aggregate(inner) => inner.strong_count() > 0,
+        }
+    }
+
+    fn upgrade(&self) -> Option<ActiveRegisteredView> {
+        match self {
+            RegisteredView::Filter(inner) => inner.upgrade().map(ActiveRegisteredView::Filter),
+            RegisteredView::Sorted(inner) => inner.upgrade().map(ActiveRegisteredView::Sorted),
+            RegisteredView::Aggregate(inner) => {
+                inner.upgrade().map(ActiveRegisteredView::Aggregate)
+            }
+        }
+    }
 }
 
 /// Inner state for PyFilterView that can be shared with the view registry
@@ -650,7 +718,9 @@ impl PyFilterViewInner {
 
                     let result: bool = self.predicate.call1(py, (dict,))?.extract(py)?;
                     if result {
-                        let insert_pos = self.indices.iter()
+                        let insert_pos = self
+                            .indices
+                            .iter()
                             .position(|&i| i > index)
                             .unwrap_or(self.indices.len());
                         self.indices.insert(insert_pos, index);
@@ -691,7 +761,9 @@ impl PyFilterViewInner {
 
                     match (currently_in_view, now_matches) {
                         (false, true) => {
-                            let insert_pos = self.indices.iter()
+                            let insert_pos = self
+                                .indices
+                                .iter()
                                 .position(|&i| i > row)
                                 .unwrap_or(self.indices.len());
                             self.indices.insert(insert_pos, row);
@@ -754,8 +826,7 @@ impl PyTable {
     ) -> PyResult<Self> {
         let hint = match storage {
             None => StorageHint::FastReads,
-            Some(s) => StorageHint::from_str(s)
-                .map_err(|e| PyValueError::new_err(e))?,
+            Some(s) => StorageHint::from_str(s).map_err(|e| PyValueError::new_err(e))?,
         };
 
         Ok(PyTable {
@@ -775,8 +846,12 @@ impl PyTable {
 
     fn __repr__(&self) -> String {
         let table = self.inner.borrow();
-        format!("Table(name='{}', rows={}, columns={})",
-                table.name(), table.len(), table.schema().get_column_names().len())
+        format!(
+            "Table(name='{}', rows={}, columns={})",
+            table.name(),
+            table.len(),
+            table.schema().get_column_names().len()
+        )
     }
 
     /// Get table name
@@ -791,7 +866,8 @@ impl PyTable {
 
     /// Get column names
     fn column_names(&self) -> Vec<String> {
-        self.inner.borrow()
+        self.inner
+            .borrow()
             .schema()
             .get_column_names()
             .iter()
@@ -805,7 +881,9 @@ impl PyTable {
         let col_info: HashMap<String, (RustColumnType, bool)> = {
             let table = self.inner.borrow();
             let schema = table.schema();
-            schema.get_column_names().iter()
+            schema
+                .get_column_names()
+                .iter()
                 .filter_map(|name| {
                     let col_type = schema.get_column_type(name)?;
                     let nullable = schema.is_column_nullable(name).unwrap_or(false);
@@ -822,13 +900,17 @@ impl PyTable {
             let col_value = if let Some((col_type, nullable)) = col_info.get(&key_str) {
                 py_to_column_value_typed(&value, *col_type, *nullable)?
             } else {
-                return Err(PyValueError::new_err(format!("Unknown column: {}", key_str)));
+                return Err(PyValueError::new_err(format!(
+                    "Unknown column: {}",
+                    key_str
+                )));
             };
 
             rust_row.insert(key_str, col_value);
         }
 
-        self.inner.borrow_mut()
+        self.inner
+            .borrow_mut()
             .append_row(rust_row)
             .map_err(|e| PyValueError::new_err(e))
     }
@@ -861,8 +943,13 @@ impl PyTable {
         // This avoids repeated schema lookups per row
         let table = self.inner.borrow();
         let schema = table.schema();
-        let col_names: Vec<String> = schema.get_column_names().iter().map(|s| s.to_string()).collect();
-        let col_info: HashMap<String, (RustColumnType, bool)> = col_names.iter()
+        let col_names: Vec<String> = schema
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let col_info: HashMap<String, (RustColumnType, bool)> = col_names
+            .iter()
             .filter_map(|name| {
                 let col_type = schema.get_column_type(name)?;
                 let nullable = schema.is_column_nullable(name).unwrap_or(false);
@@ -874,7 +961,8 @@ impl PyTable {
         let mut rust_rows = Vec::with_capacity(rows.len());
 
         for item in rows.iter() {
-            let row_dict = item.downcast::<PyDict>()
+            let row_dict = item
+                .downcast::<PyDict>()
                 .map_err(|_| PyValueError::new_err("Each row must be a dictionary"))?;
 
             let mut rust_row = HashMap::new();
@@ -885,7 +973,10 @@ impl PyTable {
                 let col_value = if let Some((col_type, nullable)) = col_info.get(&key_str) {
                     py_to_column_value_typed(&value, *col_type, *nullable)?
                 } else {
-                    return Err(PyValueError::new_err(format!("Unknown column: {}", key_str)));
+                    return Err(PyValueError::new_err(format!(
+                        "Unknown column: {}",
+                        key_str
+                    )));
                 };
 
                 rust_row.insert(key_str, col_value);
@@ -893,7 +984,8 @@ impl PyTable {
             rust_rows.push(rust_row);
         }
 
-        self.inner.borrow_mut()
+        self.inner
+            .borrow_mut()
             .append_rows(rust_rows)
             .map_err(|e| PyValueError::new_err(e))
     }
@@ -904,7 +996,9 @@ impl PyTable {
         let col_info: HashMap<String, (RustColumnType, bool)> = {
             let table = self.inner.borrow();
             let schema = table.schema();
-            schema.get_column_names().iter()
+            schema
+                .get_column_names()
+                .iter()
                 .filter_map(|name| {
                     let col_type = schema.get_column_type(name)?;
                     let nullable = schema.is_column_nullable(name).unwrap_or(false);
@@ -922,27 +1016,34 @@ impl PyTable {
             let col_value = if let Some((col_type, nullable)) = col_info.get(&key_str) {
                 py_to_column_value_typed(&value, *col_type, *nullable)?
             } else {
-                return Err(PyValueError::new_err(format!("Unknown column: {}", key_str)));
+                return Err(PyValueError::new_err(format!(
+                    "Unknown column: {}",
+                    key_str
+                )));
             };
             rust_row.insert(key_str, col_value);
         }
 
-        self.inner.borrow_mut()
+        self.inner
+            .borrow_mut()
             .insert_row(index, rust_row)
             .map_err(|e| PyValueError::new_err(e))
     }
 
     /// Delete a row at a specific index
     fn delete_row(&mut self, index: usize) -> PyResult<()> {
-        self.inner.borrow_mut()
+        self.inner
+            .borrow_mut()
             .delete_row(index)
-            .map(|_| ())  // Discard the returned row
+            .map(|_| ()) // Discard the returned row
             .map_err(|e| PyIndexError::new_err(e))
     }
 
     /// Get a value at (row, column)
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
-        let value = self.inner.borrow()
+        let value = self
+            .inner
+            .borrow()
             .get_value(row, column)
             .map_err(|e| PyKeyError::new_err(e))?;
 
@@ -950,7 +1051,13 @@ impl PyTable {
     }
 
     /// Set a value at (row, column)
-    fn set_value(&mut self, _py: Python, row: usize, column: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn set_value(
+        &mut self,
+        _py: Python,
+        row: usize,
+        column: &str,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         let (col_type, nullable) = {
             let table = self.inner.borrow();
             let schema = table.schema();
@@ -963,14 +1070,17 @@ impl PyTable {
 
         let col_value = py_to_column_value_typed(value, col_type, nullable)?;
 
-        self.inner.borrow_mut()
+        self.inner
+            .borrow_mut()
             .set_value(row, column, col_value)
             .map_err(|e| PyValueError::new_err(e))
     }
 
     /// Get a full row as a dictionary
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        let row = self.inner.borrow()
+        let row = self
+            .inner
+            .borrow()
             .get_row(index)
             .map_err(|e| PyIndexError::new_err(e))?;
 
@@ -1039,7 +1149,8 @@ impl PyTable {
 
             let list = PyList::empty_bound(py);
             for i in 0..table_len {
-                let value = table.get_value(i, &column_name)
+                let value = table
+                    .get_value(i, &column_name)
                     .map_err(|e| PyIndexError::new_err(e))?;
                 list.append(column_value_to_py(py, &value)?)?;
             }
@@ -1047,7 +1158,7 @@ impl PyTable {
         }
 
         Err(PyTypeError::new_err(
-            "indices must be integers, slices, or column names (strings)"
+            "indices must be integers, slices, or column names (strings)",
         ))
     }
 
@@ -1068,9 +1179,9 @@ impl PyTable {
         let view = PyFilterView::new(self.clone(), predicate)?;
 
         // Register the view's inner state for automatic tick() propagation
-        self.registered_views.borrow_mut().push(
-            RegisteredView::Filter(Rc::clone(&view.inner))
-        );
+        self.registered_views
+            .borrow_mut()
+            .push(RegisteredView::Filter(Rc::downgrade(&view.inner)));
 
         Ok(view)
     }
@@ -1093,7 +1204,8 @@ impl PyTable {
     ///     for idx in indices:
     ///         print(table.get_row(idx))
     fn filter_expr(&self, expression: &str) -> PyResult<Vec<usize>> {
-        self.inner.borrow()
+        self.inner
+            .borrow()
             .filter_expr(expression)
             .map_err(|e| PyValueError::new_err(e))
     }
@@ -1130,7 +1242,11 @@ impl PyTable {
     ///     # Sort by multiple columns
     ///     sorted_table = table.sort(["name", "score"], descending=[False, True])
     #[pyo3(signature = (by, descending=None))]
-    fn sort(&self, by: &Bound<'_, PyAny>, descending: Option<&Bound<'_, PyAny>>) -> PyResult<PySortedView> {
+    fn sort(
+        &self,
+        by: &Bound<'_, PyAny>,
+        descending: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PySortedView> {
         // Extract column name(s)
         let columns = extract_string_or_list(by)?;
 
@@ -1144,22 +1260,29 @@ impl PyTable {
                     if list.len() != columns.len() {
                         return Err(PyValueError::new_err(format!(
                             "descending list length ({}) must match columns length ({})",
-                            list.len(), columns.len()
+                            list.len(),
+                            columns.len()
                         )));
                     }
                     list
                 } else {
                     return Err(PyTypeError::new_err(
-                        "descending must be a bool or list of bools"
+                        "descending must be a bool or list of bools",
                     ));
                 }
             }
         };
 
         // Build sort keys (nulls_first=true matches SQL standard)
-        let sort_keys: Vec<RustSortKey> = columns.iter().zip(desc_flags.iter())
+        let sort_keys: Vec<RustSortKey> = columns
+            .iter()
+            .zip(desc_flags.iter())
             .map(|(col, desc)| {
-                let order = if *desc { RustSortOrder::Descending } else { RustSortOrder::Ascending };
+                let order = if *desc {
+                    RustSortOrder::Descending
+                } else {
+                    RustSortOrder::Ascending
+                };
                 RustSortKey::new(col.clone(), order, true)
             })
             .collect();
@@ -1167,18 +1290,15 @@ impl PyTable {
         // Auto-generate name
         let name = format!("{}_sorted", self.inner.borrow().name());
 
-        let view = RustSortedView::new(
-            name,
-            self.inner.clone(),
-            sort_keys,
-        ).map_err(|e| PyValueError::new_err(e))?;
+        let view = RustSortedView::new(name, self.inner.clone(), sort_keys)
+            .map_err(|e| PyValueError::new_err(e))?;
 
         let inner = Rc::new(RefCell::new(view));
 
         // Register the view's inner state for automatic tick() propagation
-        self.registered_views.borrow_mut().push(
-            RegisteredView::Sorted(Rc::clone(&inner))
-        );
+        self.registered_views
+            .borrow_mut()
+            .push(RegisteredView::Sorted(Rc::downgrade(&inner)));
 
         Ok(PySortedView { inner })
     }
@@ -1222,17 +1342,18 @@ impl PyTable {
                 let cols = extract_string_or_list(on_cols)?;
                 (cols.clone(), cols)
             }
-            (None, Some(left), Some(right)) => {
-                (extract_string_or_list(left)?, extract_string_or_list(right)?)
-            }
+            (None, Some(left), Some(right)) => (
+                extract_string_or_list(left)?,
+                extract_string_or_list(right)?,
+            ),
             (None, None, None) => {
                 return Err(PyValueError::new_err(
-                    "Must specify either 'on' or both 'left_on' and 'right_on'"
+                    "Must specify either 'on' or both 'left_on' and 'right_on'",
                 ));
             }
             _ => {
                 return Err(PyValueError::new_err(
-                    "Cannot specify both 'on' and 'left_on'/'right_on'"
+                    "Cannot specify both 'on' and 'left_on'/'right_on'",
                 ));
             }
         };
@@ -1241,9 +1362,12 @@ impl PyTable {
         let join_type = match how.to_lowercase().as_str() {
             "left" => RustJoinType::Left,
             "inner" => RustJoinType::Inner,
-            _ => return Err(PyValueError::new_err(
-                format!("Unknown join type '{}'. Use 'left' or 'inner'", how)
-            )),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown join type '{}'. Use 'left' or 'inner'",
+                    how
+                )))
+            }
         };
 
         // Auto-generate name
@@ -1260,7 +1384,8 @@ impl PyTable {
             left_keys,
             right_keys,
             join_type,
-        ).map_err(|e| PyValueError::new_err(e))?;
+        )
+        .map_err(|e| PyValueError::new_err(e))?;
 
         Ok(PyJoinView {
             inner: Rc::new(RefCell::new(join)),
@@ -1344,19 +1469,15 @@ impl PyTable {
         // Auto-generate name
         let name = format!("{}_grouped", self.inner.borrow().name());
 
-        let view = RustAggregateView::new(
-            name,
-            self.inner.clone(),
-            group_cols,
-            aggregations,
-        ).map_err(|e| PyValueError::new_err(e))?;
+        let view = RustAggregateView::new(name, self.inner.clone(), group_cols, aggregations)
+            .map_err(|e| PyValueError::new_err(e))?;
 
         let inner = Rc::new(RefCell::new(view));
 
         // Register the view's inner state for automatic tick() propagation
-        self.registered_views.borrow_mut().push(
-            RegisteredView::Aggregate(Rc::clone(&inner))
-        );
+        self.registered_views
+            .borrow_mut()
+            .push(RegisteredView::Aggregate(Rc::downgrade(&inner)));
 
         Ok(PyAggregateView { inner })
     }
@@ -1413,14 +1534,16 @@ impl PyTable {
     /// Calculate the sum of all numeric values in a column.
     /// NULL values are skipped.
     fn sum(&self, column: &str) -> PyResult<f64> {
-        self.inner.borrow()
+        self.inner
+            .borrow()
             .sum(column)
             .map_err(|e| PyValueError::new_err(e))
     }
 
     /// Count the number of non-NULL values in a column.
     fn count_non_null(&self, column: &str) -> PyResult<usize> {
-        self.inner.borrow()
+        self.inner
+            .borrow()
             .count_non_null(column)
             .map_err(|e| PyValueError::new_err(e))
     }
@@ -1428,7 +1551,8 @@ impl PyTable {
     /// Calculate the average of all numeric values in a column.
     /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
     fn avg(&self, column: &str) -> PyResult<Option<f64>> {
-        self.inner.borrow()
+        self.inner
+            .borrow()
             .avg(column)
             .map_err(|e| PyValueError::new_err(e))
     }
@@ -1436,7 +1560,8 @@ impl PyTable {
     /// Find the minimum numeric value in a column.
     /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
     fn min(&self, column: &str) -> PyResult<Option<f64>> {
-        self.inner.borrow()
+        self.inner
+            .borrow()
             .min(column)
             .map_err(|e| PyValueError::new_err(e))
     }
@@ -1444,7 +1569,8 @@ impl PyTable {
     /// Find the maximum numeric value in a column.
     /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
     fn max(&self, column: &str) -> PyResult<Option<f64>> {
-        self.inner.borrow()
+        self.inner
+            .borrow()
             .max(column)
             .map_err(|e| PyValueError::new_err(e))
     }
@@ -1475,7 +1601,8 @@ impl PyTable {
     ///     with open("data.json", "w") as f:
     ///         f.write(json_str)
     fn to_json(&self) -> PyResult<String> {
-        self.inner.borrow()
+        self.inner
+            .borrow()
             .to_json()
             .map_err(|e| PyValueError::new_err(e))
     }
@@ -1497,8 +1624,7 @@ impl PyTable {
     ///         table = livetable.Table.from_csv("my_table", f.read())
     #[staticmethod]
     fn from_csv(name: &str, csv: &str) -> PyResult<Self> {
-        let table = RustTable::from_csv(name, csv)
-            .map_err(|e| PyValueError::new_err(e))?;
+        let table = RustTable::from_csv(name, csv).map_err(|e| PyValueError::new_err(e))?;
         Ok(PyTable {
             inner: Rc::new(RefCell::new(table)),
             registered_views: Rc::new(RefCell::new(Vec::new())),
@@ -1516,8 +1642,7 @@ impl PyTable {
     ///         table = livetable.Table.from_json("my_table", f.read())
     #[staticmethod]
     fn from_json(name: &str, json: &str) -> PyResult<Self> {
-        let table = RustTable::from_json(name, json)
-            .map_err(|e| PyValueError::new_err(e))?;
+        let table = RustTable::from_json(name, json).map_err(|e| PyValueError::new_err(e))?;
         Ok(PyTable {
             inner: Rc::new(RefCell::new(table)),
             registered_views: Rc::new(RefCell::new(Vec::new())),
@@ -1539,23 +1664,27 @@ impl PyTable {
     ///     print(df.describe())
     fn to_pandas(&self, py: Python) -> PyResult<PyObject> {
         // Import pandas
-        let pandas = py.import_bound("pandas")
-            .map_err(|_| PyValueError::new_err(
-                "pandas is not installed. Install with: pip install pandas"
-            ))?;
+        let pandas = py.import_bound("pandas").map_err(|_| {
+            PyValueError::new_err("pandas is not installed. Install with: pip install pandas")
+        })?;
 
         // Collect all data into owned Rust structures while holding the borrow,
         // then release the borrow before making Python calls (avoids RefCell
         // conflicts if Python GC triggers a finalizer that accesses this table).
         let (column_names, column_data): (Vec<String>, Vec<Vec<RustColumnValue>>) = {
             let table = self.inner.borrow();
-            let names: Vec<String> = table.schema().get_column_names()
-                .iter().map(|s| s.to_string()).collect();
+            let names: Vec<String> = table
+                .schema()
+                .get_column_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             let mut data = Vec::with_capacity(names.len());
             for col_name in &names {
                 let mut col_values = Vec::with_capacity(table.len());
                 for row_idx in 0..table.len() {
-                    let value = table.get_value(row_idx, col_name)
+                    let value = table
+                        .get_value(row_idx, col_name)
                         .map_err(|e| PyValueError::new_err(e))?;
                     col_values.push(value);
                 }
@@ -1642,7 +1771,8 @@ impl PyTable {
                 rust_row.insert(col_name.clone(), col_value);
             }
 
-            table.append_row(rust_row)
+            table
+                .append_row(rust_row)
                 .map_err(|e| PyValueError::new_err(e))?;
         }
 
@@ -1676,7 +1806,7 @@ impl PyTable {
             return Ok(0);
         }
 
-        let views = self.registered_views.borrow();
+        let views = self.live_registered_views();
         let mut synced_count = 0;
         let mut min_cursor = self.inner.borrow().changeset().total_len();
 
@@ -1685,19 +1815,19 @@ impl PyTable {
             return Ok(0);
         }
 
-        for view in views.iter() {
+        for view in views {
             match view {
-                RegisteredView::Filter(inner) => {
+                ActiveRegisteredView::Filter(inner) => {
                     inner.borrow_mut().sync(py)?;
                     min_cursor = min_cursor.min(inner.borrow().last_processed_change_count);
                     synced_count += 1;
                 }
-                RegisteredView::Sorted(inner) => {
+                ActiveRegisteredView::Sorted(inner) => {
                     inner.borrow_mut().sync();
                     min_cursor = min_cursor.min(inner.borrow().last_processed_change_count());
                     synced_count += 1;
                 }
-                RegisteredView::Aggregate(inner) => {
+                ActiveRegisteredView::Aggregate(inner) => {
                     inner.borrow_mut().sync();
                     min_cursor = min_cursor.min(inner.borrow().last_processed_change_count());
                     synced_count += 1;
@@ -1713,7 +1843,7 @@ impl PyTable {
 
     /// Get the number of registered views that will be synced by tick().
     fn registered_view_count(&self) -> usize {
-        self.registered_views.borrow().len()
+        self.live_registered_views().len()
     }
 }
 
@@ -1723,6 +1853,14 @@ impl Clone for PyTable {
             inner: Rc::clone(&self.inner),
             registered_views: Rc::clone(&self.registered_views),
         }
+    }
+}
+
+impl PyTable {
+    fn live_registered_views(&self) -> Vec<ActiveRegisteredView> {
+        let mut views = self.registered_views.borrow_mut();
+        views.retain(RegisteredView::is_alive);
+        views.iter().filter_map(RegisteredView::upgrade).collect()
     }
 }
 
@@ -1771,9 +1909,7 @@ impl PyFilterView {
     }
 
     fn refresh(&mut self) -> PyResult<()> {
-        Python::with_gil(|py| {
-            self.inner.borrow_mut().refresh(py)
-        })
+        Python::with_gil(|py| self.inner.borrow_mut().refresh(py))
     }
 
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
@@ -1798,7 +1934,8 @@ impl PyFilterView {
             }
             if idx < 0 || idx as usize >= view_len {
                 return Err(PyIndexError::new_err(format!(
-                    "index {} out of range for view with {} rows", key, view_len
+                    "index {} out of range for view with {} rows",
+                    key, view_len
                 )));
             }
             return self.get_row(py, idx as usize);
@@ -1899,8 +2036,11 @@ impl PyProjectionView {
     }
 
     fn __repr__(&self) -> String {
-        format!("ProjectionView(columns={:?}, rows={})",
-                self.columns, self.table.inner.borrow().len())
+        format!(
+            "ProjectionView(columns={:?}, rows={})",
+            self.columns,
+            self.table.inner.borrow().len()
+        )
     }
 
     fn column_names(&self) -> Vec<String> {
@@ -1908,7 +2048,10 @@ impl PyProjectionView {
     }
 
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        let full_row = self.table.inner.borrow()
+        let full_row = self
+            .table
+            .inner
+            .borrow()
             .get_row(index)
             .map_err(|e| PyIndexError::new_err(e))?;
 
@@ -1926,10 +2069,13 @@ impl PyProjectionView {
         let view_len = self.table.inner.borrow().len();
 
         if let Ok(mut idx) = key.extract::<isize>() {
-            if idx < 0 { idx += view_len as isize; }
+            if idx < 0 {
+                idx += view_len as isize;
+            }
             if idx < 0 || idx as usize >= view_len {
                 return Err(PyIndexError::new_err(format!(
-                    "index {} out of range for view with {} rows", key, view_len
+                    "index {} out of range for view with {} rows",
+                    key, view_len
                 )));
             }
             return self.get_row(py, idx as usize);
@@ -1962,7 +2108,10 @@ impl PyProjectionView {
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
         if !self.columns.contains(&column.to_string()) {
-            return Err(PyKeyError::new_err(format!("Column '{}' not in projection", column)));
+            return Err(PyKeyError::new_err(format!(
+                "Column '{}' not in projection",
+                column
+            )));
         }
 
         self.table.get_value(py, row, column)
@@ -2007,8 +2156,11 @@ impl PyComputedView {
     }
 
     fn __repr__(&self) -> String {
-        format!("ComputedView(computed_column='{}', rows={})",
-                self.computed_column_name, self.table.inner.borrow().len())
+        format!(
+            "ComputedView(computed_column='{}', rows={})",
+            self.computed_column_name,
+            self.table.inner.borrow().len()
+        )
     }
 
     fn column_names(&self) -> Vec<String> {
@@ -2018,7 +2170,10 @@ impl PyComputedView {
     }
 
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        let full_row = self.table.inner.borrow()
+        let full_row = self
+            .table
+            .inner
+            .borrow()
             .get_row(index)
             .map_err(|e| PyIndexError::new_err(e))?;
 
@@ -2046,10 +2201,13 @@ impl PyComputedView {
         let view_len = self.table.inner.borrow().len();
 
         if let Ok(mut idx) = key.extract::<isize>() {
-            if idx < 0 { idx += view_len as isize; }
+            if idx < 0 {
+                idx += view_len as isize;
+            }
             if idx < 0 || idx as usize >= view_len {
                 return Err(PyIndexError::new_err(format!(
-                    "index {} out of range for view with {} rows", key, view_len
+                    "index {} out of range for view with {} rows",
+                    key, view_len
                 )));
             }
             return self.get_row(py, idx as usize);
@@ -2083,7 +2241,10 @@ impl PyComputedView {
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
         if column == self.computed_column_name {
             // Need to compute this value
-            let full_row = self.table.inner.borrow()
+            let full_row = self
+                .table
+                .inner
+                .borrow()
                 .get_row(row)
                 .map_err(|e| PyIndexError::new_err(e))?;
 
@@ -2125,12 +2286,16 @@ pub struct PyJoinType {
 impl PyJoinType {
     #[classattr]
     fn LEFT() -> Self {
-        PyJoinType { inner: RustJoinType::Left }
+        PyJoinType {
+            inner: RustJoinType::Left,
+        }
     }
 
     #[classattr]
     fn INNER() -> Self {
-        PyJoinType { inner: RustJoinType::Inner }
+        PyJoinType {
+            inner: RustJoinType::Inner,
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -2179,7 +2344,8 @@ impl PyJoinView {
             left_keys_vec,
             right_keys_vec,
             join_type.inner,
-        ).map_err(|e| PyValueError::new_err(e))?;
+        )
+        .map_err(|e| PyValueError::new_err(e))?;
 
         Ok(PyJoinView {
             inner: Rc::new(RefCell::new(join)),
@@ -2204,7 +2370,9 @@ impl PyJoinView {
     }
 
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        let row = self.inner.borrow()
+        let row = self
+            .inner
+            .borrow()
             .get_row(index)
             .map_err(|e| PyIndexError::new_err(e))?;
 
@@ -2220,10 +2388,13 @@ impl PyJoinView {
         let view_len = self.inner.borrow().len();
 
         if let Ok(mut idx) = key.extract::<isize>() {
-            if idx < 0 { idx += view_len as isize; }
+            if idx < 0 {
+                idx += view_len as isize;
+            }
             if idx < 0 || idx as usize >= view_len {
                 return Err(PyIndexError::new_err(format!(
-                    "index {} out of range for view with {} rows", key, view_len
+                    "index {} out of range for view with {} rows",
+                    key, view_len
                 )));
             }
             return self.get_row(py, idx as usize);
@@ -2255,7 +2426,9 @@ impl PyJoinView {
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
-        let value = self.inner.borrow()
+        let value = self
+            .inner
+            .borrow()
             .get_value(row, column)
             .map_err(|e| PyKeyError::new_err(e))?;
 
@@ -2293,12 +2466,16 @@ pub struct PySortOrder {
 impl PySortOrder {
     #[classattr]
     fn ASCENDING() -> Self {
-        PySortOrder { inner: RustSortOrder::Ascending }
+        PySortOrder {
+            inner: RustSortOrder::Ascending,
+        }
     }
 
     #[classattr]
     fn DESCENDING() -> Self {
-        PySortOrder { inner: RustSortOrder::Descending }
+        PySortOrder {
+            inner: RustSortOrder::Descending,
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -2357,8 +2534,10 @@ impl PySortKey {
             RustSortOrder::Ascending => "ASCENDING",
             RustSortOrder::Descending => "DESCENDING",
         };
-        format!("SortKey(column='{}', order={}, nulls_first={})",
-                self.column, order_str, self.nulls_first)
+        format!(
+            "SortKey(column='{}', order={}, nulls_first={})",
+            self.column, order_str, self.nulls_first
+        )
     }
 
     #[getter]
@@ -2395,11 +2574,8 @@ impl PySortedView {
     fn new(name: String, table: PyTable, sort_keys: Vec<PySortKey>) -> PyResult<Self> {
         let rust_keys: Vec<RustSortKey> = sort_keys.iter().map(|k| k.to_rust()).collect();
 
-        let view = RustSortedView::new(
-            name,
-            table.inner.clone(),
-            rust_keys,
-        ).map_err(|e| PyValueError::new_err(e))?;
+        let view = RustSortedView::new(name, table.inner.clone(), rust_keys)
+            .map_err(|e| PyValueError::new_err(e))?;
 
         Ok(PySortedView {
             inner: Rc::new(RefCell::new(view)),
@@ -2424,7 +2600,9 @@ impl PySortedView {
     }
 
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        let row = self.inner.borrow()
+        let row = self
+            .inner
+            .borrow()
             .get_row(index)
             .map_err(|e| PyIndexError::new_err(e))?;
 
@@ -2440,10 +2618,13 @@ impl PySortedView {
         let view_len = self.inner.borrow().len();
 
         if let Ok(mut idx) = key.extract::<isize>() {
-            if idx < 0 { idx += view_len as isize; }
+            if idx < 0 {
+                idx += view_len as isize;
+            }
             if idx < 0 || idx as usize >= view_len {
                 return Err(PyIndexError::new_err(format!(
-                    "index {} out of range for view with {} rows", key, view_len
+                    "index {} out of range for view with {} rows",
+                    key, view_len
                 )));
             }
             return self.get_row(py, idx as usize);
@@ -2475,7 +2656,9 @@ impl PySortedView {
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
-        let value = self.inner.borrow()
+        let value = self
+            .inner
+            .borrow()
             .get_value(row, column)
             .map_err(|e| PyKeyError::new_err(e))?;
 
@@ -2526,48 +2709,63 @@ impl PyAggregateFunction {
     /// Sum of values
     #[classattr]
     fn SUM() -> Self {
-        PyAggregateFunction { inner: RustAggregateFunction::Sum }
+        PyAggregateFunction {
+            inner: RustAggregateFunction::Sum,
+        }
     }
 
     /// Count of non-null values
     #[classattr]
     fn COUNT() -> Self {
-        PyAggregateFunction { inner: RustAggregateFunction::Count }
+        PyAggregateFunction {
+            inner: RustAggregateFunction::Count,
+        }
     }
 
     /// Average of values
     #[classattr]
     fn AVG() -> Self {
-        PyAggregateFunction { inner: RustAggregateFunction::Avg }
+        PyAggregateFunction {
+            inner: RustAggregateFunction::Avg,
+        }
     }
 
     /// Minimum value
     #[classattr]
     fn MIN() -> Self {
-        PyAggregateFunction { inner: RustAggregateFunction::Min }
+        PyAggregateFunction {
+            inner: RustAggregateFunction::Min,
+        }
     }
 
     /// Maximum value
     #[classattr]
     fn MAX() -> Self {
-        PyAggregateFunction { inner: RustAggregateFunction::Max }
+        PyAggregateFunction {
+            inner: RustAggregateFunction::Max,
+        }
     }
 
     /// Median value (equivalent to PERCENTILE(0.5))
     #[classattr]
     fn MEDIAN() -> Self {
-        PyAggregateFunction { inner: RustAggregateFunction::Median }
+        PyAggregateFunction {
+            inner: RustAggregateFunction::Median,
+        }
     }
 
     /// Percentile value. p must be between 0.0 and 1.0 inclusive.
     #[staticmethod]
     fn PERCENTILE(p: f64) -> PyResult<Self> {
         if !(0.0..=1.0).contains(&p) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Percentile value must be between 0.0 and 1.0, got {}", p)
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Percentile value must be between 0.0 and 1.0, got {}",
+                p
+            )));
         }
-        Ok(PyAggregateFunction { inner: RustAggregateFunction::Percentile(p) })
+        Ok(PyAggregateFunction {
+            inner: RustAggregateFunction::Percentile(p),
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -2621,12 +2819,8 @@ impl PyAggregateView {
             .map(|(result, source, func)| (result, source, func.to_rust()))
             .collect();
 
-        let view = RustAggregateView::new(
-            name,
-            table.inner.clone(),
-            group_by,
-            rust_aggregations,
-        ).map_err(|e| PyValueError::new_err(e))?;
+        let view = RustAggregateView::new(name, table.inner.clone(), group_by, rust_aggregations)
+            .map_err(|e| PyValueError::new_err(e))?;
 
         Ok(PyAggregateView {
             inner: Rc::new(RefCell::new(view)),
@@ -2639,7 +2833,11 @@ impl PyAggregateView {
 
     fn __repr__(&self) -> String {
         let view = self.inner.borrow();
-        format!("AggregateView(name='{}', groups={})", view.name(), view.len())
+        format!(
+            "AggregateView(name='{}', groups={})",
+            view.name(),
+            view.len()
+        )
     }
 
     /// Get view name
@@ -2659,7 +2857,9 @@ impl PyAggregateView {
 
     /// Get a row by index as a dictionary
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        let row = self.inner.borrow()
+        let row = self
+            .inner
+            .borrow()
             .get_row(index)
             .map_err(|e| PyIndexError::new_err(e))?;
 
@@ -2713,14 +2913,14 @@ impl PyAggregateView {
             return Ok(list.to_object(py));
         }
 
-        Err(PyTypeError::new_err(
-            "indices must be integers or slices"
-        ))
+        Err(PyTypeError::new_err("indices must be integers or slices"))
     }
 
     /// Get a value at (row, column)
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
-        let value = self.inner.borrow()
+        let value = self
+            .inner
+            .borrow()
             .get_value(row, column)
             .map_err(|e| PyKeyError::new_err(e))?;
 

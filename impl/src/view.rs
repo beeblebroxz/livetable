@@ -1,15 +1,14 @@
+use crate::changeset::{IncrementalView, IndexAdjuster, TableChange};
 /// LiveTable View Implementation
 ///
 /// Views are read-only derived tables that automatically propagate changes from parent tables.
 /// This is a simplified implementation focusing on core functionality.
-
 use crate::column::ColumnValue;
 use crate::table::Table;
-use crate::changeset::{TableChange, IncrementalView, IndexAdjuster};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::cell::RefCell;
 
 /// A FilterView filters rows from the parent table based on a predicate.
 /// Maintains a mapping from view indices to parent indices.
@@ -49,6 +48,7 @@ impl FilterView {
     fn rebuild_index(&mut self) {
         self.view_to_parent.clear();
         let parent = self.parent.borrow();
+        self.view_to_parent.reserve(parent.len());
 
         for i in 0..parent.len() {
             if let Ok(row) = parent.get_row(i) {
@@ -94,7 +94,10 @@ impl FilterView {
     /// Returns true if any changes were applied
     pub fn sync(&mut self) -> bool {
         let parent = self.parent.borrow();
-        let changes = match parent.changeset().changes_from(self.last_processed_change_count) {
+        let changes = match parent
+            .changeset()
+            .changes_from(self.last_processed_change_count)
+        {
             Some(changes) => changes,
             None => {
                 drop(parent);
@@ -140,7 +143,8 @@ impl IncrementalView for FilterView {
                     // Check if the new row matches the predicate
                     if (self.predicate)(data) {
                         // Find where to insert in view_to_parent to maintain sorted order
-                        let insert_pos = self.view_to_parent
+                        let insert_pos = self
+                            .view_to_parent
                             .iter()
                             .position(|&parent_idx| parent_idx > *index)
                             .unwrap_or(self.view_to_parent.len());
@@ -151,7 +155,8 @@ impl IncrementalView for FilterView {
 
                 TableChange::RowDeleted { index, .. } => {
                     // Find indices that need to be removed and adjust others
-                    let to_remove = IndexAdjuster::adjust_mapping_for_delete(&mut self.view_to_parent, *index);
+                    let to_remove =
+                        IndexAdjuster::adjust_mapping_for_delete(&mut self.view_to_parent, *index);
 
                     // Remove from back to front to maintain valid indices
                     for view_idx in to_remove.into_iter().rev() {
@@ -165,7 +170,9 @@ impl IncrementalView for FilterView {
                     let currently_in_view = self.view_to_parent.contains(row);
 
                     // Re-evaluate the predicate for this row
-                    let now_matches = self.parent.borrow()
+                    let now_matches = self
+                        .parent
+                        .borrow()
                         .get_row(*row)
                         .map(|data| (self.predicate)(&data))
                         .unwrap_or(false);
@@ -173,7 +180,8 @@ impl IncrementalView for FilterView {
                     match (currently_in_view, now_matches) {
                         (false, true) => {
                             // Row now matches - add it
-                            let insert_pos = self.view_to_parent
+                            let insert_pos = self
+                                .view_to_parent
                                 .iter()
                                 .position(|&parent_idx| parent_idx > *row)
                                 .unwrap_or(self.view_to_parent.len());
@@ -182,7 +190,9 @@ impl IncrementalView for FilterView {
                         }
                         (true, false) => {
                             // Row no longer matches - remove it
-                            if let Some(pos) = self.view_to_parent.iter().position(|&idx| idx == *row) {
+                            if let Some(pos) =
+                                self.view_to_parent.iter().position(|&idx| idx == *row)
+                            {
                                 self.view_to_parent.remove(pos);
                                 modified = true;
                             }
@@ -215,7 +225,11 @@ pub struct ProjectionView {
 }
 
 impl ProjectionView {
-    pub fn new(name: String, parent: Rc<RefCell<Table>>, columns: Vec<String>) -> Result<Self, String> {
+    pub fn new(
+        name: String,
+        parent: Rc<RefCell<Table>>,
+        columns: Vec<String>,
+    ) -> Result<Self, String> {
         // Validate columns exist
         {
             let parent_borrowed = parent.borrow();
@@ -244,7 +258,7 @@ impl ProjectionView {
 
     pub fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String> {
         let full_row = self.parent.borrow().get_row(index)?;
-        let mut result = HashMap::new();
+        let mut result = HashMap::with_capacity(self.selected_columns.len());
 
         for col in &self.selected_columns {
             if let Some(value) = full_row.get(col) {
@@ -392,8 +406,12 @@ pub struct JoinView {
     /// Column names in right table to join on (supports multi-column joins)
     right_keys: Vec<String>,
     join_type: JoinType,
-    /// Cached joined rows: (left_row_index, optional_right_row_index)
-    join_index: Vec<(usize, Option<usize>)>,
+    /// Cached joined rows: (optional_left_row_index, optional_right_row_index)
+    /// - INNER: always (Some(left), Some(right))
+    /// - LEFT: (Some(left), Some(right)) or (Some(left), None)
+    /// - RIGHT: (Some(left), Some(right)) or (None, Some(right))
+    /// - FULL: all three patterns
+    join_index: Vec<(Option<usize>, Option<usize>)>,
     /// Last synced generation from left table's changeset
     left_last_synced: u64,
     /// Last synced generation from right table's changeset
@@ -427,7 +445,14 @@ impl JoinView {
         right_key: String,
         join_type: JoinType,
     ) -> Result<Self, String> {
-        Self::new_multi(name, left_table, right_table, vec![left_key], vec![right_key], join_type)
+        Self::new_multi(
+            name,
+            left_table,
+            right_table,
+            vec![left_key],
+            vec![right_key],
+            join_type,
+        )
     }
 
     /// Creates a new join view with multi-column join keys.
@@ -542,11 +567,7 @@ impl JoinView {
     /// Returns None if any key column contains NULL (SQL semantics: NULL != NULL)
     /// This is the fast path - uses pre-computed column indices.
     /// Optimized to minimize allocations for common types.
-    fn build_key_from_indices(
-        table: &Table,
-        row: usize,
-        col_indices: &[usize],
-    ) -> Option<String> {
+    fn build_key_from_indices(table: &Table, row: usize, col_indices: &[usize]) -> Option<String> {
         // Fast path for single-column join (most common case)
         if col_indices.len() == 1 {
             return match table.get_value_by_index(row, col_indices[0]) {
@@ -575,25 +596,26 @@ impl JoinView {
     }
 
     /// Rebuilds the join index by scanning both tables.
-    /// Optimized to use direct column access instead of building HashMaps per row.
+    /// Unified 4-phase algorithm for all join types (INNER, LEFT, RIGHT, FULL).
     fn rebuild_index(&mut self) {
         self.join_index.clear();
 
         let left = self.left_table.borrow();
         let right = self.right_table.borrow();
 
-        // Pre-compute column indices for join keys (done once, not per row)
-        let left_col_indices: Vec<usize> = self.left_keys
+        // Phase 1: Pre-compute column indices for join keys (done once, not per row)
+        let left_col_indices: Vec<usize> = self
+            .left_keys
             .iter()
             .filter_map(|k| left.schema().get_column_index(k))
             .collect();
-        let right_col_indices: Vec<usize> = self.right_keys
+        let right_col_indices: Vec<usize> = self
+            .right_keys
             .iter()
             .filter_map(|k| right.schema().get_column_index(k))
             .collect();
 
-        // Build a hashmap of right table values for efficient lookup
-        // Uses direct column access instead of get_row()
+        // Phase 2: Build a hashmap of right table values for efficient lookup
         let mut right_index: HashMap<String, Vec<usize>> = HashMap::new();
 
         for i in 0..right.len() {
@@ -602,28 +624,46 @@ impl JoinView {
             }
         }
 
-        // For each left row, find matching right rows
+        // Phase 3: Scan left rows — find matching right rows
+        let mut matched_right: HashSet<usize> = HashSet::new();
+
         for i in 0..left.len() {
             if let Some(key_str) = Self::build_key_from_indices(&left, i, &left_col_indices) {
                 if let Some(matching_indices) = right_index.get(&key_str) {
                     // Found matches - add each combination
                     for &right_idx in matching_indices {
-                        self.join_index.push((i, Some(right_idx)));
+                        self.join_index.push((Some(i), Some(right_idx)));
+                        matched_right.insert(right_idx);
                     }
                 } else {
-                    // No match
+                    // Non-NULL key, no match
                     match self.join_type {
-                        JoinType::Left => {
-                            // Include left row with null right values
-                            self.join_index.push((i, None));
+                        JoinType::Left | JoinType::Full => {
+                            self.join_index.push((Some(i), None));
                         }
-                        JoinType::Inner => {
+                        JoinType::Inner | JoinType::Right => {
                             // Skip - no match means not included
                         }
-                        JoinType::Right | JoinType::Full => {
-                            todo!("RIGHT/FULL join rebuild not yet implemented")
-                        }
                     }
+                }
+            } else {
+                // NULL key — row exists but can never match anything
+                match self.join_type {
+                    JoinType::Left | JoinType::Full => {
+                        self.join_index.push((Some(i), None));
+                    }
+                    JoinType::Inner | JoinType::Right => {
+                        // Skip
+                    }
+                }
+            }
+        }
+
+        // Phase 4: (RIGHT/FULL only) Scan right rows for unmatched entries
+        if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
+            for i in 0..right.len() {
+                if !matched_right.contains(&i) {
+                    self.join_index.push((None, Some(i)));
                 }
             }
         }
@@ -641,7 +681,8 @@ impl JoinView {
         let mut right_index: HashMap<String, Vec<usize>> = HashMap::new();
 
         // Pre-compute column indices
-        let right_col_indices: Vec<usize> = self.right_keys
+        let right_col_indices: Vec<usize> = self
+            .right_keys
             .iter()
             .filter_map(|k| right.schema().get_column_index(k))
             .collect();
@@ -653,6 +694,41 @@ impl JoinView {
         }
 
         right_index
+    }
+
+    fn find_left_insert_position(&self, left_idx: usize) -> usize {
+        // None left indices always sort after all Some entries
+        self.join_index
+            .iter()
+            .position(|(existing_left, _)| match existing_left {
+                Some(el) => *el > left_idx,
+                None => true, // None-left entries (unmatched right) are always after
+            })
+            .unwrap_or(self.join_index.len())
+    }
+
+    fn find_right_insert_position(&self, left_idx: usize, right_idx: usize) -> usize {
+        self.join_index
+            .iter()
+            .position(|(existing_left, existing_right)| {
+                match existing_left {
+                    Some(el) => {
+                        if *el > left_idx {
+                            return true;
+                        }
+                        if *el < left_idx {
+                            return false;
+                        }
+                        // Same left index: order by right index
+                        match existing_right {
+                            Some(existing_right_idx) => *existing_right_idx > right_idx,
+                            None => true,
+                        }
+                    }
+                    None => true, // None-left entries are always after
+                }
+            })
+            .unwrap_or(self.join_index.len())
     }
 
     /// Returns the number of rows in the joined result
@@ -674,26 +750,32 @@ impl JoinView {
             return Err(format!("Index {} out of range [0, {})", index, self.len()));
         }
 
-        let (left_idx, right_idx_opt) = self.join_index[index];
+        let (left_idx_opt, right_idx_opt) = self.join_index[index];
 
-        let mut result = HashMap::new();
+        let left_schema = self.left_table.borrow().schema().clone();
+        let right_schema = self.right_table.borrow().schema().clone();
+        let mut result = HashMap::with_capacity(left_schema.len() + right_schema.len());
 
-        // Add all columns from left table
-        let left_row = self.left_table.borrow().get_row(left_idx)?;
-        result.extend(left_row);
+        // Add all columns from left table (or nulls if no left match)
+        if let Some(left_idx) = left_idx_opt {
+            let left_row = self.left_table.borrow().get_row(left_idx)?;
+            result.extend(left_row);
+        } else {
+            // No left match - add null values for all left columns
+            for col_name in left_schema.get_column_names() {
+                result.insert(col_name.to_string(), ColumnValue::Null);
+            }
+        }
 
         // Add columns from right table (or nulls if no match)
         if let Some(right_idx) = right_idx_opt {
             let right_row = self.right_table.borrow().get_row(right_idx)?;
             // Add right columns, prefixing with "right_" to avoid collisions
             for (col_name, value) in right_row {
-                // All columns are included with "right_" prefix
-                // (join keys are included to allow verification if needed)
                 result.insert(format!("right_{}", col_name), value);
             }
         } else {
             // No match - add null values for all right columns
-            let right_schema = self.right_table.borrow().schema().clone();
             for col_name in right_schema.get_column_names() {
                 result.insert(format!("right_{}", col_name), ColumnValue::Null);
             }
@@ -704,11 +786,45 @@ impl JoinView {
 
     /// Gets a specific value from the joined view
     pub fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
-        let full_row = self.get_row(row)?;
-        full_row
-            .get(column)
-            .cloned()
-            .ok_or_else(|| format!("Column '{}' not found in joined view", column))
+        if row >= self.join_index.len() {
+            return Err(format!("Row {} out of range [0, {})", row, self.len()));
+        }
+
+        let (left_idx_opt, right_idx_opt) = self.join_index[row];
+        if let Some(right_column) = column.strip_prefix("right_") {
+            if self
+                .right_table
+                .borrow()
+                .schema()
+                .get_column_index(right_column)
+                .is_none()
+            {
+                return Err(format!("Column '{}' not found in joined view", column));
+            }
+
+            return match right_idx_opt {
+                Some(right_idx) => self.right_table.borrow().get_value(right_idx, right_column),
+                None => Ok(ColumnValue::Null),
+            };
+        }
+
+        // Left column
+        match left_idx_opt {
+            Some(left_idx) => self.left_table.borrow().get_value(left_idx, column),
+            None => {
+                // Verify the column exists in left schema
+                if self
+                    .left_table
+                    .borrow()
+                    .schema()
+                    .get_column_index(column)
+                    .is_none()
+                {
+                    return Err(format!("Column '{}' not found in joined view", column));
+                }
+                Ok(ColumnValue::Null)
+            }
+        }
     }
 
     /// Refreshes the join index after tables have changed
@@ -799,29 +915,41 @@ impl JoinView {
         let mut modified = false;
 
         // Handle left table inserts — build right lookup once, not per insert
-        let has_left_inserts = left_changes.iter().any(|c| matches!(c, TableChange::RowInserted { .. }));
-        let right_lookup = if has_left_inserts { Some(self.build_right_lookup()) } else { None };
+        let has_left_inserts = left_changes
+            .iter()
+            .any(|c| matches!(c, TableChange::RowInserted { .. }));
+        let right_lookup = if has_left_inserts {
+            Some(self.build_right_lookup())
+        } else {
+            None
+        };
 
         for change in &left_changes {
             if let TableChange::RowInserted { index, data } = change {
                 // Adjust existing left indices
-                for (left_idx, _) in self.join_index.iter_mut() {
-                    if *left_idx >= *index {
-                        *left_idx += 1;
+                for (left_idx_opt, _) in self.join_index.iter_mut() {
+                    if let Some(left_idx) = left_idx_opt {
+                        if *left_idx >= *index {
+                            *left_idx += 1;
+                        }
                     }
                 }
 
                 // Find matches for the new left row
                 if let Some(key_str) = Self::build_composite_key(data, &self.left_keys) {
                     let lookup = right_lookup.as_ref().unwrap();
+                    let insert_pos = self.find_left_insert_position(*index);
 
                     if let Some(matching_indices) = lookup.get(&key_str) {
-                        for &right_idx in matching_indices {
-                            self.join_index.push((*index, Some(right_idx)));
+                        for (offset, &right_idx) in matching_indices.iter().enumerate() {
+                            self.join_index
+                                .insert(insert_pos + offset, (Some(*index), Some(right_idx)));
                             modified = true;
                         }
-                    } else if self.join_type == JoinType::Left {
-                        self.join_index.push((*index, None));
+                    } else if self.join_type == JoinType::Left
+                        || self.join_type == JoinType::Full
+                    {
+                        self.join_index.insert(insert_pos, (Some(*index), None));
                         modified = true;
                     }
                 }
@@ -830,7 +958,11 @@ impl JoinView {
 
         // Handle right table inserts
         for change in &right_changes {
-            if let TableChange::RowInserted { index: right_idx, data } = change {
+            if let TableChange::RowInserted {
+                index: right_idx,
+                data,
+            } = change
+            {
                 // Adjust existing right indices
                 for (_, right_opt) in self.join_index.iter_mut() {
                     if let Some(r_idx) = right_opt {
@@ -845,37 +977,78 @@ impl JoinView {
                     let left = self.left_table.borrow();
 
                     // Pre-compute left column indices for fast access
-                    let left_col_indices: Vec<usize> = self.left_keys
+                    let left_col_indices: Vec<usize> = self
+                        .left_keys
                         .iter()
                         .filter_map(|k| left.schema().get_column_index(k))
                         .collect();
 
+                    let mut any_match = false;
                     for left_idx in 0..left.len() {
                         // Use fast direct column access instead of get_row()
-                        if let Some(left_key_str) = Self::build_key_from_indices(&left, left_idx, &left_col_indices) {
+                        if let Some(left_key_str) =
+                            Self::build_key_from_indices(&left, left_idx, &left_col_indices)
+                        {
                             if left_key_str == right_key_str {
-                                // For left joins, we might need to replace a (left_idx, None)
-                                // with (left_idx, Some(right_idx))
-                                if self.join_type == JoinType::Left {
+                                any_match = true;
+                                // For left/full joins, we might need to replace a
+                                // (Some(left_idx), None) with (Some(left_idx), Some(right_idx))
+                                if self.join_type == JoinType::Left
+                                    || self.join_type == JoinType::Full
+                                {
                                     // Check if there's an existing null match to replace
-                                    let existing_null = self.join_index.iter()
-                                        .position(|(l, r)| *l == left_idx && r.is_none());
+                                    let existing_null = self.join_index.iter().position(|(l, r)| {
+                                        *l == Some(left_idx) && r.is_none()
+                                    });
 
                                     if let Some(pos) = existing_null {
-                                        self.join_index[pos] = (left_idx, Some(*right_idx));
+                                        self.join_index[pos] =
+                                            (Some(left_idx), Some(*right_idx));
                                     } else {
-                                        self.join_index.push((left_idx, Some(*right_idx)));
+                                        let insert_pos =
+                                            self.find_right_insert_position(left_idx, *right_idx);
+                                        self.join_index.insert(
+                                            insert_pos,
+                                            (Some(left_idx), Some(*right_idx)),
+                                        );
                                     }
                                 } else {
-                                    self.join_index.push((left_idx, Some(*right_idx)));
+                                    let insert_pos =
+                                        self.find_right_insert_position(left_idx, *right_idx);
+                                    self.join_index.insert(
+                                        insert_pos,
+                                        (Some(left_idx), Some(*right_idx)),
+                                    );
                                 }
                                 modified = true;
                             }
                         }
                     }
+
+                    // RIGHT/FULL: if no left match, append as unmatched right row
+                    if !any_match
+                        && (self.join_type == JoinType::Right
+                            || self.join_type == JoinType::Full)
+                    {
+                        self.join_index.push((None, Some(*right_idx)));
+                        modified = true;
+                    }
+                } else {
+                    // NULL key on right — for RIGHT/FULL, add as unmatched
+                    if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
+                        self.join_index.push((None, Some(*right_idx)));
+                        modified = true;
+                    }
                 }
             }
         }
+
+        let left_table = self.left_table.borrow();
+        let right_table = self.right_table.borrow();
+        self.left_last_processed_change_count = left_table.changeset().total_len();
+        self.right_last_processed_change_count = right_table.changeset().total_len();
+        self.left_last_synced = left_table.changeset_generation();
+        self.right_last_synced = right_table.changeset_generation();
 
         modified
     }
@@ -1051,16 +1224,19 @@ impl SortedView {
 
         // Pre-extract all sort key values (O(N) instead of O(N log N) get_value calls)
         let sort_keys = self.sort_keys.clone();
-        let sort_col_indices: Vec<usize> = sort_keys.iter()
+        let sort_col_indices: Vec<usize> = sort_keys
+            .iter()
             .filter_map(|key| table.schema().get_column_index(&key.column))
             .collect();
 
         // Pre-extract values for each sort key column
-        let sort_values: Vec<Vec<ColumnValue>> = sort_col_indices.iter()
+        let sort_values: Vec<Vec<ColumnValue>> = sort_col_indices
+            .iter()
             .map(|&col_idx| {
                 (0..len)
                     .map(|row_idx| {
-                        table.get_value_by_index(row_idx, col_idx)
+                        table
+                            .get_value_by_index(row_idx, col_idx)
                             .unwrap_or(ColumnValue::Null)
                     })
                     .collect()
@@ -1086,11 +1262,7 @@ impl SortedView {
     }
 
     /// Compare two column values by reference (avoids cloning)
-    fn compare_values_ref(
-        val_a: &ColumnValue,
-        val_b: &ColumnValue,
-        key: &SortKey,
-    ) -> Ordering {
+    fn compare_values_ref(val_a: &ColumnValue, val_b: &ColumnValue, key: &SortKey) -> Ordering {
         let a_is_null = val_a.is_null();
         let b_is_null = val_b.is_null();
 
@@ -1257,7 +1429,10 @@ impl SortedView {
     /// Returns true if any changes were applied
     pub fn sync(&mut self) -> bool {
         let parent = self.parent.borrow();
-        let changes = match parent.changeset().changes_from(self.last_processed_change_count) {
+        let changes = match parent
+            .changeset()
+            .changes_from(self.last_processed_change_count)
+        {
             Some(changes) => changes,
             None => {
                 drop(parent);
@@ -1338,7 +1513,8 @@ impl IncrementalView for SortedView {
                     if affects_sort {
                         // The row's sort position may have changed
                         // Remove from current position and re-insert at correct position
-                        if let Some(current_pos) = self.sorted_index.iter().position(|&i| i == *row) {
+                        if let Some(current_pos) = self.sorted_index.iter().position(|&i| i == *row)
+                        {
                             self.sorted_index.remove(current_pos);
                             let new_pos = self.find_insertion_position(*row);
                             self.sorted_index.insert(new_pos, *row);
@@ -1374,8 +1550,8 @@ pub enum AggregateFunction {
     Avg,
     Min,
     Max,
-    Percentile(f64),  // p value in 0.0..=1.0
-    Median,           // Sugar for Percentile(0.5)
+    Percentile(f64), // p value in 0.0..=1.0
+    Median,          // Sugar for Percentile(0.5)
 }
 
 /// Internal state for tracking aggregate statistics for one source column
@@ -1431,8 +1607,8 @@ impl ColumnAggState {
         }
 
         // Check if we need to recalculate min/max
-        let needs_recalc = self.min.map_or(false, |m| m == value)
-            || self.max.map_or(false, |m| m == value);
+        let needs_recalc =
+            self.min.map_or(false, |m| m == value) || self.max.map_or(false, |m| m == value);
 
         !needs_recalc
     }
@@ -1485,18 +1661,14 @@ impl ColumnAggState {
                     ColumnValue::Null
                 }
             }
-            AggregateFunction::Min => {
-                self.min.map_or(ColumnValue::Null, ColumnValue::Float64)
-            }
-            AggregateFunction::Max => {
-                self.max.map_or(ColumnValue::Null, ColumnValue::Float64)
-            }
-            AggregateFunction::Percentile(p) => {
-                self.percentile(p).map_or(ColumnValue::Null, ColumnValue::Float64)
-            }
-            AggregateFunction::Median => {
-                self.percentile(0.5).map_or(ColumnValue::Null, ColumnValue::Float64)
-            }
+            AggregateFunction::Min => self.min.map_or(ColumnValue::Null, ColumnValue::Float64),
+            AggregateFunction::Max => self.max.map_or(ColumnValue::Null, ColumnValue::Float64),
+            AggregateFunction::Percentile(p) => self
+                .percentile(p)
+                .map_or(ColumnValue::Null, ColumnValue::Float64),
+            AggregateFunction::Median => self
+                .percentile(0.5)
+                .map_or(ColumnValue::Null, ColumnValue::Float64),
         }
     }
 }
@@ -1524,7 +1696,8 @@ impl GroupState {
     /// Add a value for a specific source column
     fn add_column_value(&mut self, source_col: &str, value: f64) {
         let needs_sorted = self.percentile_columns.contains(source_col);
-        let stats = self.column_stats
+        let stats = self
+            .column_stats
             .entry(source_col.to_string())
             .or_insert_with(|| ColumnAggState::new(needs_sorted));
         stats.add_value(value);
@@ -1575,7 +1748,11 @@ impl GroupKey {
                         ColumnValue::Float32(f) => Some(format!("f{}", f)),
                         ColumnValue::Float64(f) => Some(format!("F{}", f)),
                         ColumnValue::String(s) => Some(format!("s{}", s)),
-                        ColumnValue::Bool(b) => Some(if *b { "B1".to_string() } else { "B0".to_string() }),
+                        ColumnValue::Bool(b) => Some(if *b {
+                            "B1".to_string()
+                        } else {
+                            "B0".to_string()
+                        }),
                         ColumnValue::Date(d) => Some(format!("d{}", d)),
                         ColumnValue::DateTime(dt) => Some(format!("D{}", dt)),
                     }
@@ -1599,7 +1776,11 @@ impl GroupKey {
                     Ok(ColumnValue::Float32(v)) => Some(format!("f{}", v)),
                     Ok(ColumnValue::Float64(v)) => Some(format!("F{}", v)),
                     Ok(ColumnValue::String(s)) => Some(format!("s{}", s)),
-                    Ok(ColumnValue::Bool(b)) => Some(if b { "B1".to_string() } else { "B0".to_string() }),
+                    Ok(ColumnValue::Bool(b)) => Some(if b {
+                        "B1".to_string()
+                    } else {
+                        "B0".to_string()
+                    }),
                     Ok(ColumnValue::Date(d)) => Some(format!("d{}", d)),
                     Ok(ColumnValue::DateTime(dt)) => Some(format!("D{}", dt)),
                     Err(_) => None,
@@ -1616,7 +1797,11 @@ impl GroupKey {
         GroupKey(vec![Some(format!("i{}", value))])
     }
 
-    fn to_column_values(&self, group_by: &[String], parent: &Table) -> HashMap<String, ColumnValue> {
+    fn to_column_values(
+        &self,
+        group_by: &[String],
+        parent: &Table,
+    ) -> HashMap<String, ColumnValue> {
         let mut result = HashMap::new();
         for (i, col_name) in group_by.iter().enumerate() {
             let value = match &self.0[i] {
@@ -1634,7 +1819,7 @@ impl GroupKey {
                                         ColumnValue::String(s[1..].to_string())
                                     // Old format: String("value")
                                     } else if s.starts_with("String(\"") && s.ends_with("\")") {
-                                        let inner = &s[8..s.len()-2];
+                                        let inner = &s[8..s.len() - 2];
                                         ColumnValue::String(inner.to_string())
                                     } else {
                                         ColumnValue::String(s.clone())
@@ -1643,11 +1828,17 @@ impl GroupKey {
                                 crate::column::ColumnType::Int32 => {
                                     // New format: i<value>
                                     if s.starts_with('i') {
-                                        s[1..].parse().map(ColumnValue::Int32).unwrap_or(ColumnValue::Null)
+                                        s[1..]
+                                            .parse()
+                                            .map(ColumnValue::Int32)
+                                            .unwrap_or(ColumnValue::Null)
                                     // Old format: Int32(value)
                                     } else if s.starts_with("Int32(") && s.ends_with(")") {
-                                        let inner = &s[6..s.len()-1];
-                                        inner.parse().map(ColumnValue::Int32).unwrap_or(ColumnValue::Null)
+                                        let inner = &s[6..s.len() - 1];
+                                        inner
+                                            .parse()
+                                            .map(ColumnValue::Int32)
+                                            .unwrap_or(ColumnValue::Null)
                                     } else {
                                         ColumnValue::Null
                                     }
@@ -1655,11 +1846,17 @@ impl GroupKey {
                                 crate::column::ColumnType::Int64 => {
                                     // New format: I<value>
                                     if s.starts_with('I') {
-                                        s[1..].parse().map(ColumnValue::Int64).unwrap_or(ColumnValue::Null)
+                                        s[1..]
+                                            .parse()
+                                            .map(ColumnValue::Int64)
+                                            .unwrap_or(ColumnValue::Null)
                                     // Old format: Int64(value)
                                     } else if s.starts_with("Int64(") && s.ends_with(")") {
-                                        let inner = &s[6..s.len()-1];
-                                        inner.parse().map(ColumnValue::Int64).unwrap_or(ColumnValue::Null)
+                                        let inner = &s[6..s.len() - 1];
+                                        inner
+                                            .parse()
+                                            .map(ColumnValue::Int64)
+                                            .unwrap_or(ColumnValue::Null)
                                     } else {
                                         ColumnValue::Null
                                     }
@@ -1667,7 +1864,10 @@ impl GroupKey {
                                 crate::column::ColumnType::Float32 => {
                                     // New format: f<value>
                                     if s.starts_with('f') {
-                                        s[1..].parse().map(ColumnValue::Float32).unwrap_or(ColumnValue::Null)
+                                        s[1..]
+                                            .parse()
+                                            .map(ColumnValue::Float32)
+                                            .unwrap_or(ColumnValue::Null)
                                     } else {
                                         ColumnValue::Null
                                     }
@@ -1675,7 +1875,10 @@ impl GroupKey {
                                 crate::column::ColumnType::Float64 => {
                                     // New format: F<value>
                                     if s.starts_with('F') {
-                                        s[1..].parse().map(ColumnValue::Float64).unwrap_or(ColumnValue::Null)
+                                        s[1..]
+                                            .parse()
+                                            .map(ColumnValue::Float64)
+                                            .unwrap_or(ColumnValue::Null)
                                     } else {
                                         ColumnValue::Null
                                     }
@@ -1693,7 +1896,10 @@ impl GroupKey {
                                 crate::column::ColumnType::Date => {
                                     // New format: d<days>
                                     if s.starts_with('d') {
-                                        s[1..].parse().map(ColumnValue::Date).unwrap_or(ColumnValue::Null)
+                                        s[1..]
+                                            .parse()
+                                            .map(ColumnValue::Date)
+                                            .unwrap_or(ColumnValue::Null)
                                     } else {
                                         ColumnValue::Null
                                     }
@@ -1701,7 +1907,10 @@ impl GroupKey {
                                 crate::column::ColumnType::DateTime => {
                                     // New format: D<milliseconds>
                                     if s.starts_with('D') {
-                                        s[1..].parse().map(ColumnValue::DateTime).unwrap_or(ColumnValue::Null)
+                                        s[1..]
+                                            .parse()
+                                            .map(ColumnValue::DateTime)
+                                            .unwrap_or(ColumnValue::Null)
                                     } else {
                                         ColumnValue::Null
                                     }
@@ -1774,7 +1983,10 @@ impl AggregateView {
             // Validate aggregation source columns exist
             for (_, source_col, _) in &aggregations {
                 if p.schema().get_column_index(source_col).is_none() {
-                    return Err(format!("Aggregation source column '{}' not found in table", source_col));
+                    return Err(format!(
+                        "Aggregation source column '{}' not found in table",
+                        source_col
+                    ));
                 }
             }
         }
@@ -1813,17 +2025,17 @@ impl AggregateView {
 
         // Pre-compute column indices for fast access
         let parent = self.parent.borrow();
-        let group_col_indices: Vec<usize> = self.group_by_columns
+        let group_col_indices: Vec<usize> = self
+            .group_by_columns
             .iter()
             .filter_map(|name| parent.schema().get_column_index(name))
             .collect();
 
         // Get unique source columns and their indices
-        let source_col_info: Vec<(usize, String)> = self.unique_source_columns()
+        let source_col_info: Vec<(usize, String)> = self
+            .unique_source_columns()
             .into_iter()
-            .filter_map(|col| {
-                parent.schema().get_column_index(&col).map(|idx| (idx, col))
-            })
+            .filter_map(|col| parent.schema().get_column_index(&col).map(|idx| (idx, col)))
             .collect();
 
         let num_rows = parent.len();
@@ -1923,7 +2135,8 @@ impl AggregateView {
                 let col_values: Vec<(String, f64)> = source_col_info
                     .iter()
                     .filter_map(|(col_idx, col_name)| {
-                        parent.get_value_by_index(row_idx, *col_idx)
+                        parent
+                            .get_value_by_index(row_idx, *col_idx)
                             .ok()
                             .and_then(|v| Self::extract_numeric(&v))
                             .map(|num| (col_name.clone(), num))
@@ -1983,8 +2196,14 @@ impl AggregateView {
 
     /// Get source columns that need sorted_values for percentile/median
     fn percentile_source_columns(&self) -> HashSet<String> {
-        self.aggregations.iter()
-            .filter(|(_, _, func)| matches!(func, AggregateFunction::Percentile(_) | AggregateFunction::Median))
+        self.aggregations
+            .iter()
+            .filter(|(_, _, func)| {
+                matches!(
+                    func,
+                    AggregateFunction::Percentile(_) | AggregateFunction::Median
+                )
+            })
             .map(|(_, source_col, _)| source_col.clone())
             .collect()
     }
@@ -2029,7 +2248,11 @@ impl AggregateView {
         }
     }
 
-    fn remove_row_from_aggregates(&mut self, row_idx: usize, row: &HashMap<String, ColumnValue>) -> bool {
+    fn remove_row_from_aggregates(
+        &mut self,
+        row_idx: usize,
+        row: &HashMap<String, ColumnValue>,
+    ) -> bool {
         let key = GroupKey::from_row(row, &self.group_by_columns);
 
         // Remove from row_to_group
@@ -2090,7 +2313,8 @@ impl AggregateView {
                 row_indices
                     .iter()
                     .filter_map(|&row_idx| {
-                        parent.get_value_by_index(row_idx, col_idx)
+                        parent
+                            .get_value_by_index(row_idx, col_idx)
                             .ok()
                             .and_then(|value| Self::extract_numeric(&value))
                     })
@@ -2149,7 +2373,9 @@ impl AggregateView {
 
         let key = &self.group_order[index];
         let parent = self.parent.borrow();
-        let mut result = key.to_column_values(&self.group_by_columns, &parent);
+        let mut result =
+            HashMap::with_capacity(self.group_by_columns.len() + self.aggregations.len());
+        result.extend(key.to_column_values(&self.group_by_columns, &parent));
 
         if let Some(state) = self.groups.get(key) {
             for (result_col, source_col, func) in &self.aggregations {
@@ -2171,7 +2397,10 @@ impl AggregateView {
         if self.group_by_columns.iter().any(|c| c == column) {
             let parent = self.parent.borrow();
             let values = key.to_column_values(&self.group_by_columns, &parent);
-            return values.get(column).cloned().ok_or_else(|| format!("Column '{}' not found", column));
+            return values
+                .get(column)
+                .cloned()
+                .ok_or_else(|| format!("Column '{}' not found", column));
         }
 
         // Check if it's an aggregation result column
@@ -2193,7 +2422,10 @@ impl AggregateView {
     /// Incrementally sync with parent table's changes
     pub fn sync(&mut self) -> bool {
         let parent = self.parent.borrow();
-        let changes = match parent.changeset().changes_from(self.last_processed_change_count) {
+        let changes = match parent
+            .changeset()
+            .changes_from(self.last_processed_change_count)
+        {
             Some(changes) => changes,
             None => {
                 drop(parent);
@@ -2242,7 +2474,12 @@ impl IncrementalView for AggregateView {
                     modified = true;
                 }
 
-                TableChange::CellUpdated { row, column, old_value, new_value } => {
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    new_value,
+                } => {
                     // Check if group-by column changed
                     if self.group_by_columns.contains(column) {
                         // Need to move row to a different group
@@ -2257,7 +2494,8 @@ impl IncrementalView for AggregateView {
                         modified = true;
                     } else {
                         // Check if aggregated column changed
-                        let affects_aggregation = self.aggregations.iter().any(|(_, src, _)| src == column);
+                        let affects_aggregation =
+                            self.aggregations.iter().any(|(_, src, _)| src == column);
                         if affects_aggregation {
                             // Update the aggregate values
                             if let Some(key) = self.row_to_group.get(row).cloned() {
@@ -2358,7 +2596,12 @@ impl AggregateView {
     }
 
     /// Reconstruct what a row looked like before a cell update
-    fn reconstruct_old_row(&self, row_idx: usize, changed_col: &str, old_value: &ColumnValue) -> Result<HashMap<String, ColumnValue>, String> {
+    fn reconstruct_old_row(
+        &self,
+        row_idx: usize,
+        changed_col: &str,
+        old_value: &ColumnValue,
+    ) -> Result<HashMap<String, ColumnValue>, String> {
         let parent = self.parent.borrow();
         let mut row = parent.get_row(row_idx)?;
         row.insert(changed_col.to_string(), old_value.clone());
@@ -2377,7 +2620,7 @@ mod tests {
     #[test]
     fn test_column_agg_state_percentile() {
         let mut state = ColumnAggState::new(true); // needs_sorted = true
-        // Values: 10, 20, 30, 40, 50
+                                                   // Values: 10, 20, 30, 40, 50
         for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
             state.add_value(v);
         }
@@ -2454,14 +2697,20 @@ mod tests {
             // North: 10, 20, 30, 40, 50  (median=30, p90=46)
             for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
                 let mut row = HashMap::new();
-                row.insert("region".to_string(), ColumnValue::String("North".to_string()));
+                row.insert(
+                    "region".to_string(),
+                    ColumnValue::String("North".to_string()),
+                );
                 row.insert("amount".to_string(), ColumnValue::Float64(v));
                 t.append_row(row).unwrap();
             }
             // South: 100, 200  (median=150)
             for v in [100.0, 200.0] {
                 let mut row = HashMap::new();
-                row.insert("region".to_string(), ColumnValue::String("South".to_string()));
+                row.insert(
+                    "region".to_string(),
+                    ColumnValue::String("South".to_string()),
+                );
                 row.insert("amount".to_string(), ColumnValue::Float64(v));
                 t.append_row(row).unwrap();
             }
@@ -2472,10 +2721,19 @@ mod tests {
             table.clone(),
             vec!["region".to_string()],
             vec![
-                ("median_amount".to_string(), "amount".to_string(), AggregateFunction::Median),
-                ("p90_amount".to_string(), "amount".to_string(), AggregateFunction::Percentile(0.9)),
+                (
+                    "median_amount".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Median,
+                ),
+                (
+                    "p90_amount".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Percentile(0.9),
+                ),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(agg.len(), 2);
 
@@ -2523,8 +2781,13 @@ mod tests {
             "test_agg".to_string(),
             table.clone(),
             vec!["group".to_string()],
-            vec![("median_val".to_string(), "val".to_string(), AggregateFunction::Median)],
-        ).unwrap();
+            vec![(
+                "median_val".to_string(),
+                "val".to_string(),
+                AggregateFunction::Median,
+            )],
+        )
+        .unwrap();
 
         // Median of [10, 20, 30] = 20.0
         let row = agg.get_row(0).unwrap();
@@ -2584,17 +2847,13 @@ mod tests {
         }
 
         // Create filter view: value > 20
-        let view = FilterView::new(
-            "filtered".to_string(),
-            table.clone(),
-            |row| {
-                if let Some(ColumnValue::Int32(v)) = row.get("value") {
-                    *v > 20
-                } else {
-                    false
-                }
-            },
-        );
+        let view = FilterView::new("filtered".to_string(), table.clone(), |row| {
+            if let Some(ColumnValue::Int32(v)) = row.get("value") {
+                *v > 20
+            } else {
+                false
+            }
+        });
 
         assert_eq!(view.len(), 2);
         assert_eq!(view.get_value(0, "id").unwrap().as_i32(), Some(2));
@@ -2624,17 +2883,13 @@ mod tests {
             t.append_row(row2).unwrap();
         }
 
-        let mut view = FilterView::new(
-            "active_only".to_string(),
-            table.clone(),
-            |row| {
-                if let Some(ColumnValue::Bool(active)) = row.get("active") {
-                    *active
-                } else {
-                    false
-                }
-            },
-        );
+        let mut view = FilterView::new("active_only".to_string(), table.clone(), |row| {
+            if let Some(ColumnValue::Bool(active)) = row.get("active") {
+                *active
+            } else {
+                false
+            }
+        });
 
         assert_eq!(view.len(), 1);
 
@@ -2667,7 +2922,10 @@ mod tests {
             let mut row = HashMap::new();
             row.insert("id".to_string(), ColumnValue::Int32(1));
             row.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
-            row.insert("secret".to_string(), ColumnValue::String("password123".to_string()));
+            row.insert(
+                "secret".to_string(),
+                ColumnValue::String("password123".to_string()),
+            );
             t.append_row(row).unwrap();
         }
 
@@ -2676,7 +2934,8 @@ mod tests {
             "public".to_string(),
             table.clone(),
             vec!["id".to_string(), "name".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(view.len(), 1);
 
@@ -2688,17 +2947,11 @@ mod tests {
 
     #[test]
     fn test_view_readonly() {
-        let schema = Schema::new(vec![
-            ("id".to_string(), ColumnType::Int32, false),
-        ]);
+        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
 
         let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
 
-        let view = FilterView::new(
-            "readonly".to_string(),
-            table.clone(),
-            |_| true,
-        );
+        let view = FilterView::new("readonly".to_string(), table.clone(), |_| true);
 
         // Views don't have mutation methods - they're read-only by design
         // This test just verifies the view exists and works
@@ -2773,7 +3026,10 @@ mod tests {
 
             let mut row3 = HashMap::new();
             row3.insert("user_id".to_string(), ColumnValue::Int32(3));
-            row3.insert("name".to_string(), ColumnValue::String("Charlie".to_string()));
+            row3.insert(
+                "name".to_string(),
+                ColumnValue::String("Charlie".to_string()),
+            );
             u.append_row(row3).unwrap();
         }
 
@@ -2783,7 +3039,10 @@ mod tests {
             ("user_id".to_string(), ColumnType::Int32, false),
             ("amount".to_string(), ColumnType::Float64, false),
         ]);
-        let orders = Rc::new(RefCell::new(Table::new("orders".to_string(), orders_schema)));
+        let orders = Rc::new(RefCell::new(Table::new(
+            "orders".to_string(),
+            orders_schema,
+        )));
 
         {
             let mut o = orders.borrow_mut();
@@ -2875,7 +3134,10 @@ mod tests {
             ("user_id".to_string(), ColumnType::Int32, false),
             ("amount".to_string(), ColumnType::Float64, false),
         ]);
-        let orders = Rc::new(RefCell::new(Table::new("orders".to_string(), orders_schema)));
+        let orders = Rc::new(RefCell::new(Table::new(
+            "orders".to_string(),
+            orders_schema,
+        )));
 
         {
             let mut o = orders.borrow_mut();
@@ -2924,7 +3186,10 @@ mod tests {
             ("order_id".to_string(), ColumnType::Int32, false),
             ("user_id".to_string(), ColumnType::Int32, false),
         ]);
-        let orders = Rc::new(RefCell::new(Table::new("orders".to_string(), orders_schema)));
+        let orders = Rc::new(RefCell::new(Table::new(
+            "orders".to_string(),
+            orders_schema,
+        )));
 
         let mut joined = JoinView::new(
             "user_orders".to_string(),
@@ -2959,6 +3224,254 @@ mod tests {
         assert_eq!(row.get("right_order_id").unwrap().as_i32(), Some(101));
     }
 
+    #[test]
+    fn test_join_sync_advances_cursors_and_is_idempotent() {
+        let users_schema = Schema::new(vec![
+            ("user_id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let users = Rc::new(RefCell::new(Table::new("users".to_string(), users_schema)));
+        users
+            .borrow_mut()
+            .append_row(HashMap::from([
+                ("user_id".to_string(), ColumnValue::Int32(1)),
+                ("name".to_string(), ColumnValue::String("Alice".to_string())),
+            ]))
+            .unwrap();
+
+        let orders_schema = Schema::new(vec![
+            ("order_id".to_string(), ColumnType::Int32, false),
+            ("user_id".to_string(), ColumnType::Int32, false),
+        ]);
+        let orders = Rc::new(RefCell::new(Table::new(
+            "orders".to_string(),
+            orders_schema,
+        )));
+
+        let mut joined = JoinView::new(
+            "user_orders".to_string(),
+            users.clone(),
+            orders.clone(),
+            "user_id".to_string(),
+            "user_id".to_string(),
+            JoinType::Left,
+        )
+        .unwrap();
+
+        orders
+            .borrow_mut()
+            .append_row(HashMap::from([
+                ("order_id".to_string(), ColumnValue::Int32(101)),
+                ("user_id".to_string(), ColumnValue::Int32(1)),
+            ]))
+            .unwrap();
+
+        assert!(joined.sync());
+        assert_eq!(joined.len(), 1);
+        assert_eq!(
+            joined.get_value(0, "right_order_id").unwrap().as_i32(),
+            Some(101)
+        );
+
+        let first_cursors = joined.last_processed_change_count();
+        assert!(!joined.sync());
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined.last_processed_change_count(), first_cursors);
+    }
+
+    #[test]
+    fn test_join_sync_preserves_full_rebuild_order_on_left_insert() {
+        let users_schema = Schema::new(vec![
+            ("user_id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let users = Rc::new(RefCell::new(Table::new("users".to_string(), users_schema)));
+        {
+            let mut users_ref = users.borrow_mut();
+            users_ref
+                .append_row(HashMap::from([
+                    ("user_id".to_string(), ColumnValue::Int32(1)),
+                    ("name".to_string(), ColumnValue::String("Alice".to_string())),
+                ]))
+                .unwrap();
+            users_ref
+                .append_row(HashMap::from([
+                    ("user_id".to_string(), ColumnValue::Int32(2)),
+                    ("name".to_string(), ColumnValue::String("Bob".to_string())),
+                ]))
+                .unwrap();
+        }
+
+        let orders_schema = Schema::new(vec![
+            ("order_id".to_string(), ColumnType::Int32, false),
+            ("user_id".to_string(), ColumnType::Int32, false),
+        ]);
+        let orders = Rc::new(RefCell::new(Table::new(
+            "orders".to_string(),
+            orders_schema,
+        )));
+        {
+            let mut orders_ref = orders.borrow_mut();
+            orders_ref
+                .append_row(HashMap::from([
+                    ("order_id".to_string(), ColumnValue::Int32(101)),
+                    ("user_id".to_string(), ColumnValue::Int32(1)),
+                ]))
+                .unwrap();
+            orders_ref
+                .append_row(HashMap::from([
+                    ("order_id".to_string(), ColumnValue::Int32(301)),
+                    ("user_id".to_string(), ColumnValue::Int32(3)),
+                ]))
+                .unwrap();
+            orders_ref
+                .append_row(HashMap::from([
+                    ("order_id".to_string(), ColumnValue::Int32(201)),
+                    ("user_id".to_string(), ColumnValue::Int32(2)),
+                ]))
+                .unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "user_orders".to_string(),
+            users.clone(),
+            orders.clone(),
+            "user_id".to_string(),
+            "user_id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+
+        users
+            .borrow_mut()
+            .insert_row(
+                1,
+                HashMap::from([
+                    ("user_id".to_string(), ColumnValue::Int32(3)),
+                    ("name".to_string(), ColumnValue::String("Carol".to_string())),
+                ]),
+            )
+            .unwrap();
+
+        assert!(joined.sync());
+        let incremental_rows: Vec<(String, i32)> = (0..joined.len())
+            .map(|idx| {
+                let row = joined.get_row(idx).unwrap();
+                (
+                    row.get("name").unwrap().as_string().unwrap().to_string(),
+                    row.get("right_order_id").unwrap().as_i32().unwrap(),
+                )
+            })
+            .collect();
+
+        joined.refresh();
+        let rebuilt_rows: Vec<(String, i32)> = (0..joined.len())
+            .map(|idx| {
+                let row = joined.get_row(idx).unwrap();
+                (
+                    row.get("name").unwrap().as_string().unwrap().to_string(),
+                    row.get("right_order_id").unwrap().as_i32().unwrap(),
+                )
+            })
+            .collect();
+
+        assert_eq!(incremental_rows, rebuilt_rows);
+        assert_eq!(
+            incremental_rows,
+            vec![
+                ("Alice".to_string(), 101),
+                ("Carol".to_string(), 301),
+                ("Bob".to_string(), 201),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_join_sync_preserves_full_rebuild_order_on_right_insert() {
+        let users_schema = Schema::new(vec![
+            ("user_id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let users = Rc::new(RefCell::new(Table::new("users".to_string(), users_schema)));
+        users
+            .borrow_mut()
+            .append_row(HashMap::from([
+                ("user_id".to_string(), ColumnValue::Int32(1)),
+                ("name".to_string(), ColumnValue::String("Alice".to_string())),
+            ]))
+            .unwrap();
+
+        let orders_schema = Schema::new(vec![
+            ("order_id".to_string(), ColumnType::Int32, false),
+            ("user_id".to_string(), ColumnType::Int32, false),
+        ]);
+        let orders = Rc::new(RefCell::new(Table::new(
+            "orders".to_string(),
+            orders_schema,
+        )));
+        {
+            let mut orders_ref = orders.borrow_mut();
+            orders_ref
+                .append_row(HashMap::from([
+                    ("order_id".to_string(), ColumnValue::Int32(101)),
+                    ("user_id".to_string(), ColumnValue::Int32(1)),
+                ]))
+                .unwrap();
+            orders_ref
+                .append_row(HashMap::from([
+                    ("order_id".to_string(), ColumnValue::Int32(301)),
+                    ("user_id".to_string(), ColumnValue::Int32(1)),
+                ]))
+                .unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "user_orders".to_string(),
+            users.clone(),
+            orders.clone(),
+            "user_id".to_string(),
+            "user_id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+
+        orders
+            .borrow_mut()
+            .insert_row(
+                1,
+                HashMap::from([
+                    ("order_id".to_string(), ColumnValue::Int32(201)),
+                    ("user_id".to_string(), ColumnValue::Int32(1)),
+                ]),
+            )
+            .unwrap();
+
+        assert!(joined.sync());
+        let incremental_order_ids: Vec<i32> = (0..joined.len())
+            .map(|idx| {
+                joined
+                    .get_value(idx, "right_order_id")
+                    .unwrap()
+                    .as_i32()
+                    .unwrap()
+            })
+            .collect();
+
+        joined.refresh();
+        let rebuilt_order_ids: Vec<i32> = (0..joined.len())
+            .map(|idx| {
+                joined
+                    .get_value(idx, "right_order_id")
+                    .unwrap()
+                    .as_i32()
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(incremental_order_ids, rebuilt_order_ids);
+        assert_eq!(incremental_order_ids, vec![101, 201, 301]);
+    }
+
     // === Incremental Propagation Tests ===
 
     #[test]
@@ -2985,17 +3498,13 @@ mod tests {
         }
 
         // Create filter view: value > 20
-        let mut view = FilterView::new(
-            "filtered".to_string(),
-            table.clone(),
-            |row| {
-                if let Some(ColumnValue::Int32(v)) = row.get("value") {
-                    *v > 20
-                } else {
-                    false
-                }
-            },
-        );
+        let mut view = FilterView::new("filtered".to_string(), table.clone(), |row| {
+            if let Some(ColumnValue::Int32(v)) = row.get("value") {
+                *v > 20
+            } else {
+                false
+            }
+        });
 
         // Clear initial changes so we can test incremental
         table.borrow_mut().clear_changeset();
@@ -3052,17 +3561,13 @@ mod tests {
         }
 
         // Filter: value > 20 (rows 3, 4, 5)
-        let mut view = FilterView::new(
-            "filtered".to_string(),
-            table.clone(),
-            |row| {
-                if let Some(ColumnValue::Int32(v)) = row.get("value") {
-                    *v > 20
-                } else {
-                    false
-                }
-            },
-        );
+        let mut view = FilterView::new("filtered".to_string(), table.clone(), |row| {
+            if let Some(ColumnValue::Int32(v)) = row.get("value") {
+                *v > 20
+            } else {
+                false
+            }
+        });
 
         table.borrow_mut().clear_changeset();
         assert_eq!(view.len(), 3);
@@ -3098,24 +3603,23 @@ mod tests {
             t.append_row(row2).unwrap();
         }
 
-        let mut view = FilterView::new(
-            "filtered".to_string(),
-            table.clone(),
-            |row| {
-                if let Some(ColumnValue::Int32(v)) = row.get("value") {
-                    *v > 20
-                } else {
-                    false
-                }
-            },
-        );
+        let mut view = FilterView::new("filtered".to_string(), table.clone(), |row| {
+            if let Some(ColumnValue::Int32(v)) = row.get("value") {
+                *v > 20
+            } else {
+                false
+            }
+        });
 
         table.borrow_mut().clear_changeset();
         assert_eq!(view.len(), 1);
 
         // Update row 0's value to 25 (now matches filter)
         {
-            table.borrow_mut().set_value(0, "value", ColumnValue::Int32(25)).unwrap();
+            table
+                .borrow_mut()
+                .set_value(0, "value", ColumnValue::Int32(25))
+                .unwrap();
         }
 
         view.sync();
@@ -3124,7 +3628,10 @@ mod tests {
         // Update row 1's value to 15 (no longer matches filter)
         table.borrow_mut().clear_changeset();
         {
-            table.borrow_mut().set_value(1, "value", ColumnValue::Int32(15)).unwrap();
+            table
+                .borrow_mut()
+                .set_value(1, "value", ColumnValue::Int32(15))
+                .unwrap();
         }
 
         view.sync();
@@ -3133,9 +3640,7 @@ mod tests {
 
     #[test]
     fn test_table_changeset_tracking() {
-        let schema = Schema::new(vec![
-            ("id".to_string(), ColumnType::Int32, false),
-        ]);
+        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
 
         let mut table = Table::new("test".to_string(), schema);
 
@@ -3181,7 +3686,10 @@ mod tests {
         {
             let mut t = table.borrow_mut();
             let mut row1 = HashMap::new();
-            row1.insert("name".to_string(), ColumnValue::String("Charlie".to_string()));
+            row1.insert(
+                "name".to_string(),
+                ColumnValue::String("Charlie".to_string()),
+            );
             row1.insert("score".to_string(), ColumnValue::Int32(75));
             t.append_row(row1).unwrap();
 
@@ -3201,12 +3709,22 @@ mod tests {
             "by_name".to_string(),
             table.clone(),
             vec![SortKey::ascending("name")],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(sorted.len(), 3);
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Alice"));
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Bob"));
-        assert_eq!(sorted.get_value(2, "name").unwrap().as_string(), Some("Charlie"));
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Alice")
+        );
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Bob")
+        );
+        assert_eq!(
+            sorted.get_value(2, "name").unwrap().as_string(),
+            Some("Charlie")
+        );
     }
 
     #[test]
@@ -3231,7 +3749,10 @@ mod tests {
             t.append_row(row2).unwrap();
 
             let mut row3 = HashMap::new();
-            row3.insert("name".to_string(), ColumnValue::String("Charlie".to_string()));
+            row3.insert(
+                "name".to_string(),
+                ColumnValue::String("Charlie".to_string()),
+            );
             row3.insert("score".to_string(), ColumnValue::Int32(85));
             t.append_row(row3).unwrap();
         }
@@ -3241,7 +3762,8 @@ mod tests {
             "by_score_desc".to_string(),
             table.clone(),
             vec![SortKey::descending("score")],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(sorted.len(), 3);
         assert_eq!(sorted.get_value(0, "score").unwrap().as_i32(), Some(92)); // Bob
@@ -3263,28 +3785,43 @@ mod tests {
             let mut t = table.borrow_mut();
             // Engineering - Alice
             let mut row = HashMap::new();
-            row.insert("department".to_string(), ColumnValue::String("Engineering".to_string()));
+            row.insert(
+                "department".to_string(),
+                ColumnValue::String("Engineering".to_string()),
+            );
             row.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
             row.insert("salary".to_string(), ColumnValue::Int32(100000));
             t.append_row(row).unwrap();
 
             // Sales - Bob
             let mut row = HashMap::new();
-            row.insert("department".to_string(), ColumnValue::String("Sales".to_string()));
+            row.insert(
+                "department".to_string(),
+                ColumnValue::String("Sales".to_string()),
+            );
             row.insert("name".to_string(), ColumnValue::String("Bob".to_string()));
             row.insert("salary".to_string(), ColumnValue::Int32(80000));
             t.append_row(row).unwrap();
 
             // Engineering - Charlie
             let mut row = HashMap::new();
-            row.insert("department".to_string(), ColumnValue::String("Engineering".to_string()));
-            row.insert("name".to_string(), ColumnValue::String("Charlie".to_string()));
+            row.insert(
+                "department".to_string(),
+                ColumnValue::String("Engineering".to_string()),
+            );
+            row.insert(
+                "name".to_string(),
+                ColumnValue::String("Charlie".to_string()),
+            );
             row.insert("salary".to_string(), ColumnValue::Int32(90000));
             t.append_row(row).unwrap();
 
             // Sales - Diana
             let mut row = HashMap::new();
-            row.insert("department".to_string(), ColumnValue::String("Sales".to_string()));
+            row.insert(
+                "department".to_string(),
+                ColumnValue::String("Sales".to_string()),
+            );
             row.insert("name".to_string(), ColumnValue::String("Diana".to_string()));
             row.insert("salary".to_string(), ColumnValue::Int32(85000));
             t.append_row(row).unwrap();
@@ -3298,17 +3835,30 @@ mod tests {
                 SortKey::ascending("department"),
                 SortKey::descending("salary"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(sorted.len(), 4);
 
         // Engineering first (Alice 100k, then Charlie 90k)
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Alice"));
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Charlie"));
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Alice")
+        );
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Charlie")
+        );
 
         // Sales second (Diana 85k, then Bob 80k)
-        assert_eq!(sorted.get_value(2, "name").unwrap().as_string(), Some("Diana"));
-        assert_eq!(sorted.get_value(3, "name").unwrap().as_string(), Some("Bob"));
+        assert_eq!(
+            sorted.get_value(2, "name").unwrap().as_string(),
+            Some("Diana")
+        );
+        assert_eq!(
+            sorted.get_value(3, "name").unwrap().as_string(),
+            Some("Bob")
+        );
     }
 
     #[test]
@@ -3333,7 +3883,10 @@ mod tests {
             t.append_row(row).unwrap();
 
             let mut row = HashMap::new();
-            row.insert("name".to_string(), ColumnValue::String("Charlie".to_string()));
+            row.insert(
+                "name".to_string(),
+                ColumnValue::String("Charlie".to_string()),
+            );
             row.insert("age".to_string(), ColumnValue::Int32(25));
             t.append_row(row).unwrap();
         }
@@ -3343,23 +3896,43 @@ mod tests {
             "by_age".to_string(),
             table.clone(),
             vec![SortKey::ascending("age")],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(sorted.len(), 3);
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Charlie")); // 25
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Alice"));   // 30
-        assert_eq!(sorted.get_value(2, "name").unwrap().as_string(), Some("Bob"));     // null
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Charlie")
+        ); // 25
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Alice")
+        ); // 30
+        assert_eq!(
+            sorted.get_value(2, "name").unwrap().as_string(),
+            Some("Bob")
+        ); // null
 
         // Sort by age ascending (nulls first)
         let sorted_nulls_first = SortedView::new(
             "by_age_nulls_first".to_string(),
             table.clone(),
             vec![SortKey::new("age", SortOrder::Ascending, true)],
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert_eq!(sorted_nulls_first.get_value(0, "name").unwrap().as_string(), Some("Bob"));      // null
-        assert_eq!(sorted_nulls_first.get_value(1, "name").unwrap().as_string(), Some("Charlie")); // 25
-        assert_eq!(sorted_nulls_first.get_value(2, "name").unwrap().as_string(), Some("Alice"));   // 30
+        assert_eq!(
+            sorted_nulls_first.get_value(0, "name").unwrap().as_string(),
+            Some("Bob")
+        ); // null
+        assert_eq!(
+            sorted_nulls_first.get_value(1, "name").unwrap().as_string(),
+            Some("Charlie")
+        ); // 25
+        assert_eq!(
+            sorted_nulls_first.get_value(2, "name").unwrap().as_string(),
+            Some("Alice")
+        ); // 30
     }
 
     #[test]
@@ -3388,12 +3961,19 @@ mod tests {
             "by_name".to_string(),
             table.clone(),
             vec![SortKey::ascending("name")],
-        ).unwrap();
+        )
+        .unwrap();
 
         table.borrow_mut().clear_changeset();
         assert_eq!(sorted.len(), 2);
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Bob"));
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Diana"));
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Bob")
+        );
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Diana")
+        );
 
         // Add Alice (should go first alphabetically)
         {
@@ -3407,26 +3987,50 @@ mod tests {
         let changed = sorted.sync();
         assert!(changed);
         assert_eq!(sorted.len(), 3);
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Alice"));
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Bob"));
-        assert_eq!(sorted.get_value(2, "name").unwrap().as_string(), Some("Diana"));
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Alice")
+        );
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Bob")
+        );
+        assert_eq!(
+            sorted.get_value(2, "name").unwrap().as_string(),
+            Some("Diana")
+        );
 
         // Add Charlie (should go between Bob and Diana)
         table.borrow_mut().clear_changeset();
         {
             let mut t = table.borrow_mut();
             let mut row = HashMap::new();
-            row.insert("name".to_string(), ColumnValue::String("Charlie".to_string()));
+            row.insert(
+                "name".to_string(),
+                ColumnValue::String("Charlie".to_string()),
+            );
             row.insert("score".to_string(), ColumnValue::Int32(80));
             t.append_row(row).unwrap();
         }
 
         sorted.sync();
         assert_eq!(sorted.len(), 4);
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Alice"));
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Bob"));
-        assert_eq!(sorted.get_value(2, "name").unwrap().as_string(), Some("Charlie"));
-        assert_eq!(sorted.get_value(3, "name").unwrap().as_string(), Some("Diana"));
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Alice")
+        );
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Bob")
+        );
+        assert_eq!(
+            sorted.get_value(2, "name").unwrap().as_string(),
+            Some("Charlie")
+        );
+        assert_eq!(
+            sorted.get_value(3, "name").unwrap().as_string(),
+            Some("Diana")
+        );
     }
 
     #[test]
@@ -3452,7 +4056,8 @@ mod tests {
             "by_name".to_string(),
             table.clone(),
             vec![SortKey::ascending("name")],
-        ).unwrap();
+        )
+        .unwrap();
 
         table.borrow_mut().clear_changeset();
         assert_eq!(sorted.len(), 4);
@@ -3462,9 +4067,18 @@ mod tests {
 
         sorted.sync();
         assert_eq!(sorted.len(), 3);
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Alice"));
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Charlie"));
-        assert_eq!(sorted.get_value(2, "name").unwrap().as_string(), Some("Diana"));
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Alice")
+        );
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Charlie")
+        );
+        assert_eq!(
+            sorted.get_value(2, "name").unwrap().as_string(),
+            Some("Diana")
+        );
     }
 
     #[test]
@@ -3489,7 +4103,10 @@ mod tests {
             t.append_row(row).unwrap();
 
             let mut row = HashMap::new();
-            row.insert("name".to_string(), ColumnValue::String("Charlie".to_string()));
+            row.insert(
+                "name".to_string(),
+                ColumnValue::String("Charlie".to_string()),
+            );
             row.insert("score".to_string(), ColumnValue::Int32(90));
             t.append_row(row).unwrap();
         }
@@ -3499,24 +4116,46 @@ mod tests {
             "by_score".to_string(),
             table.clone(),
             vec![SortKey::ascending("score")],
-        ).unwrap();
+        )
+        .unwrap();
 
         table.borrow_mut().clear_changeset();
 
         // Initial order: Alice (70), Bob (80), Charlie (90)
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Alice"));
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Bob"));
-        assert_eq!(sorted.get_value(2, "name").unwrap().as_string(), Some("Charlie"));
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Alice")
+        );
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Bob")
+        );
+        assert_eq!(
+            sorted.get_value(2, "name").unwrap().as_string(),
+            Some("Charlie")
+        );
 
         // Update Alice's score to 95 (should move to end)
-        table.borrow_mut().set_value(0, "score", ColumnValue::Int32(95)).unwrap();
+        table
+            .borrow_mut()
+            .set_value(0, "score", ColumnValue::Int32(95))
+            .unwrap();
 
         sorted.sync();
 
         // New order: Bob (80), Charlie (90), Alice (95)
-        assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Bob"));
-        assert_eq!(sorted.get_value(1, "name").unwrap().as_string(), Some("Charlie"));
-        assert_eq!(sorted.get_value(2, "name").unwrap().as_string(), Some("Alice"));
+        assert_eq!(
+            sorted.get_value(0, "name").unwrap().as_string(),
+            Some("Bob")
+        );
+        assert_eq!(
+            sorted.get_value(1, "name").unwrap().as_string(),
+            Some("Charlie")
+        );
+        assert_eq!(
+            sorted.get_value(2, "name").unwrap().as_string(),
+            Some("Alice")
+        );
     }
 
     #[test]
@@ -3543,20 +4182,19 @@ mod tests {
             "by_value".to_string(),
             table.clone(),
             vec![SortKey::ascending("value")],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Sorted order by value: 50 (parent 1), 75 (parent 2), 100 (parent 0)
         assert_eq!(sorted.get_parent_index(0), Some(1)); // 50
         assert_eq!(sorted.get_parent_index(1), Some(2)); // 75
         assert_eq!(sorted.get_parent_index(2), Some(0)); // 100
-        assert_eq!(sorted.get_parent_index(3), None);    // out of range
+        assert_eq!(sorted.get_parent_index(3), None); // out of range
     }
 
     #[test]
     fn test_sorted_view_empty_table() {
-        let schema = Schema::new(vec![
-            ("name".to_string(), ColumnType::String, false),
-        ]);
+        let schema = Schema::new(vec![("name".to_string(), ColumnType::String, false)]);
 
         let table = Rc::new(RefCell::new(Table::new("empty".to_string(), schema)));
 
@@ -3564,7 +4202,8 @@ mod tests {
             "sorted_empty".to_string(),
             table.clone(),
             vec![SortKey::ascending("name")],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(sorted.len(), 0);
         assert!(sorted.is_empty());
@@ -3572,9 +4211,7 @@ mod tests {
 
     #[test]
     fn test_sorted_view_invalid_column() {
-        let schema = Schema::new(vec![
-            ("name".to_string(), ColumnType::String, false),
-        ]);
+        let schema = Schema::new(vec![("name".to_string(), ColumnType::String, false)]);
 
         let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
 
@@ -3590,17 +4227,11 @@ mod tests {
 
     #[test]
     fn test_sorted_view_no_sort_keys() {
-        let schema = Schema::new(vec![
-            ("name".to_string(), ColumnType::String, false),
-        ]);
+        let schema = Schema::new(vec![("name".to_string(), ColumnType::String, false)]);
 
         let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
 
-        let result = SortedView::new(
-            "invalid".to_string(),
-            table.clone(),
-            vec![],
-        );
+        let result = SortedView::new("invalid".to_string(), table.clone(), vec![]);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("At least one sort key"));
@@ -3627,16 +4258,12 @@ mod tests {
             }
         }
 
-        let mut view = FilterView::new(
-            "filtered".to_string(),
-            table.clone(),
-            |row| {
-                row.get("value")
-                    .and_then(|v| v.as_i32())
-                    .map(|v| v >= 10)
-                    .unwrap_or(false)
-            },
-        );
+        let mut view = FilterView::new("filtered".to_string(), table.clone(), |row| {
+            row.get("value")
+                .and_then(|v| v.as_i32())
+                .map(|v| v >= 10)
+                .unwrap_or(false)
+        });
 
         assert_eq!(view.len(), 2); // rows with value 10, 20
         let initial_cursor = view.last_processed_change_count();
@@ -3856,5 +4483,382 @@ mod tests {
         assert!(modified);
         assert_eq!(view.len(), 8);
         assert_eq!(view.last_processed_change_count(), 8);
+    }
+
+    // === RIGHT and FULL OUTER Join Tests ===
+
+    #[test]
+    fn test_right_join() {
+        // Users: Alice/1, Bob/2, Charlie/3
+        let users_schema = Schema::new(vec![
+            ("user_id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let users = Rc::new(RefCell::new(Table::new("users".to_string(), users_schema)));
+        {
+            let mut u = users.borrow_mut();
+            u.append_row(HashMap::from([
+                ("user_id".to_string(), ColumnValue::Int32(1)),
+                ("name".to_string(), ColumnValue::String("Alice".to_string())),
+            ]))
+            .unwrap();
+            u.append_row(HashMap::from([
+                ("user_id".to_string(), ColumnValue::Int32(2)),
+                ("name".to_string(), ColumnValue::String("Bob".to_string())),
+            ]))
+            .unwrap();
+            u.append_row(HashMap::from([
+                ("user_id".to_string(), ColumnValue::Int32(3)),
+                (
+                    "name".to_string(),
+                    ColumnValue::String("Charlie".to_string()),
+                ),
+            ]))
+            .unwrap();
+        }
+
+        // Orders: 101/1 (Alice), 102/4 (Dave — no matching user)
+        let orders_schema = Schema::new(vec![
+            ("order_id".to_string(), ColumnType::Int32, false),
+            ("user_id".to_string(), ColumnType::Int32, false),
+        ]);
+        let orders = Rc::new(RefCell::new(Table::new(
+            "orders".to_string(),
+            orders_schema,
+        )));
+        {
+            let mut o = orders.borrow_mut();
+            o.append_row(HashMap::from([
+                ("order_id".to_string(), ColumnValue::Int32(101)),
+                ("user_id".to_string(), ColumnValue::Int32(1)),
+            ]))
+            .unwrap();
+            o.append_row(HashMap::from([
+                ("order_id".to_string(), ColumnValue::Int32(102)),
+                ("user_id".to_string(), ColumnValue::Int32(4)),
+            ]))
+            .unwrap();
+        }
+
+        let joined = JoinView::new(
+            "user_orders".to_string(),
+            users.clone(),
+            orders.clone(),
+            "user_id".to_string(),
+            "user_id".to_string(),
+            JoinType::Right,
+        )
+        .unwrap();
+
+        // RIGHT JOIN: all right rows. Alice matched (order 101), Dave unmatched (order 102).
+        assert_eq!(joined.len(), 2);
+
+        // Row 0: Alice matched with order 101
+        let row0 = joined.get_row(0).unwrap();
+        assert_eq!(row0.get("name").unwrap().as_string(), Some("Alice"));
+        assert_eq!(row0.get("right_order_id").unwrap().as_i32(), Some(101));
+
+        // Row 1: Unmatched right row (order 102, user_id=4) — left columns are NULL
+        let row1 = joined.get_row(1).unwrap();
+        assert!(row1.get("name").unwrap().is_null());
+        assert!(row1.get("user_id").unwrap().is_null());
+        assert_eq!(row1.get("right_order_id").unwrap().as_i32(), Some(102));
+        assert_eq!(row1.get("right_user_id").unwrap().as_i32(), Some(4));
+    }
+
+    #[test]
+    fn test_full_join() {
+        // Users: Alice/1, Bob/2
+        let users_schema = Schema::new(vec![
+            ("user_id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let users = Rc::new(RefCell::new(Table::new("users".to_string(), users_schema)));
+        {
+            let mut u = users.borrow_mut();
+            u.append_row(HashMap::from([
+                ("user_id".to_string(), ColumnValue::Int32(1)),
+                ("name".to_string(), ColumnValue::String("Alice".to_string())),
+            ]))
+            .unwrap();
+            u.append_row(HashMap::from([
+                ("user_id".to_string(), ColumnValue::Int32(2)),
+                ("name".to_string(), ColumnValue::String("Bob".to_string())),
+            ]))
+            .unwrap();
+        }
+
+        // Orders: 101/1 (Alice), 102/4 (Dave — no matching user)
+        let orders_schema = Schema::new(vec![
+            ("order_id".to_string(), ColumnType::Int32, false),
+            ("user_id".to_string(), ColumnType::Int32, false),
+        ]);
+        let orders = Rc::new(RefCell::new(Table::new(
+            "orders".to_string(),
+            orders_schema,
+        )));
+        {
+            let mut o = orders.borrow_mut();
+            o.append_row(HashMap::from([
+                ("order_id".to_string(), ColumnValue::Int32(101)),
+                ("user_id".to_string(), ColumnValue::Int32(1)),
+            ]))
+            .unwrap();
+            o.append_row(HashMap::from([
+                ("order_id".to_string(), ColumnValue::Int32(102)),
+                ("user_id".to_string(), ColumnValue::Int32(4)),
+            ]))
+            .unwrap();
+        }
+
+        let joined = JoinView::new(
+            "user_orders".to_string(),
+            users.clone(),
+            orders.clone(),
+            "user_id".to_string(),
+            "user_id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // FULL JOIN: 3 rows — Alice matched, Bob unmatched left, Dave unmatched right
+        assert_eq!(joined.len(), 3);
+
+        // Row 0: Alice matched with order 101
+        let row0 = joined.get_row(0).unwrap();
+        assert_eq!(row0.get("name").unwrap().as_string(), Some("Alice"));
+        assert_eq!(row0.get("right_order_id").unwrap().as_i32(), Some(101));
+
+        // Row 1: Bob unmatched (left only)
+        let row1 = joined.get_row(1).unwrap();
+        assert_eq!(row1.get("name").unwrap().as_string(), Some("Bob"));
+        assert!(row1.get("right_order_id").unwrap().is_null());
+
+        // Row 2: Dave unmatched (right only, user_id=4)
+        let row2 = joined.get_row(2).unwrap();
+        assert!(row2.get("name").unwrap().is_null());
+        assert_eq!(row2.get("right_order_id").unwrap().as_i32(), Some(102));
+        assert_eq!(row2.get("right_user_id").unwrap().as_i32(), Some(4));
+    }
+
+    #[test]
+    fn test_right_join_multiple_matches() {
+        // Two left rows with same key, one right row
+        let left_schema = Schema::new(vec![
+            ("key".to_string(), ColumnType::Int32, false),
+            ("val".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("left".to_string(), left_schema)));
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(1)),
+                ("val".to_string(), ColumnValue::String("A".to_string())),
+            ]))
+            .unwrap();
+            l.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(1)),
+                ("val".to_string(), ColumnValue::String("B".to_string())),
+            ]))
+            .unwrap();
+        }
+
+        let right_schema = Schema::new(vec![
+            ("key".to_string(), ColumnType::Int32, false),
+            ("data".to_string(), ColumnType::String, false),
+        ]);
+        let right = Rc::new(RefCell::new(Table::new("right".to_string(), right_schema)));
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(1)),
+                ("data".to_string(), ColumnValue::String("X".to_string())),
+            ]))
+            .unwrap();
+        }
+
+        let joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "key".to_string(),
+            "key".to_string(),
+            JoinType::Right,
+        )
+        .unwrap();
+
+        // RIGHT JOIN: one right row matches two left rows -> 2 result rows
+        assert_eq!(joined.len(), 2);
+
+        let row0 = joined.get_row(0).unwrap();
+        assert_eq!(row0.get("val").unwrap().as_string(), Some("A"));
+        assert_eq!(row0.get("right_data").unwrap().as_string(), Some("X"));
+
+        let row1 = joined.get_row(1).unwrap();
+        assert_eq!(row1.get("val").unwrap().as_string(), Some("B"));
+        assert_eq!(row1.get("right_data").unwrap().as_string(), Some("X"));
+    }
+
+    #[test]
+    fn test_full_join_no_matches() {
+        // Disjoint keys: left has {1,2}, right has {3,4}
+        let left_schema = Schema::new(vec![
+            ("key".to_string(), ColumnType::Int32, false),
+            ("lval".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("left".to_string(), left_schema)));
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(1)),
+                ("lval".to_string(), ColumnValue::String("A".to_string())),
+            ]))
+            .unwrap();
+            l.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(2)),
+                ("lval".to_string(), ColumnValue::String("B".to_string())),
+            ]))
+            .unwrap();
+        }
+
+        let right_schema = Schema::new(vec![
+            ("key".to_string(), ColumnType::Int32, false),
+            ("rval".to_string(), ColumnType::String, false),
+        ]);
+        let right = Rc::new(RefCell::new(Table::new("right".to_string(), right_schema)));
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(3)),
+                ("rval".to_string(), ColumnValue::String("X".to_string())),
+            ]))
+            .unwrap();
+            r.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(4)),
+                ("rval".to_string(), ColumnValue::String("Y".to_string())),
+            ]))
+            .unwrap();
+        }
+
+        let joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "key".to_string(),
+            "key".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // FULL JOIN with disjoint keys: 4 rows, all cross-columns are NULL
+        assert_eq!(joined.len(), 4);
+
+        // Left rows first (unmatched)
+        let row0 = joined.get_row(0).unwrap();
+        assert_eq!(row0.get("lval").unwrap().as_string(), Some("A"));
+        assert!(row0.get("right_rval").unwrap().is_null());
+
+        let row1 = joined.get_row(1).unwrap();
+        assert_eq!(row1.get("lval").unwrap().as_string(), Some("B"));
+        assert!(row1.get("right_rval").unwrap().is_null());
+
+        // Right rows after (unmatched)
+        let row2 = joined.get_row(2).unwrap();
+        assert!(row2.get("lval").unwrap().is_null());
+        assert_eq!(row2.get("right_rval").unwrap().as_string(), Some("X"));
+
+        let row3 = joined.get_row(3).unwrap();
+        assert!(row3.get("lval").unwrap().is_null());
+        assert_eq!(row3.get("right_rval").unwrap().as_string(), Some("Y"));
+    }
+
+    #[test]
+    fn test_full_join_null_key_rows() {
+        // Both tables have NULL-key rows. FULL -> 3 rows
+        // Left: (1, "Alice"), (NULL, "Ghost")
+        // Right: (1, "Order1"), (NULL, "Phantom")
+        let left_schema = Schema::new(vec![
+            ("key".to_string(), ColumnType::Int32, true),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("left".to_string(), left_schema)));
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(1)),
+                (
+                    "name".to_string(),
+                    ColumnValue::String("Alice".to_string()),
+                ),
+            ]))
+            .unwrap();
+            l.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Null),
+                (
+                    "name".to_string(),
+                    ColumnValue::String("Ghost".to_string()),
+                ),
+            ]))
+            .unwrap();
+        }
+
+        let right_schema = Schema::new(vec![
+            ("key".to_string(), ColumnType::Int32, true),
+            ("data".to_string(), ColumnType::String, false),
+        ]);
+        let right = Rc::new(RefCell::new(Table::new("right".to_string(), right_schema)));
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Int32(1)),
+                (
+                    "data".to_string(),
+                    ColumnValue::String("Order1".to_string()),
+                ),
+            ]))
+            .unwrap();
+            r.append_row(HashMap::from([
+                ("key".to_string(), ColumnValue::Null),
+                (
+                    "data".to_string(),
+                    ColumnValue::String("Phantom".to_string()),
+                ),
+            ]))
+            .unwrap();
+        }
+
+        let joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "key".to_string(),
+            "key".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // FULL JOIN: 3 rows
+        // - Alice matched with Order1: (Some(0), Some(0))
+        // - Ghost (NULL key, unmatched left): (Some(1), None)
+        // - Phantom (NULL key, unmatched right): (None, Some(1))
+        assert_eq!(joined.len(), 3);
+
+        // Row 0: Alice matched
+        let row0 = joined.get_row(0).unwrap();
+        assert_eq!(row0.get("name").unwrap().as_string(), Some("Alice"));
+        assert_eq!(row0.get("right_data").unwrap().as_string(), Some("Order1"));
+
+        // Row 1: Ghost (NULL key, left only)
+        let row1 = joined.get_row(1).unwrap();
+        assert_eq!(row1.get("name").unwrap().as_string(), Some("Ghost"));
+        assert!(row1.get("right_data").unwrap().is_null());
+
+        // Row 2: Phantom (NULL key, right only)
+        let row2 = joined.get_row(2).unwrap();
+        assert!(row2.get("name").unwrap().is_null());
+        assert_eq!(
+            row2.get("right_data").unwrap().as_string(),
+            Some("Phantom")
+        );
     }
 }
