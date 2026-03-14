@@ -943,6 +943,20 @@ impl JoinView {
                     let insert_pos = self.find_left_insert_position(*index);
 
                     if let Some(matching_indices) = lookup.get(&key_str) {
+                        // For RIGHT/FULL joins: matched right rows may currently exist
+                        // as unmatched entries (None, Some(right_idx)) in the tail section.
+                        // Remove those before inserting the proper matched entries.
+                        if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
+                            for &right_idx in matching_indices {
+                                if let Some(pos) = self.join_index.iter().position(|(l, r)| {
+                                    l.is_none() && *r == Some(right_idx)
+                                }) {
+                                    self.join_index.remove(pos);
+                                }
+                            }
+                            // Recompute insert_pos after removals may have shifted things
+                        }
+                        let insert_pos = self.find_left_insert_position(*index);
                         for (offset, &right_idx) in matching_indices.iter().enumerate() {
                             self.join_index
                                 .insert(insert_pos + offset, (Some(*index), Some(right_idx)));
@@ -4868,6 +4882,336 @@ mod tests {
         assert_eq!(
             row2.get("right_data").unwrap().as_string(),
             Some("Phantom")
+        );
+    }
+
+    // === RIGHT/FULL JOIN incremental sync tests ===
+
+    /// Helper: collect join_index from a JoinView by reading rows and extracting
+    /// a comparable tuple for each row. Returns Vec of (Option<left_key>, Option<right_key>).
+    fn collect_join_rows(
+        joined: &JoinView,
+    ) -> Vec<(Option<i32>, Option<i32>)> {
+        (0..joined.len())
+            .map(|idx| {
+                let row = joined.get_row(idx).unwrap();
+                let left_id = match row.get("id").unwrap() {
+                    ColumnValue::Null => None,
+                    v => Some(v.as_i32().unwrap()),
+                };
+                let right_id = match row.get("right_id").unwrap() {
+                    ColumnValue::Null => None,
+                    v => Some(v.as_i32().unwrap()),
+                };
+                (left_id, right_id)
+            })
+            .collect()
+    }
+
+    fn make_left_table() -> Rc<RefCell<Table>> {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        Rc::new(RefCell::new(Table::new("left".to_string(), schema)))
+    }
+
+    fn make_right_table() -> Rc<RefCell<Table>> {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("val".to_string(), ColumnType::String, false),
+        ]);
+        Rc::new(RefCell::new(Table::new("right".to_string(), schema)))
+    }
+
+    fn left_row(id: i32, name: &str) -> HashMap<String, ColumnValue> {
+        HashMap::from([
+            ("id".to_string(), ColumnValue::Int32(id)),
+            ("name".to_string(), ColumnValue::String(name.to_string())),
+        ])
+    }
+
+    fn right_row(id: i32, val: &str) -> HashMap<String, ColumnValue> {
+        HashMap::from([
+            ("id".to_string(), ColumnValue::Int32(id)),
+            ("val".to_string(), ColumnValue::String(val.to_string())),
+        ])
+    }
+
+    #[test]
+    fn test_right_join_sync_left_insert() {
+        // Start: empty left, 2 right rows. RIGHT JOIN => 2 unmatched right rows.
+        // Insert left row matching right id=1. Sync. Verify matches rebuild.
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+            r.append_row(right_row(2, "R2")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Right,
+        )
+        .unwrap();
+
+        // Initial state: 2 unmatched right rows
+        assert_eq!(joined.len(), 2);
+
+        // Insert left row matching right id=1
+        left.borrow_mut().append_row(left_row(1, "L1")).unwrap();
+        assert!(joined.sync());
+
+        let synced = collect_join_rows(&joined);
+
+        // Rebuild from scratch and compare
+        joined.refresh();
+        let rebuilt = collect_join_rows(&joined);
+
+        assert_eq!(synced, rebuilt);
+        // Expected: (Some(1), Some(1)) matched, then (None, Some(2)) unmatched right
+        assert_eq!(synced, vec![(Some(1), Some(1)), (None, Some(2))]);
+    }
+
+    #[test]
+    fn test_right_join_sync_right_insert() {
+        // Start: 1 left row (id=1), empty right. RIGHT JOIN => empty.
+        // Insert 2 right rows: id=1 (matching), id=99 (not matching). Sync.
+        let left = make_left_table();
+        let right = make_right_table();
+        left.borrow_mut().append_row(left_row(1, "L1")).unwrap();
+
+        let mut joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Right,
+        )
+        .unwrap();
+
+        assert_eq!(joined.len(), 0);
+
+        // Insert matching and non-matching right rows
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+            r.append_row(right_row(99, "R99")).unwrap();
+        }
+        assert!(joined.sync());
+
+        let synced = collect_join_rows(&joined);
+
+        joined.refresh();
+        let rebuilt = collect_join_rows(&joined);
+
+        assert_eq!(synced, rebuilt);
+        // Expected: (Some(1), Some(1)) matched, then (None, Some(99)) unmatched right
+        assert_eq!(synced, vec![(Some(1), Some(1)), (None, Some(99))]);
+    }
+
+    #[test]
+    fn test_full_join_sync_left_insert() {
+        // Start: empty left, 1 right row (id=5). FULL JOIN => 1 unmatched right row.
+        // Insert 2 left rows: id=5 (matching), id=10 (not matching). Sync.
+        let left = make_left_table();
+        let right = make_right_table();
+        right.borrow_mut().append_row(right_row(5, "R5")).unwrap();
+
+        let mut joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // Initial: 1 unmatched right row (None, Some(0))
+        assert_eq!(joined.len(), 1);
+
+        // Insert 2 left rows
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(5, "L5")).unwrap();
+            l.append_row(left_row(10, "L10")).unwrap();
+        }
+        assert!(joined.sync());
+
+        let synced = collect_join_rows(&joined);
+
+        joined.refresh();
+        let rebuilt = collect_join_rows(&joined);
+
+        assert_eq!(synced, rebuilt);
+        // Expected: (Some(5), Some(5)) matched, (Some(10), None) unmatched left
+        assert_eq!(synced, vec![(Some(5), Some(5)), (Some(10), None)]);
+    }
+
+    #[test]
+    fn test_full_join_sync_right_insert() {
+        // Start: 1 left row (id=3), empty right. FULL JOIN => 1 unmatched left row.
+        // Insert 2 right rows: id=3 (matching), id=7 (not matching). Sync.
+        let left = make_left_table();
+        let right = make_right_table();
+        left.borrow_mut().append_row(left_row(3, "L3")).unwrap();
+
+        let mut joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // Initial: 1 unmatched left row (Some(0), None)
+        assert_eq!(joined.len(), 1);
+
+        // Insert matching and non-matching right rows
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(3, "R3")).unwrap();
+            r.append_row(right_row(7, "R7")).unwrap();
+        }
+        assert!(joined.sync());
+
+        let synced = collect_join_rows(&joined);
+
+        joined.refresh();
+        let rebuilt = collect_join_rows(&joined);
+
+        assert_eq!(synced, rebuilt);
+        // Expected: (Some(3), Some(3)) matched, then (None, Some(7)) unmatched right
+        assert_eq!(synced, vec![(Some(3), Some(3)), (None, Some(7))]);
+    }
+
+    #[test]
+    fn test_full_join_unmatched_becomes_matched() {
+        // Start: left(id=1), right(id=2) — no overlap.
+        // FULL JOIN has 2 rows: (Some(0), None) and (None, Some(0)).
+        // Insert left(id=2) which matches the previously-unmatched right row.
+        // Sync. Verify (None, Some(0)) is replaced with (Some(1), Some(0)).
+        let left = make_left_table();
+        let right = make_right_table();
+        left.borrow_mut().append_row(left_row(1, "L1")).unwrap();
+        right.borrow_mut().append_row(right_row(2, "R2")).unwrap();
+
+        let mut joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // Initial: 2 rows — (Some(0), None) unmatched left, (None, Some(0)) unmatched right
+        assert_eq!(joined.len(), 2);
+
+        // Insert left row that matches the right row's id=2
+        left.borrow_mut().append_row(left_row(2, "L2")).unwrap();
+        assert!(joined.sync());
+
+        let synced = collect_join_rows(&joined);
+
+        joined.refresh();
+        let rebuilt = collect_join_rows(&joined);
+
+        assert_eq!(synced, rebuilt);
+        // Expected: (Some(1), None) for left id=1, (Some(2), Some(2)) for matched pair
+        assert_eq!(synced, vec![(Some(1), None), (Some(2), Some(2))]);
+    }
+
+    #[test]
+    fn test_right_join_rebuild_after_delete() {
+        // RIGHT JOIN, delete from left, sync triggers rebuild. Verify correct result.
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+            l.append_row(left_row(2, "L2")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+            r.append_row(right_row(3, "R3")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Right,
+        )
+        .unwrap();
+
+        // Initial: (Some(0), Some(0)) for id=1 matched, (None, Some(1)) for id=3 unmatched
+        assert_eq!(joined.len(), 2);
+
+        // Delete left row id=1 (index 0)
+        left.borrow_mut().delete_row(0).unwrap();
+        assert!(joined.sync()); // Should trigger rebuild
+
+        let result = collect_join_rows(&joined);
+        // After delete: left has only id=2, right has id=1 and id=3
+        // RIGHT JOIN: both right rows are unmatched
+        assert_eq!(result, vec![(None, Some(1)), (None, Some(3))]);
+    }
+
+    #[test]
+    fn test_full_join_rebuild_after_delete() {
+        // FULL JOIN, delete from right, sync triggers rebuild. Verify correct result.
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+            l.append_row(left_row(2, "L2")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(2, "R2")).unwrap();
+            r.append_row(right_row(3, "R3")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // Initial: (Some(0), None) for left id=1 unmatched,
+        //          (Some(1), Some(0)) for id=2 matched,
+        //          (None, Some(1)) for right id=3 unmatched
+        assert_eq!(joined.len(), 3);
+
+        // Delete right row id=2 (index 0)
+        right.borrow_mut().delete_row(0).unwrap();
+        assert!(joined.sync()); // Should trigger rebuild
+
+        let result = collect_join_rows(&joined);
+        // After delete: left has id=1 and id=2, right has only id=3
+        // FULL JOIN: left id=1 unmatched, left id=2 unmatched, right id=3 unmatched
+        assert_eq!(
+            result,
+            vec![(Some(1), None), (Some(2), None), (None, Some(3))]
         );
     }
 }
