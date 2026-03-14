@@ -210,7 +210,7 @@ agg.sync()  # Updates aggregates incrementally (not full rebuild)
 
 ### ✅ Join Operations
 
-LEFT and INNER joins with automatic column prefixing:
+LEFT, INNER, RIGHT, and FULL OUTER joins with automatic column prefixing:
 
 ```python
 # Create two tables
@@ -246,6 +246,26 @@ inner_joined = livetable.JoinView(
     "id",
     "user_id",
     livetable.JoinType.INNER
+)
+
+# RIGHT JOIN - all rows from right table, matched from left
+right_joined = livetable.JoinView(
+    "all_orders",
+    users,
+    orders,
+    "id",
+    "user_id",
+    livetable.JoinType.RIGHT
+)
+
+# FULL OUTER JOIN - all rows from both tables
+full_joined = livetable.JoinView(
+    "all_data",
+    users,
+    orders,
+    "id",
+    "user_id",
+    livetable.JoinType.FULL
 )
 
 # MULTI-COLUMN JOIN - composite keys
@@ -294,7 +314,11 @@ sorted_table = table.sort(["score", "name"], descending=[True, False])  # Multi-
 joined = students.join(grades, on="id")                                    # Same column name
 joined = students.join(enrollments, left_on="id", right_on="student_id")   # Different names
 joined = students.join(enrollments, left_on="id", right_on="student_id", how="inner")
-joined = sales.join(targets, on=["year", "month"])                         # Multi-column
+joined = students.join(grades, on="id", how="right")                         # Right join
+joined = students.join(grades, on="id", how="full")                          # Full outer join
+joined = students.join(grades, on="id", how="outer")                         # Alias for full
+joined = students.join(grades, on="id", how="full_outer")                    # Alias for full
+joined = sales.join(targets, on=["year", "month"])                           # Multi-column
 
 # GROUP BY - returns an AggregateView
 grouped = table.group_by("department", agg=[
@@ -320,8 +344,8 @@ for row in grouped:
 **Key differences from explicit View constructors:**
 - No need to provide view names (auto-generated)
 - Aggregation functions as strings instead of enum values
-- Join type as string ("left", "inner") instead of enum
-- Views are automatically registered for tick() propagation
+- Join type as string ("left", "inner", "right", "full", "outer", "full_outer") instead of enum
+- Views are automatically registered for tick() propagation (including JoinView, which registers with both parent tables)
 
 ### ✅ Automatic View Propagation (tick)
 
@@ -722,7 +746,8 @@ joined = livetable.JoinView("j", sales, targets,
 - `get_row(index: int) -> dict` - Get joined row
 - `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get value
-- `refresh()` - Rebuild join
+- `sync()` - Incremental update after table changes, returns bool
+- `refresh()` - Full rebuild
 
 **Notes:**
 - Right table columns are prefixed with `"right_"` to avoid conflicts
@@ -734,6 +759,8 @@ joined = livetable.JoinView("j", sales, targets,
 Enum for join types:
 - `JoinType.LEFT` - All rows from left, matched from right
 - `JoinType.INNER` - Only rows that match in both tables
+- `JoinType.RIGHT` - All rows from right, matched from left
+- `JoinType.FULL` - All rows from both tables (full outer join)
 
 ### AggregateFunction
 
@@ -894,7 +921,7 @@ Potential additions:
 - [x] ~~Simplified API (sort, join, group_by)~~ ✅ **DONE!**
 - [x] ~~Storage hints (fast_reads/fast_updates)~~ ✅ **DONE!**
 - [x] ~~Percentile/Median aggregations (P25, P50, P75, P90, P95, P99)~~ ✅ **DONE!**
-- [ ] RIGHT and FULL OUTER joins
+- [x] ~~RIGHT and FULL OUTER joins~~ ✅ **DONE!**
 
 ## Contributing
 

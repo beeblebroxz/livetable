@@ -123,7 +123,7 @@ for row in table:     # Iteration
 | `FilterView` | `table.filter()` | Filter rows with Python lambdas |
 | `ProjectionView` | `table.select()` | Select specific columns |
 | `ComputedView` | `table.add_computed_column()` | Add calculated columns |
-| `JoinView` | `table.join()` | LEFT/INNER joins (single or composite keys) |
+| `JoinView` | `table.join()` | LEFT/INNER/RIGHT/FULL joins (single or composite keys) |
 | `SortedView` | `table.sort()` | Multi-column sorting |
 | `AggregateView` | `table.group_by()` | GROUP BY with SUM, AVG, MIN, MAX, COUNT, MEDIAN, PERCENTILE |
 
@@ -159,6 +159,12 @@ joined = students.join(enrollments, left_on="id", right_on="student_id")
 
 # Inner join (default is left)
 joined = students.join(enrollments, left_on="id", right_on="student_id", how="inner")
+
+# Right join - all rows from right table
+joined = students.join(grades, on="id", how="right")
+
+# Full outer join - all rows from both tables
+joined = students.join(grades, on="id", how="full")   # also: "outer", "full_outer"
 
 # Multi-column join
 joined = sales.join(targets, on=["year", "month"])

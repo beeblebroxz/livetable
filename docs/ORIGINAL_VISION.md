@@ -194,7 +194,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 - [x] StorageHint API for selecting storage backend (`fast_reads` / `fast_updates`)
 - [x] Column layer with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL)
 - [x] Table layer (Root tables with CRUD operations)
-- [x] Views: FilterView, ProjectionView, ComputedView, JoinView (LEFT/INNER), SortedView
+- [x] Views: FilterView, ProjectionView, ComputedView, JoinView (LEFT/INNER/RIGHT/FULL), SortedView
 - [x] AggregateView with GROUP BY and incremental updates (SUM, COUNT, AVG, MIN, MAX, MEDIAN, PERCENTILE)
 - [x] String interning with reference counting
 - [x] Changesets and incremental view propagation
@@ -204,7 +204,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)
 
 ### Planned
-- [ ] RIGHT and FULL OUTER joins
+- [x] RIGHT and FULL OUTER joins
 - [x] Multi-column joins (composite key support)
 - [x] Date/Time column types (DATE and DATETIME)
 - [ ] Materialized Views (cached for faster reads)

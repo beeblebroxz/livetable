@@ -91,7 +91,7 @@ cd frontend && npm install && npm run dev
 - **sequence.rs** - Storage backends: `ArraySequence` (contiguous, default), `TieredVectorSequence` (O(√N) inserts, backed by [tiered-vector](https://crates.io/crates/tiered-vector) crate)
 - **column.rs** - Strongly-typed column values with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
 - **table.rs** - Row-level CRUD operations on column collections
-- **view.rs** - Zero-copy views: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView`, `SortedView`
+- **view.rs** - Zero-copy views: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`
 - **python_bindings.rs** - PyO3 bindings exposing Rust types as Python classes
 - **websocket.rs** + **messages.rs** - Real-time sync via Actix-web WebSocket server
 
@@ -100,6 +100,7 @@ cd frontend && npm install && npm run dev
 - Python lambdas are converted to Rust closures for filter/computed operations
 - Join operations use O(N+M) algorithm
 - WebSocket protocol: `UpdateCell`, `AddRow`, `DeleteRow` messages with broadcast to all clients
+- JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
 - String columns use `NULL_STRING_ID` (u32::MAX) as null sentinel in `string_ids` — never use 0
 - `Column::check_value_type(&value)` validates without consuming — use before batch mutations
 - Expression parser (`expr.rs`): Lexer has `input: Vec<char>` + `pos: usize`, supports negative literals
@@ -184,6 +185,22 @@ joined = livetable.JoinView("result", sales, targets,
     ["year", "month", "region"],  # Left keys
     ["target_year", "target_month", "target_region"],  # Right keys
     livetable.JoinType.INNER)
+
+# RIGHT JOIN - all rows from right table
+joined = students.join(grades, on="id", how="right")
+
+# FULL OUTER JOIN - all rows from both tables
+joined = students.join(grades, on="id", how="full")
+joined = students.join(grades, on="id", how="outer")       # alias
+joined = students.join(grades, on="id", how="full_outer")   # alias
+
+# Explicit constructors
+joined = livetable.JoinView("result", t1, t2, "id", "id", livetable.JoinType.RIGHT)
+joined = livetable.JoinView("result", t1, t2, "id", "id", livetable.JoinType.FULL)
+
+# Incremental sync (also available on JoinView)
+joined.sync()     # Incremental update, returns bool
+joined.refresh()  # Full rebuild
 
 # Simple aggregations
 total = table.sum("score")
