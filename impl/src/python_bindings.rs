@@ -1310,7 +1310,7 @@ impl PyTable {
     ///     on: Column name(s) for join key (if same in both tables)
     ///     left_on: Column name(s) in this table (if different from right)
     ///     right_on: Column name(s) in other table (if different from left)
-    ///     how: Join type - "left" or "inner" (default: "left")
+    ///     how: Join type - "left", "inner", "right", "full", or "outer" (default: "left")
     ///
     /// Returns:
     ///     A joined view of the two tables
@@ -1362,9 +1362,11 @@ impl PyTable {
         let join_type = match how.to_lowercase().as_str() {
             "left" => RustJoinType::Left,
             "inner" => RustJoinType::Inner,
+            "right" => RustJoinType::Right,
+            "full" | "outer" | "full_outer" => RustJoinType::Full,
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "Unknown join type '{}'. Use 'left' or 'inner'",
+                    "Unknown join type '{}'. Use 'left', 'inner', 'right', 'full', or 'outer'",
                     how
                 )))
             }
@@ -2298,12 +2300,26 @@ impl PyJoinType {
         }
     }
 
+    #[classattr]
+    fn RIGHT() -> Self {
+        PyJoinType {
+            inner: RustJoinType::Right,
+        }
+    }
+
+    #[classattr]
+    fn FULL() -> Self {
+        PyJoinType {
+            inner: RustJoinType::Full,
+        }
+    }
+
     fn __repr__(&self) -> String {
         match self.inner {
             RustJoinType::Left => "JoinType.LEFT".to_string(),
             RustJoinType::Inner => "JoinType.INNER".to_string(),
-            RustJoinType::Right => todo!("RIGHT join Python bindings"),
-            RustJoinType::Full => todo!("FULL join Python bindings"),
+            RustJoinType::Right => "JoinType.RIGHT".to_string(),
+            RustJoinType::Full => "JoinType.FULL".to_string(),
         }
     }
 }
@@ -2323,7 +2339,7 @@ impl PyJoinView {
     /// * `right_table` - Right table
     /// * `left_keys` - Column name(s) in left table to join on (string or list of strings)
     /// * `right_keys` - Column name(s) in right table to join on (string or list of strings)
-    /// * `join_type` - Type of join (JoinType.LEFT or JoinType.INNER)
+    /// * `join_type` - Type of join (JoinType.LEFT, JoinType.INNER, JoinType.RIGHT, or JoinType.FULL)
     #[new]
     fn new(
         name: String,
@@ -2437,6 +2453,12 @@ impl PyJoinView {
 
     fn refresh(&mut self) {
         self.inner.borrow_mut().refresh();
+    }
+
+    /// Incrementally sync the join view with parent table changes.
+    /// Returns True if any changes were applied.
+    fn sync(&mut self) -> bool {
+        self.inner.borrow_mut().sync()
     }
 
     /// Return an iterator over the joined rows.
