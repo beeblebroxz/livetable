@@ -360,9 +360,11 @@ pub enum JoinType {
 
 /// A JoinView combines two tables based on matching column values.
 ///
-/// Currently supports:
-/// - Left Join: All rows from left table, with matching data from right table
-/// - Inner Join: Only rows where both tables have matching values
+/// Supports:
+/// - Left Join: All rows from left table, matched rows from right (nulls if no match)
+/// - Inner Join: Only rows that match in both tables
+/// - Right Join: All rows from right table, matched rows from left (nulls if no match)
+/// - Full Outer Join: All rows from both tables (nulls where no match)
 ///
 /// # Examples
 ///
@@ -949,6 +951,13 @@ impl JoinView {
                     } else if self.join_type == JoinType::Left
                         || self.join_type == JoinType::Full
                     {
+                        self.join_index.insert(insert_pos, (Some(*index), None));
+                        modified = true;
+                    }
+                } else {
+                    // NULL key — matches nothing, but LEFT/FULL include the row
+                    if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
+                        let insert_pos = self.find_left_insert_position(*index);
                         self.join_index.insert(insert_pos, (Some(*index), None));
                         modified = true;
                     }
