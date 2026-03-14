@@ -338,6 +338,10 @@ pub enum JoinType {
     Left,
     /// Inner join: Only rows that match in both tables
     Inner,
+    /// Right join: All rows from right table, matched rows from left (nulls if no match)
+    Right,
+    /// Full outer join: All rows from both tables (nulls where no match on either side)
+    Full,
 }
 
 /// A JoinView combines two tables based on matching column values.
@@ -615,6 +619,9 @@ impl JoinView {
                         }
                         JoinType::Inner => {
                             // Skip - no match means not included
+                        }
+                        JoinType::Right | JoinType::Full => {
+                            todo!("RIGHT/FULL join rebuild not yet implemented")
                         }
                     }
                 }

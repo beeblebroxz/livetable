@@ -2137,6 +2137,8 @@ impl PyJoinType {
         match self.inner {
             RustJoinType::Left => "JoinType.LEFT".to_string(),
             RustJoinType::Inner => "JoinType.INNER".to_string(),
+            RustJoinType::Right => todo!("RIGHT join Python bindings"),
+            RustJoinType::Full => todo!("FULL join Python bindings"),
         }
     }
 }
