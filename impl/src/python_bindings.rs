@@ -614,13 +614,16 @@ enum RegisteredView {
     Filter(Weak<RefCell<PyFilterViewInner>>),
     Sorted(Weak<RefCell<RustSortedView>>),
     Aggregate(Weak<RefCell<RustAggregateView>>),
-    // JoinView is more complex (two parents) - not auto-registered for now
+    JoinLeft(Weak<RefCell<RustJoinView>>),
+    JoinRight(Weak<RefCell<RustJoinView>>),
 }
 
 enum ActiveRegisteredView {
     Filter(Rc<RefCell<PyFilterViewInner>>),
     Sorted(Rc<RefCell<RustSortedView>>),
     Aggregate(Rc<RefCell<RustAggregateView>>),
+    JoinLeft(Rc<RefCell<RustJoinView>>),
+    JoinRight(Rc<RefCell<RustJoinView>>),
 }
 
 impl RegisteredView {
@@ -629,6 +632,8 @@ impl RegisteredView {
             RegisteredView::Filter(inner) => inner.strong_count() > 0,
             RegisteredView::Sorted(inner) => inner.strong_count() > 0,
             RegisteredView::Aggregate(inner) => inner.strong_count() > 0,
+            RegisteredView::JoinLeft(inner) => inner.strong_count() > 0,
+            RegisteredView::JoinRight(inner) => inner.strong_count() > 0,
         }
     }
 
@@ -638,6 +643,12 @@ impl RegisteredView {
             RegisteredView::Sorted(inner) => inner.upgrade().map(ActiveRegisteredView::Sorted),
             RegisteredView::Aggregate(inner) => {
                 inner.upgrade().map(ActiveRegisteredView::Aggregate)
+            }
+            RegisteredView::JoinLeft(inner) => {
+                inner.upgrade().map(ActiveRegisteredView::JoinLeft)
+            }
+            RegisteredView::JoinRight(inner) => {
+                inner.upgrade().map(ActiveRegisteredView::JoinRight)
             }
         }
     }
@@ -1389,9 +1400,18 @@ impl PyTable {
         )
         .map_err(|e| PyValueError::new_err(e))?;
 
-        Ok(PyJoinView {
-            inner: Rc::new(RefCell::new(join)),
-        })
+        let join_rc = Rc::new(RefCell::new(join));
+
+        // Register with both parent tables for tick() propagation
+        self.registered_views
+            .borrow_mut()
+            .push(RegisteredView::JoinLeft(Rc::downgrade(&join_rc)));
+        other
+            .registered_views
+            .borrow_mut()
+            .push(RegisteredView::JoinRight(Rc::downgrade(&join_rc)));
+
+        Ok(PyJoinView { inner: join_rc })
     }
 
     /// Group table by columns and compute aggregations.
@@ -1832,6 +1852,18 @@ impl PyTable {
                 ActiveRegisteredView::Aggregate(inner) => {
                     inner.borrow_mut().sync();
                     min_cursor = min_cursor.min(inner.borrow().last_processed_change_count());
+                    synced_count += 1;
+                }
+                ActiveRegisteredView::JoinLeft(inner) => {
+                    inner.borrow_mut().sync();
+                    let (left_cursor, _) = inner.borrow().last_processed_change_count();
+                    min_cursor = min_cursor.min(left_cursor);
+                    synced_count += 1;
+                }
+                ActiveRegisteredView::JoinRight(inner) => {
+                    inner.borrow_mut().sync();
+                    let (_, right_cursor) = inner.borrow().last_processed_change_count();
+                    min_cursor = min_cursor.min(right_cursor);
                     synced_count += 1;
                 }
             }
