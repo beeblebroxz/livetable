@@ -190,7 +190,7 @@ class TestJoin:
                 self.enrollments,
                 left_on="id",
                 right_on="student_id",
-                how="outer"
+                how="cross"
             )
 
     def test_join_multi_column(self):
