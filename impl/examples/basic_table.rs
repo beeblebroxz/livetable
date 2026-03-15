@@ -4,7 +4,6 @@
 /// - Creating a table with a schema
 /// - Adding, updating, and deleting rows
 /// - Querying data from the table
-
 use livetable::{ColumnType, ColumnValue, Schema, Table};
 use std::collections::HashMap;
 
@@ -32,21 +31,33 @@ fn main() {
     let mut row1 = HashMap::new();
     row1.insert("id".to_string(), ColumnValue::Int32(1));
     row1.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
-    row1.insert("email".to_string(), ColumnValue::String("alice@example.com".to_string()));
+    row1.insert(
+        "email".to_string(),
+        ColumnValue::String("alice@example.com".to_string()),
+    );
     row1.insert("age".to_string(), ColumnValue::Int32(30));
     users.append_row(row1).unwrap();
 
     let mut row2 = HashMap::new();
     row2.insert("id".to_string(), ColumnValue::Int32(2));
     row2.insert("name".to_string(), ColumnValue::String("Bob".to_string()));
-    row2.insert("email".to_string(), ColumnValue::String("bob@example.com".to_string()));
+    row2.insert(
+        "email".to_string(),
+        ColumnValue::String("bob@example.com".to_string()),
+    );
     row2.insert("age".to_string(), ColumnValue::Null); // Null age
     users.append_row(row2).unwrap();
 
     let mut row3 = HashMap::new();
     row3.insert("id".to_string(), ColumnValue::Int32(3));
-    row3.insert("name".to_string(), ColumnValue::String("Charlie".to_string()));
-    row3.insert("email".to_string(), ColumnValue::String("charlie@example.com".to_string()));
+    row3.insert(
+        "name".to_string(),
+        ColumnValue::String("Charlie".to_string()),
+    );
+    row3.insert(
+        "email".to_string(),
+        ColumnValue::String("charlie@example.com".to_string()),
+    );
     row3.insert("age".to_string(), ColumnValue::Int32(25));
     users.append_row(row3).unwrap();
 
@@ -85,7 +96,10 @@ fn main() {
     let mut new_row = HashMap::new();
     new_row.insert("id".to_string(), ColumnValue::Int32(4));
     new_row.insert("name".to_string(), ColumnValue::String("Diana".to_string()));
-    new_row.insert("email".to_string(), ColumnValue::String("diana@example.com".to_string()));
+    new_row.insert(
+        "email".to_string(),
+        ColumnValue::String("diana@example.com".to_string()),
+    );
     new_row.insert("age".to_string(), ColumnValue::Int32(35));
     users.insert_row(1, new_row).unwrap();
     println!("   Inserted Diana at position 1");

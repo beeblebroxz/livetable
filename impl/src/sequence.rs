@@ -5,12 +5,11 @@
 /// - ArraySequence: Simple contiguous array with O(1) access, O(N) insert/delete
 /// - TieredVectorSequence: True tiered vector with O(1) access, O(sqrt(N)) insert/delete
 ///   (backed by the tiered-vector crate)
-
 use std::fmt::Debug;
 use tiered_vector::Vector as TieredVector;
 
 /// Trait for sequence storage operations
-pub trait Sequence<T: Clone> {
+pub trait Sequence<T: Clone>: Send {
     /// Return the number of elements in the sequence
     fn len(&self) -> usize;
 
@@ -68,7 +67,7 @@ impl<T: Clone> Default for ArraySequence<T> {
     }
 }
 
-impl<T: Clone + Debug> Sequence<T> for ArraySequence<T> {
+impl<T: Clone + Debug + Send> Sequence<T> for ArraySequence<T> {
     fn len(&self) -> usize {
         self.data.len()
     }
@@ -86,7 +85,11 @@ impl<T: Clone + Debug> Sequence<T> for ArraySequence<T> {
 
     fn set(&mut self, index: usize, value: T) -> Result<(), String> {
         if index >= self.data.len() {
-            return Err(format!("Index {} out of range [0, {})", index, self.data.len()));
+            return Err(format!(
+                "Index {} out of range [0, {})",
+                index,
+                self.data.len()
+            ));
         }
         self.data[index] = value;
         Ok(())
@@ -94,7 +97,11 @@ impl<T: Clone + Debug> Sequence<T> for ArraySequence<T> {
 
     fn insert(&mut self, index: usize, value: T) -> Result<(), String> {
         if index > self.data.len() {
-            return Err(format!("Index {} out of range [0, {}]", index, self.data.len()));
+            return Err(format!(
+                "Index {} out of range [0, {}]",
+                index,
+                self.data.len()
+            ));
         }
         self.data.insert(index, value);
         Ok(())
@@ -102,7 +109,11 @@ impl<T: Clone + Debug> Sequence<T> for ArraySequence<T> {
 
     fn delete(&mut self, index: usize) -> Result<T, String> {
         if index >= self.data.len() {
-            return Err(format!("Index {} out of range [0, {})", index, self.data.len()));
+            return Err(format!(
+                "Index {} out of range [0, {})",
+                index,
+                self.data.len()
+            ));
         }
         Ok(self.data.remove(index))
     }
@@ -129,6 +140,11 @@ impl<T: Clone + Debug> Sequence<T> for ArraySequence<T> {
 pub struct TieredVectorSequence<T: Clone> {
     inner: TieredVector<T>,
 }
+
+// `tiered_vector::Vector<T>` uses raw pointers internally and does not auto-derive `Send`,
+// but ownership remains within the sequence and the server only moves it across threads while
+// guarding access with a mutex.
+unsafe impl<T: Clone + Send> Send for TieredVectorSequence<T> {}
 
 impl<T: Clone + Debug> Debug for TieredVectorSequence<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -167,7 +183,7 @@ impl<T: Clone> Default for TieredVectorSequence<T> {
     }
 }
 
-impl<T: Clone + Debug> Sequence<T> for TieredVectorSequence<T> {
+impl<T: Clone + Debug + Send> Sequence<T> for TieredVectorSequence<T> {
     fn len(&self) -> usize {
         self.inner.len()
     }
@@ -189,13 +205,21 @@ impl<T: Clone + Debug> Sequence<T> for TieredVectorSequence<T> {
                 *slot = value;
                 Ok(())
             }
-            None => Err(format!("Index {} out of range [0, {})", index, self.inner.len())),
+            None => Err(format!(
+                "Index {} out of range [0, {})",
+                index,
+                self.inner.len()
+            )),
         }
     }
 
     fn insert(&mut self, index: usize, value: T) -> Result<(), String> {
         if index > self.inner.len() {
-            return Err(format!("Index {} out of range [0, {}]", index, self.inner.len()));
+            return Err(format!(
+                "Index {} out of range [0, {}]",
+                index,
+                self.inner.len()
+            ));
         }
         self.inner.insert(index, value);
         Ok(())
@@ -203,7 +227,11 @@ impl<T: Clone + Debug> Sequence<T> for TieredVectorSequence<T> {
 
     fn delete(&mut self, index: usize) -> Result<T, String> {
         if index >= self.inner.len() {
-            return Err(format!("Index {} out of range [0, {})", index, self.inner.len()));
+            return Err(format!(
+                "Index {} out of range [0, {})",
+                index,
+                self.inner.len()
+            ));
         }
         Ok(self.inner.remove(index))
     }
@@ -320,9 +348,9 @@ mod tests {
         }
 
         // Insert at various positions and verify ALL elements are still correct
-        seq.insert(25, 9990).unwrap();  // Insert in first quarter (len=101)
-        seq.insert(50, 9991).unwrap();  // Insert in middle (len=102)
-        seq.insert(75, 9992).unwrap();  // Insert in third quarter (len=103)
+        seq.insert(25, 9990).unwrap(); // Insert in first quarter (len=101)
+        seq.insert(50, 9991).unwrap(); // Insert in middle (len=102)
+        seq.insert(75, 9992).unwrap(); // Insert in third quarter (len=103)
 
         assert_eq!(seq.len(), 103);
 
@@ -334,9 +362,9 @@ mod tests {
         // Verify original elements are in correct positions
         assert_eq!(seq.get(0).unwrap(), 0);
         assert_eq!(seq.get(24).unwrap(), 24);
-        assert_eq!(seq.get(26).unwrap(), 25);  // Was at 25, shifted by first insert
-        assert_eq!(seq.get(51).unwrap(), 49);  // Was at 49, shifted by inserts at 25 and 50
-        assert_eq!(seq.get(76).unwrap(), 73);  // Was at 73, shifted by all three inserts
+        assert_eq!(seq.get(26).unwrap(), 25); // Was at 25, shifted by first insert
+        assert_eq!(seq.get(51).unwrap(), 49); // Was at 49, shifted by inserts at 25 and 50
+        assert_eq!(seq.get(76).unwrap(), 73); // Was at 73, shifted by all three inserts
         assert_eq!(seq.get(102).unwrap(), 99);
     }
 
@@ -393,7 +421,7 @@ mod tests {
 
         // Verify elements shifted correctly
         assert_eq!(seq.get(9).unwrap(), 90);
-        assert_eq!(seq.get(10).unwrap(), 110);  // Was at index 11
+        assert_eq!(seq.get(10).unwrap(), 110); // Was at index 11
         assert_eq!(seq.get(18).unwrap(), 190);
 
         // Delete from beginning
@@ -413,12 +441,12 @@ mod tests {
 
         // Interleave appends and inserts to create non-uniform blocks
         for i in 0..50 {
-            seq.append((i * 2) as i32);  // Even numbers
+            seq.append((i * 2) as i32); // Even numbers
         }
 
         // Insert odd numbers
         for i in 0..50 {
-            seq.insert(i * 2 + 1, (i * 2 + 1) as i32).unwrap();  // Insert at odd positions
+            seq.insert(i * 2 + 1, (i * 2 + 1) as i32).unwrap(); // Insert at odd positions
         }
 
         assert_eq!(seq.len(), 100);
@@ -516,7 +544,7 @@ mod tests {
         assert_eq!(seq.get_ref(0), Some(&0));
         assert_eq!(seq.get_ref(25), Some(&250));
         assert_eq!(seq.get_ref(49), Some(&490));
-        assert_eq!(seq.get_ref(50), None);  // Out of bounds
+        assert_eq!(seq.get_ref(50), None); // Out of bounds
     }
 
     /// Test large scale operations to verify O(√N) complexity doesn't break
@@ -575,10 +603,10 @@ mod tests {
         let mut seq = TieredVectorSequence::<i32>::new();
 
         for i in 0..20 {
-            seq.append(i + 1);  // [1, 2, 3, ..., 20]
+            seq.append(i + 1); // [1, 2, 3, ..., 20]
         }
 
-        seq.insert(0, 0).unwrap();  // Insert 0 at beginning
+        seq.insert(0, 0).unwrap(); // Insert 0 at beginning
 
         assert_eq!(seq.len(), 21);
         for i in 0..21 {
@@ -595,7 +623,7 @@ mod tests {
             seq.append(i);
         }
 
-        seq.insert(20, 20).unwrap();  // Insert at end
+        seq.insert(20, 20).unwrap(); // Insert at end
 
         assert_eq!(seq.len(), 21);
         for i in 0..21 {

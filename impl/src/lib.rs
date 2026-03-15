@@ -1,23 +1,25 @@
+pub mod changeset;
+pub mod column;
+pub mod expr;
+pub mod interner;
 /// LiveTable - High-Performance Columnar Table System
 ///
 /// A high-performance columnar table system with reactive views and incremental updates.
 /// This implementation demonstrates high-performance tabular data structures with
 /// strong type safety and zero-cost abstractions.
-
 pub mod sequence;
-pub mod column;
 pub mod table;
 pub mod view;
-pub mod changeset;
-pub mod interner;
-pub mod expr;
 
-pub use sequence::{ArraySequence, Sequence, TieredVectorSequence};
+pub use changeset::{Changeset, IncrementalView, IndexAdjuster, TableChange};
 pub use column::{Column, ColumnType, ColumnValue};
-pub use table::{Schema, Table, StorageHint};
-pub use view::{FilterView, ProjectionView, ComputedView, JoinView, JoinType, SortedView, SortKey, SortOrder, AggregateFunction, AggregateView};
-pub use changeset::{Changeset, TableChange, IncrementalView, IndexAdjuster};
-pub use interner::{StringInterner, StringId, InternerStats};
+pub use interner::{InternerStats, StringId, StringInterner};
+pub use sequence::{ArraySequence, Sequence, TieredVectorSequence};
+pub use table::{Schema, StorageHint, Table};
+pub use view::{
+    AggregateFunction, AggregateView, ComputedView, FilterView, JoinType, JoinView, ProjectionView,
+    SortKey, SortOrder, SortedView,
+};
 
 // Python bindings - only when python feature is enabled
 #[cfg(feature = "python")]
@@ -29,16 +31,16 @@ pub use python_bindings::*;
 #[cfg(feature = "server")]
 pub mod messages;
 #[cfg(feature = "server")]
-pub mod websocket;
-#[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "server")]
+pub mod websocket;
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use std::rc::Rc;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     #[test]
     fn test_complete_workflow() {
@@ -56,19 +58,28 @@ mod integration_tests {
             let mut t = table.borrow_mut();
 
             let mut row1 = HashMap::new();
-            row1.insert("product".to_string(), ColumnValue::String("Widget".to_string()));
+            row1.insert(
+                "product".to_string(),
+                ColumnValue::String("Widget".to_string()),
+            );
             row1.insert("quantity".to_string(), ColumnValue::Int32(10));
             row1.insert("price".to_string(), ColumnValue::Float64(9.99));
             t.append_row(row1).unwrap();
 
             let mut row2 = HashMap::new();
-            row2.insert("product".to_string(), ColumnValue::String("Gadget".to_string()));
+            row2.insert(
+                "product".to_string(),
+                ColumnValue::String("Gadget".to_string()),
+            );
             row2.insert("quantity".to_string(), ColumnValue::Int32(5));
             row2.insert("price".to_string(), ColumnValue::Float64(19.99));
             t.append_row(row2).unwrap();
 
             let mut row3 = HashMap::new();
-            row3.insert("product".to_string(), ColumnValue::String("Doohickey".to_string()));
+            row3.insert(
+                "product".to_string(),
+                ColumnValue::String("Doohickey".to_string()),
+            );
             row3.insert("quantity".to_string(), ColumnValue::Int32(15));
             row3.insert("price".to_string(), ColumnValue::Float64(4.99));
             t.append_row(row3).unwrap();
@@ -96,9 +107,24 @@ mod integration_tests {
         assert_eq!(computed_view.borrow().len(), 3);
 
         // Check computed values
-        let total0 = computed_view.borrow().get_value(0, "total").unwrap().as_f64().unwrap();
-        let total1 = computed_view.borrow().get_value(1, "total").unwrap().as_f64().unwrap();
-        let total2 = computed_view.borrow().get_value(2, "total").unwrap().as_f64().unwrap();
+        let total0 = computed_view
+            .borrow()
+            .get_value(0, "total")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        let total1 = computed_view
+            .borrow()
+            .get_value(1, "total")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        let total2 = computed_view
+            .borrow()
+            .get_value(2, "total")
+            .unwrap()
+            .as_f64()
+            .unwrap();
 
         assert!((total0 - 99.90).abs() < 0.01); // Widget: 10 * 9.99 = 99.90
         assert!((total1 - 99.95).abs() < 0.01); // Gadget: 5 * 19.99 = 99.95

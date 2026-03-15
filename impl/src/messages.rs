@@ -61,18 +61,11 @@ pub enum ServerMessage {
     },
 
     /// A row was deleted
-    RowDeleted {
-        table_name: String,
-        index: usize,
-    },
+    RowDeleted { table_name: String, index: usize },
 
     /// Subscription confirmed
-    Subscribed {
-        table_name: String,
-    },
+    Subscribed { table_name: String },
 
     /// Error occurred
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }

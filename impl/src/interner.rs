@@ -28,7 +28,6 @@
 /// // Resolve ID back to string
 /// assert_eq!(interner.resolve(id1), Some("hello"));
 /// ```
-
 use std::collections::HashMap;
 
 /// Interned string ID type
@@ -163,14 +162,16 @@ impl StringInterner {
 
     /// Returns total memory used by all interned strings (approximate)
     pub fn memory_usage(&self) -> usize {
-        let string_bytes: usize = self.id_to_string.iter()
+        let string_bytes: usize = self
+            .id_to_string
+            .iter()
             .enumerate()
             .filter(|(i, _)| self.ref_counts[*i] > 0)
             .map(|(_, s)| s.len() + std::mem::size_of::<String>())
             .sum();
 
-        let map_overhead = self.string_to_id.capacity() *
-            (std::mem::size_of::<String>() + std::mem::size_of::<StringId>());
+        let map_overhead = self.string_to_id.capacity()
+            * (std::mem::size_of::<String>() + std::mem::size_of::<StringId>());
 
         let vec_overhead = self.id_to_string.capacity() * std::mem::size_of::<String>()
             + self.ref_counts.capacity() * std::mem::size_of::<u32>()

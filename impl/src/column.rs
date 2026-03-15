@@ -1,3 +1,4 @@
+use crate::interner::{StringId, StringInterner};
 /// LiveTable Column Implementation
 ///
 /// A Column is an array-like random-access data container indexed by integer.
@@ -8,16 +9,13 @@
 /// String columns can optionally use a shared `StringInterner` to deduplicate
 /// strings. When an interner is provided, strings are stored as integer IDs
 /// internally, significantly reducing memory for columns with repeated values.
-
 use crate::sequence::{ArraySequence, Sequence, TieredVectorSequence};
-use crate::interner::{StringInterner, StringId};
-use std::cell::RefCell;
 use std::fmt::Debug;
+use std::sync::{Arc, Mutex};
 
 /// Sentinel value stored in string_ids for NULL entries.
 /// Must never collide with a valid interner ID (which grows from 0 upward).
 const NULL_STRING_ID: StringId = u32::MAX;
-use std::rc::Rc;
 
 /// Column data types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +125,7 @@ pub struct Column {
     sequence: Box<dyn Sequence<ColumnValue>>,
     null_flags: Option<Box<dyn Sequence<bool>>>,
     /// Optional string interner for String columns (shared across table)
-    interner: Option<Rc<RefCell<StringInterner>>>,
+    interner: Option<Arc<Mutex<StringInterner>>>,
     /// String IDs storage (used only when interner is Some and column_type is String)
     string_ids: Option<Box<dyn Sequence<StringId>>>,
 }
@@ -156,7 +154,7 @@ impl Column {
         column_type: ColumnType,
         nullable: bool,
         use_tiered_vector: bool,
-        interner: Option<Rc<RefCell<StringInterner>>>,
+        interner: Option<Arc<Mutex<StringInterner>>>,
     ) -> Self {
         let sequence: Box<dyn Sequence<ColumnValue>> = if use_tiered_vector {
             Box::new(TieredVectorSequence::new())
@@ -198,7 +196,7 @@ impl Column {
     }
 
     /// Returns a reference to the interner if this column uses one
-    pub fn interner(&self) -> Option<&Rc<RefCell<StringInterner>>> {
+    pub fn interner(&self) -> Option<&Arc<Mutex<StringInterner>>> {
         self.interner.as_ref()
     }
 
@@ -291,7 +289,7 @@ impl Column {
         if let Some(ref string_ids) = self.string_ids {
             if let Some(ref interner) = self.interner {
                 let id = string_ids.get(index)?;
-                let interner = interner.borrow();
+                let interner = interner.lock().unwrap();
                 if let Some(s) = interner.resolve_unchecked(id) {
                     return Ok(ColumnValue::String(s.to_string()));
                 } else {
@@ -352,7 +350,7 @@ impl Column {
                 if let Some(ref interner) = self.interner {
                     let old_id = string_ids.get(index)?;
                     if old_id != NULL_STRING_ID {
-                        interner.borrow_mut().release(old_id);
+                        interner.lock().unwrap().release(old_id);
                     }
                     string_ids.set(index, NULL_STRING_ID)?;
                 }
@@ -363,18 +361,21 @@ impl Column {
                 null_flags.set(index, false)?;
             }
             // Handle string interning
-            if let (Some(ref mut string_ids), Some(ref interner)) = (&mut self.string_ids, &self.interner) {
+            if let (Some(ref mut string_ids), Some(ref interner)) =
+                (&mut self.string_ids, &self.interner)
+            {
                 if let ColumnValue::String(ref s) = value {
                     // Release old string ID (skip if slot was NULL)
                     let old_id = string_ids.get(index)?;
                     if old_id != NULL_STRING_ID {
-                        interner.borrow_mut().release(old_id);
+                        interner.lock().unwrap().release(old_id);
                     }
                     // Intern new string
-                    let new_id = interner.borrow_mut().intern(s);
+                    let new_id = interner.lock().unwrap().intern(s);
                     string_ids.set(index, new_id)?;
                     // Store placeholder in sequence (not used for interned strings)
-                    self.sequence.set(index, ColumnValue::String(String::new()))?;
+                    self.sequence
+                        .set(index, ColumnValue::String(String::new()))?;
                     return Ok(());
                 }
             }
@@ -401,11 +402,14 @@ impl Column {
                 null_flags.insert(index, false)?;
             }
             // Handle string interning
-            if let (Some(ref mut string_ids), Some(ref interner)) = (&mut self.string_ids, &self.interner) {
+            if let (Some(ref mut string_ids), Some(ref interner)) =
+                (&mut self.string_ids, &self.interner)
+            {
                 if let ColumnValue::String(ref s) = value {
-                    let id = interner.borrow_mut().intern(s);
+                    let id = interner.lock().unwrap().intern(s);
                     string_ids.insert(index, id)?;
-                    self.sequence.insert(index, ColumnValue::String(String::new()))?;
+                    self.sequence
+                        .insert(index, ColumnValue::String(String::new()))?;
                     return Ok(());
                 }
             }
@@ -423,7 +427,9 @@ impl Column {
         };
 
         // Handle string interning - get the string before deleting the ID
-        if let (Some(ref mut string_ids), Some(ref interner)) = (&mut self.string_ids, &self.interner) {
+        if let (Some(ref mut string_ids), Some(ref interner)) =
+            (&mut self.string_ids, &self.interner)
+        {
             let id = string_ids.delete(index)?;
             self.sequence.delete(index)?; // Delete placeholder
 
@@ -433,14 +439,15 @@ impl Column {
 
             // Get the string value before releasing
             let result = {
-                let interner_ref = interner.borrow();
-                interner_ref.resolve_unchecked(id)
+                let interner_ref = interner.lock().unwrap();
+                interner_ref
+                    .resolve_unchecked(id)
                     .map(|s| ColumnValue::String(s.to_string()))
             };
 
             // Release the reference (skip sentinel for null slots)
             if id != NULL_STRING_ID {
-                interner.borrow_mut().release(id);
+                interner.lock().unwrap().release(id);
             }
 
             return result.ok_or_else(|| format!("Invalid string ID {} at index {}", id, index));
@@ -472,9 +479,11 @@ impl Column {
                 null_flags.append(false);
             }
             // Handle string interning
-            if let (Some(ref mut string_ids), Some(ref interner)) = (&mut self.string_ids, &self.interner) {
+            if let (Some(ref mut string_ids), Some(ref interner)) =
+                (&mut self.string_ids, &self.interner)
+            {
                 if let ColumnValue::String(ref s) = value {
-                    let id = interner.borrow_mut().intern(s);
+                    let id = interner.lock().unwrap().intern(s);
                     string_ids.append(id);
                     self.sequence.append(ColumnValue::String(String::new()));
                     return;
@@ -504,7 +513,7 @@ impl Column {
             ColumnType::Float64 => ColumnValue::Float64(0.0),
             ColumnType::String => ColumnValue::String(String::new()),
             ColumnType::Bool => ColumnValue::Bool(false),
-            ColumnType::Date => ColumnValue::Date(0),         // 1970-01-01
+            ColumnType::Date => ColumnValue::Date(0), // 1970-01-01
             ColumnType::DateTime => ColumnValue::DateTime(0), // 1970-01-01 00:00:00
         }
     }
@@ -552,6 +561,7 @@ impl Debug for Column {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_column_basic() {
@@ -592,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_column_string_interning() {
-        let interner = Rc::new(RefCell::new(StringInterner::new()));
+        let interner = Arc::new(Mutex::new(StringInterner::new()));
 
         let mut col = Column::new_with_interner(
             "names".to_string(),
@@ -617,10 +627,10 @@ mod tests {
         assert_eq!(col.get(4).unwrap().as_string(), Some("Alice"));
 
         // Verify the interner only has 3 unique strings
-        assert_eq!(interner.borrow().len(), 3);
+        assert_eq!(interner.lock().unwrap().len(), 3);
 
         // Verify reference counts
-        let interner_ref = interner.borrow();
+        let interner_ref = interner.lock().unwrap();
         // Alice should have 3 references
         let alice_id = interner_ref.string_to_id.get("Alice").unwrap();
         assert_eq!(interner_ref.ref_count(*alice_id), 3);
@@ -628,7 +638,7 @@ mod tests {
 
     #[test]
     fn test_column_string_interning_update() {
-        let interner = Rc::new(RefCell::new(StringInterner::new()));
+        let interner = Arc::new(Mutex::new(StringInterner::new()));
 
         let mut col = Column::new_with_interner(
             "names".to_string(),
@@ -648,13 +658,13 @@ mod tests {
         assert_eq!(col.get(1).unwrap().as_string(), Some("Bob"));
 
         // Verify reference counts changed
-        let interner_ref = interner.borrow();
+        let interner_ref = interner.lock().unwrap();
         assert_eq!(interner_ref.len(), 2); // Alice and Bob
     }
 
     #[test]
     fn test_column_string_interning_delete() {
-        let interner = Rc::new(RefCell::new(StringInterner::new()));
+        let interner = Arc::new(Mutex::new(StringInterner::new()));
 
         let mut col = Column::new_with_interner(
             "names".to_string(),
@@ -673,7 +683,7 @@ mod tests {
         assert_eq!(deleted.as_string(), Some("Bob"));
 
         // Bob should be released
-        assert_eq!(interner.borrow().len(), 1); // Only Alice remains
+        assert_eq!(interner.lock().unwrap().len(), 1); // Only Alice remains
         assert_eq!(col.len(), 2);
         assert_eq!(col.get(0).unwrap().as_string(), Some("Alice"));
         assert_eq!(col.get(1).unwrap().as_string(), Some("Alice"));

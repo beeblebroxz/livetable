@@ -21,7 +21,6 @@
 /// 2. Changes accumulate in the table's changeset buffer
 /// 3. Views call `apply_changes()` to process pending changes
 /// 4. Views update their internal indices incrementally
-
 use crate::column::ColumnValue;
 use std::collections::HashMap;
 
@@ -65,7 +64,10 @@ impl TableChange {
     /// Returns true if this change affects row indices after the changed row
     /// (i.e., inserts and deletes shift subsequent rows)
     pub fn shifts_indices(&self) -> bool {
-        matches!(self, TableChange::RowInserted { .. } | TableChange::RowDeleted { .. })
+        matches!(
+            self,
+            TableChange::RowInserted { .. } | TableChange::RowDeleted { .. }
+        )
     }
 }
 

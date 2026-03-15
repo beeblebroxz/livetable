@@ -35,12 +35,12 @@ pub enum Expr {
 /// Comparison operators
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompareOp {
-    Eq,      // ==
-    Ne,      // !=
-    Lt,      // <
-    Le,      // <=
-    Gt,      // >
-    Ge,      // >=
+    Eq, // ==
+    Ne, // !=
+    Lt, // <
+    Le, // <=
+    Gt, // >
+    Ge, // >=
 }
 
 /// Literal values that can appear in expressions
@@ -63,12 +63,12 @@ enum Token {
     Bool(bool),
     Null,
     // Operators
-    Eq,       // ==
-    Ne,       // !=
-    Lt,       // <
-    Le,       // <=
-    Gt,       // >
-    Ge,       // >=
+    Eq, // ==
+    Ne, // !=
+    Lt, // <
+    Le, // <=
+    Gt, // >
+    Ge, // >=
     And,
     Or,
     Not,
@@ -185,8 +185,14 @@ impl Lexer {
             None => Ok(Token::Eof),
             Some(c) => {
                 match c {
-                    '(' => { self.advance(); Ok(Token::LParen) }
-                    ')' => { self.advance(); Ok(Token::RParen) }
+                    '(' => {
+                        self.advance();
+                        Ok(Token::LParen)
+                    }
+                    ')' => {
+                        self.advance();
+                        Ok(Token::RParen)
+                    }
                     '=' => {
                         self.advance();
                         if self.peek() == Some('=') {
@@ -224,7 +230,11 @@ impl Lexer {
                         }
                     }
                     '\'' | '"' => self.read_string(c),
-                    '-' if self.input.get(self.pos + 1).map_or(false, |c| c.is_ascii_digit() || *c == '.') => {
+                    '-' if self
+                        .input
+                        .get(self.pos + 1)
+                        .map_or(false, |c| c.is_ascii_digit() || *c == '.') =>
+                    {
                         self.advance(); // consume '-'
                         let token = self.read_number();
                         match token {
@@ -366,7 +376,12 @@ impl Parser {
             Token::Le => CompareOp::Le,
             Token::Gt => CompareOp::Gt,
             Token::Ge => CompareOp::Ge,
-            _ => return Err(format!("Expected comparison operator, got {:?}", self.current)),
+            _ => {
+                return Err(format!(
+                    "Expected comparison operator, got {:?}",
+                    self.current
+                ))
+            }
         };
         self.advance()?;
 
@@ -392,7 +407,10 @@ pub fn parse_expr(input: &str) -> Result<Expr, String> {
 
     // Ensure we consumed all input
     if parser.current != Token::Eof {
-        return Err(format!("Unexpected token after expression: {:?}", parser.current));
+        return Err(format!(
+            "Unexpected token after expression: {:?}",
+            parser.current
+        ));
     }
 
     Ok(expr)
@@ -410,21 +428,13 @@ pub fn eval_expr(expr: &Expr, row: &HashMap<String, ColumnValue>) -> bool {
         Expr::IsNull { column } => {
             matches!(row.get(column), Some(ColumnValue::Null) | None)
         }
-        Expr::IsNotNull { column } => {
-            match row.get(column) {
-                Some(ColumnValue::Null) | None => false,
-                Some(_) => true,
-            }
-        }
-        Expr::And(left, right) => {
-            eval_expr(left, row) && eval_expr(right, row)
-        }
-        Expr::Or(left, right) => {
-            eval_expr(left, row) || eval_expr(right, row)
-        }
-        Expr::Not(inner) => {
-            !eval_expr(inner, row)
-        }
+        Expr::IsNotNull { column } => match row.get(column) {
+            Some(ColumnValue::Null) | None => false,
+            Some(_) => true,
+        },
+        Expr::And(left, right) => eval_expr(left, row) && eval_expr(right, row),
+        Expr::Or(left, right) => eval_expr(left, row) || eval_expr(right, row),
+        Expr::Not(inner) => !eval_expr(inner, row),
     }
 }
 
@@ -448,7 +458,9 @@ fn compare_values(col_val: &ColumnValue, op: &CompareOp, lit_val: &LiteralValue)
         (ColumnValue::Float64(a), LiteralValue::Int(b)) => compare_ord(*a, *b as f64, op),
 
         // String comparisons
-        (ColumnValue::String(a), LiteralValue::String(b)) => compare_ord(a.as_str(), b.as_str(), op),
+        (ColumnValue::String(a), LiteralValue::String(b)) => {
+            compare_ord(a.as_str(), b.as_str(), op)
+        }
 
         // Boolean comparisons
         (ColumnValue::Bool(a), LiteralValue::Bool(b)) => {
@@ -488,30 +500,24 @@ where
     F: Fn(&str) -> Option<ColumnValue>,
 {
     match expr {
-        Expr::Compare { column, op, value } => {
-            match get_column(column) {
-                None => false,
-                Some(col_val) => compare_values(&col_val, op, value),
-            }
-        }
+        Expr::Compare { column, op, value } => match get_column(column) {
+            None => false,
+            Some(col_val) => compare_values(&col_val, op, value),
+        },
         Expr::IsNull { column } => {
             matches!(get_column(column), Some(ColumnValue::Null) | None)
         }
-        Expr::IsNotNull { column } => {
-            match get_column(column) {
-                Some(ColumnValue::Null) | None => false,
-                Some(_) => true,
-            }
-        }
+        Expr::IsNotNull { column } => match get_column(column) {
+            Some(ColumnValue::Null) | None => false,
+            Some(_) => true,
+        },
         Expr::And(left, right) => {
             eval_expr_fast(left, get_column) && eval_expr_fast(right, get_column)
         }
         Expr::Or(left, right) => {
             eval_expr_fast(left, get_column) || eval_expr_fast(right, get_column)
         }
-        Expr::Not(inner) => {
-            !eval_expr_fast(inner, get_column)
-        }
+        Expr::Not(inner) => !eval_expr_fast(inner, get_column),
     }
 }
 

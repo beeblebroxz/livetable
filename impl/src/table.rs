@@ -1,3 +1,4 @@
+use crate::changeset::{Changeset, TableChange};
 /// LiveTable Table Implementation in Rust
 ///
 /// A Table is a collection of columns with a schema.
@@ -30,13 +31,10 @@
 /// assert_eq!(table.len(), 1);
 /// assert_eq!(table.get_value(0, "name").unwrap().as_string(), Some("Alice"));
 /// ```
-
 use crate::column::{Column, ColumnType, ColumnValue};
-use crate::changeset::{Changeset, TableChange};
-use crate::interner::{StringInterner, InternerStats};
-use std::cell::RefCell;
+use crate::interner::{InternerStats, StringInterner};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 /// Hint for selecting the underlying storage strategy.
 ///
@@ -129,7 +127,10 @@ impl Schema {
 
     /// Returns a list of all column names.
     pub fn get_column_names(&self) -> Vec<&str> {
-        self.columns.iter().map(|(name, _, _)| name.as_str()).collect()
+        self.columns
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect()
     }
 
     /// Returns the index of a column by name, or None if not found.
@@ -141,19 +142,23 @@ impl Schema {
     ///
     /// Returns a tuple of (name, type, nullable) or None if index is out of bounds.
     pub fn get_column_info(&self, index: usize) -> Option<(&str, ColumnType, bool)> {
-        self.columns.get(index).map(|(name, ty, nullable)| (name.as_str(), *ty, *nullable))
+        self.columns
+            .get(index)
+            .map(|(name, ty, nullable)| (name.as_str(), *ty, *nullable))
     }
 
     /// Returns the type of a column by name, or None if not found.
     pub fn get_column_type(&self, name: &str) -> Option<ColumnType> {
-        self.columns.iter()
+        self.columns
+            .iter()
             .find(|(n, _, _)| n == name)
             .map(|(_, ty, _)| *ty)
     }
 
     /// Returns whether a column is nullable by name, or None if not found.
     pub fn is_column_nullable(&self, name: &str) -> Option<bool> {
-        self.columns.iter()
+        self.columns
+            .iter()
             .find(|(n, _, _)| n == name)
             .map(|(_, _, nullable)| *nullable)
     }
@@ -193,7 +198,7 @@ pub struct Table {
     /// Tracks changes for incremental view propagation
     changeset: Changeset,
     /// Optional string interner shared across all string columns
-    interner: Option<Rc<RefCell<StringInterner>>>,
+    interner: Option<Arc<Mutex<StringInterner>>>,
 }
 
 impl Table {
@@ -249,7 +254,7 @@ impl Table {
         let use_tiered_vector = hint.use_tiered_vector();
         // Create shared interner if string interning is enabled
         let interner = if use_string_interning {
-            Some(Rc::new(RefCell::new(StringInterner::new())))
+            Some(Arc::new(Mutex::new(StringInterner::new())))
         } else {
             None
         };
@@ -296,7 +301,10 @@ impl Table {
     /// Create a new table with boolean storage option and interning (deprecated).
     ///
     /// Prefer using `with_hint_and_interning()` for clearer intent.
-    #[deprecated(since = "0.2.0", note = "Use `with_hint_and_interning()` with `StorageHint` instead")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use `with_hint_and_interning()` with `StorageHint` instead"
+    )]
     pub fn new_with_interning(
         name: String,
         schema: Schema,
@@ -318,7 +326,7 @@ impl Table {
 
     /// Returns statistics about the string interner, if enabled
     pub fn interner_stats(&self) -> Option<InternerStats> {
-        self.interner.as_ref().map(|i| i.borrow().stats())
+        self.interner.as_ref().map(|i| i.lock().unwrap().stats())
     }
 
     pub fn name(&self) -> &str {
@@ -341,7 +349,8 @@ impl Table {
         if row >= self.row_count {
             return Err(format!("Row {} out of range [0, {})", row, self.row_count));
         }
-        let col_idx = self.schema
+        let col_idx = self
+            .schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
@@ -352,16 +361,23 @@ impl Table {
     /// Used for performance-critical loops where column lookup can be done once upfront.
     #[inline]
     pub fn get_value_by_index(&self, row: usize, col_idx: usize) -> Result<ColumnValue, String> {
-        self.columns.get(col_idx)
+        self.columns
+            .get(col_idx)
             .ok_or_else(|| format!("Column index {} out of range", col_idx))?
             .get(row)
     }
 
-    pub fn set_value(&mut self, row: usize, column: &str, value: ColumnValue) -> Result<(), String> {
+    pub fn set_value(
+        &mut self,
+        row: usize,
+        column: &str,
+        value: ColumnValue,
+    ) -> Result<(), String> {
         if row >= self.row_count {
             return Err(format!("Row {} out of range [0, {})", row, self.row_count));
         }
-        let col_idx = self.schema
+        let col_idx = self
+            .schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
@@ -387,7 +403,7 @@ impl Table {
             return Err(format!("Row {} out of range [0, {})", row, self.row_count));
         }
 
-        let mut result = HashMap::new();
+        let mut result = HashMap::with_capacity(self.columns.len());
         for (i, col) in self.columns.iter().enumerate() {
             let col_name = self.schema.get_column_info(i).unwrap().0;
             result.insert(col_name.to_string(), col.get(row)?);
@@ -473,7 +489,10 @@ impl Table {
     /// assert_eq!(count, 2);
     /// assert_eq!(table.len(), 2);
     /// ```
-    pub fn append_rows(&mut self, rows: Vec<HashMap<String, ColumnValue>>) -> Result<usize, String> {
+    pub fn append_rows(
+        &mut self,
+        rows: Vec<HashMap<String, ColumnValue>>,
+    ) -> Result<usize, String> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -485,13 +504,15 @@ impl Table {
             for (i, col) in self.columns.iter().enumerate() {
                 let col_name = col_names[i];
                 match row.get(col_name) {
-                    None => return Err(format!(
-                        "Row {}: Missing value for column '{}'",
-                        row_idx, col_name
-                    )),
-                    Some(value) => col.check_value_type(value).map_err(|e| {
-                        format!("Row {}: {}", row_idx, e)
-                    })?,
+                    None => {
+                        return Err(format!(
+                            "Row {}: Missing value for column '{}'",
+                            row_idx, col_name
+                        ))
+                    }
+                    Some(value) => col
+                        .check_value_type(value)
+                        .map_err(|e| format!("Row {}: {}", row_idx, e))?,
                 }
             }
         }
@@ -522,9 +543,16 @@ impl Table {
         Ok(num_rows)
     }
 
-    pub fn insert_row(&mut self, index: usize, row: HashMap<String, ColumnValue>) -> Result<(), String> {
+    pub fn insert_row(
+        &mut self,
+        index: usize,
+        row: HashMap<String, ColumnValue>,
+    ) -> Result<(), String> {
         if index > self.row_count {
-            return Err(format!("Index {} out of range [0, {}]", index, self.row_count));
+            return Err(format!(
+                "Index {} out of range [0, {}]",
+                index, self.row_count
+            ));
         }
 
         // Validate all columns are present and type-compatible before any mutation
@@ -546,17 +574,18 @@ impl Table {
         self.row_count += 1;
 
         // Record the change
-        self.changeset.push(TableChange::RowInserted {
-            index,
-            data: row,
-        });
+        self.changeset
+            .push(TableChange::RowInserted { index, data: row });
 
         Ok(())
     }
 
     pub fn delete_row(&mut self, index: usize) -> Result<HashMap<String, ColumnValue>, String> {
         if index >= self.row_count {
-            return Err(format!("Row {} out of range [0, {})", index, self.row_count));
+            return Err(format!(
+                "Row {} out of range [0, {})",
+                index, self.row_count
+            ));
         }
 
         let mut result = HashMap::new();
@@ -624,7 +653,8 @@ impl Table {
     /// Calculate the sum of all numeric values in a column.
     /// NULL values are skipped.
     pub fn sum(&self, column: &str) -> Result<f64, String> {
-        let col_idx = self.schema
+        let col_idx = self
+            .schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
@@ -640,7 +670,8 @@ impl Table {
 
     /// Count the number of non-NULL values in a column.
     pub fn count_non_null(&self, column: &str) -> Result<usize, String> {
-        let col_idx = self.schema
+        let col_idx = self
+            .schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
@@ -657,7 +688,8 @@ impl Table {
     /// Calculate the average of all numeric values in a column.
     /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
     pub fn avg(&self, column: &str) -> Result<Option<f64>, String> {
-        let col_idx = self.schema
+        let col_idx = self
+            .schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
@@ -681,7 +713,8 @@ impl Table {
     /// Find the minimum numeric value in a column.
     /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
     pub fn min(&self, column: &str) -> Result<Option<f64>, String> {
-        let col_idx = self.schema
+        let col_idx = self
+            .schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
@@ -698,7 +731,8 @@ impl Table {
     /// Find the maximum numeric value in a column.
     /// NULL values are skipped. Returns None if there are no non-NULL numeric values.
     pub fn max(&self, column: &str) -> Result<Option<f64>, String> {
-        let col_idx = self.schema
+        let col_idx = self
+            .schema
             .get_column_index(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
 
@@ -752,26 +786,29 @@ impl Table {
 
         // Data rows
         for row in self.iter_rows() {
-            let values: Vec<String> = column_names.iter().map(|col| {
-                match row.get(*col) {
-                    Some(ColumnValue::Null) | None => String::new(),
-                    Some(ColumnValue::String(s)) => {
-                        // Escape quotes and wrap if contains comma/quote/newline
-                        if s.contains(',') || s.contains('"') || s.contains('\n') {
-                            format!("\"{}\"", s.replace('"', "\"\""))
-                        } else {
-                            s.clone()
+            let values: Vec<String> = column_names
+                .iter()
+                .map(|col| {
+                    match row.get(*col) {
+                        Some(ColumnValue::Null) | None => String::new(),
+                        Some(ColumnValue::String(s)) => {
+                            // Escape quotes and wrap if contains comma/quote/newline
+                            if s.contains(',') || s.contains('"') || s.contains('\n') {
+                                format!("\"{}\"", s.replace('"', "\"\""))
+                            } else {
+                                s.clone()
+                            }
                         }
+                        Some(ColumnValue::Bool(b)) => b.to_string(),
+                        Some(ColumnValue::Int32(n)) => n.to_string(),
+                        Some(ColumnValue::Int64(n)) => n.to_string(),
+                        Some(ColumnValue::Float32(f)) => f.to_string(),
+                        Some(ColumnValue::Float64(f)) => f.to_string(),
+                        Some(ColumnValue::Date(days)) => format_date(*days),
+                        Some(ColumnValue::DateTime(ms)) => format_datetime(*ms),
                     }
-                    Some(ColumnValue::Bool(b)) => b.to_string(),
-                    Some(ColumnValue::Int32(n)) => n.to_string(),
-                    Some(ColumnValue::Int64(n)) => n.to_string(),
-                    Some(ColumnValue::Float32(f)) => f.to_string(),
-                    Some(ColumnValue::Float64(f)) => f.to_string(),
-                    Some(ColumnValue::Date(days)) => format_date(*days),
-                    Some(ColumnValue::DateTime(ms)) => format_datetime(*ms),
-                }
-            }).collect();
+                })
+                .collect();
             result.push_str(&values.join(","));
             result.push('\n');
         }
@@ -805,9 +842,11 @@ impl Table {
     /// ```
     pub fn to_json(&self) -> Result<String, String> {
         let column_names = self.schema.get_column_names();
-        let rows: Vec<serde_json::Value> = self.iter_rows()
+        let rows: Vec<serde_json::Value> = self
+            .iter_rows()
             .map(|row| {
-                let obj: serde_json::Map<String, serde_json::Value> = column_names.iter()
+                let obj: serde_json::Map<String, serde_json::Value> = column_names
+                    .iter()
                     .map(|col| {
                         let json_val = match row.get(*col) {
                             Some(ColumnValue::Int32(n)) => serde_json::Value::Number((*n).into()),
@@ -817,15 +856,17 @@ impl Table {
                                     .map(serde_json::Value::Number)
                                     .unwrap_or(serde_json::Value::Null)
                             }
-                            Some(ColumnValue::Float64(f)) => {
-                                serde_json::Number::from_f64(*f)
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null)
-                            }
+                            Some(ColumnValue::Float64(f)) => serde_json::Number::from_f64(*f)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null),
                             Some(ColumnValue::String(s)) => serde_json::Value::String(s.clone()),
                             Some(ColumnValue::Bool(b)) => serde_json::Value::Bool(*b),
-                            Some(ColumnValue::Date(days)) => serde_json::Value::String(format_date(*days)),
-                            Some(ColumnValue::DateTime(ms)) => serde_json::Value::String(format_datetime(*ms)),
+                            Some(ColumnValue::Date(days)) => {
+                                serde_json::Value::String(format_date(*days))
+                            }
+                            Some(ColumnValue::DateTime(ms)) => {
+                                serde_json::Value::String(format_datetime(*ms))
+                            }
                             Some(ColumnValue::Null) | None => serde_json::Value::Null,
                         };
                         (col.to_string(), json_val)
@@ -835,8 +876,7 @@ impl Table {
             })
             .collect();
 
-        serde_json::to_string_pretty(&rows)
-            .map_err(|e| format!("JSON serialization error: {}", e))
+        serde_json::to_string_pretty(&rows).map_err(|e| format!("JSON serialization error: {}", e))
     }
 
     /// Create a table from a CSV string.
@@ -938,16 +978,15 @@ impl Table {
     /// assert_eq!(table.len(), 2);
     /// ```
     pub fn from_json(name: &str, json: &str) -> Result<Table, String> {
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(json)
-            .map_err(|e| format!("JSON parse error: {}", e))?;
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(json).map_err(|e| format!("JSON parse error: {}", e))?;
 
         if parsed.is_empty() {
             return Err("JSON array is empty".to_string());
         }
 
         // Infer schema from first object
-        let first = parsed[0].as_object()
-            .ok_or("Expected array of objects")?;
+        let first = parsed[0].as_object().ok_or("Expected array of objects")?;
 
         let schema = infer_schema_from_json(first)?;
         let mut table = Table::new(name.to_string(), schema);
@@ -1007,7 +1046,9 @@ impl Table {
         let column_indices: std::collections::HashMap<String, usize> = expr_columns
             .iter()
             .filter_map(|name| {
-                self.schema.get_column_index(name).map(|idx| (name.clone(), idx))
+                self.schema
+                    .get_column_index(name)
+                    .map(|idx| (name.clone(), idx))
             })
             .collect();
 
@@ -1017,7 +1058,9 @@ impl Table {
             // Use eval_expr_fast with a closure that directly accesses columns
             let matches = crate::expr::eval_expr_fast(&expr, &|col_name: &str| {
                 column_indices.get(col_name).and_then(|&col_idx| {
-                    self.columns.get(col_idx).and_then(|col| col.get(row_idx).ok())
+                    self.columns
+                        .get(col_idx)
+                        .and_then(|col| col.get(row_idx).ok())
                 })
             });
 
@@ -1038,7 +1081,11 @@ impl Table {
 fn ymd_from_days(days: i32) -> (i32, u32, u32) {
     // Algorithm from https://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
     let doe = (z - era * 146097) as u32;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = (yoe as i32) + era * 400;
@@ -1087,11 +1134,15 @@ fn format_datetime(ms: i64) -> String {
     let millisecond = time_ms % 1000;
 
     if millisecond > 0 {
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}",
-            year, month, day, hour, minute, second, millisecond)
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}",
+            year, month, day, hour, minute, second, millisecond
+        )
     } else {
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-            year, month, day, hour, minute, second)
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            year, month, day, hour, minute, second
+        )
     }
 }
 
@@ -1165,10 +1216,8 @@ fn parse_datetime(s: &str) -> Option<i64> {
         return None;
     }
 
-    let time_ms = (hour as i64) * 3_600_000
-        + (minute as i64) * 60_000
-        + (second as i64) * 1000
-        + (ms as i64);
+    let time_ms =
+        (hour as i64) * 3_600_000 + (minute as i64) * 60_000 + (second as i64) * 1000 + (ms as i64);
 
     Some((days as i64) * 86_400_000 + time_ms)
 }
@@ -1230,7 +1279,10 @@ fn parse_csv_rows(csv: &str) -> Vec<Vec<String>> {
 fn infer_types_from_csv_row(row: Option<&Vec<String>>) -> Vec<ColumnType> {
     match row {
         None => Vec::new(),
-        Some(values) => values.iter().map(|v| infer_type_from_csv_value(v)).collect(),
+        Some(values) => values
+            .iter()
+            .map(|v| infer_type_from_csv_value(v))
+            .collect(),
     }
 }
 
@@ -1250,7 +1302,8 @@ fn infer_type_from_csv_value(value: &str) -> ColumnType {
 
     // Check for datetime (YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS)
     if (trimmed.contains('T') || (trimmed.contains(' ') && trimmed.contains(':')))
-        && parse_datetime(trimmed).is_some() {
+        && parse_datetime(trimmed).is_some()
+    {
         return ColumnType::DateTime;
     }
 
@@ -1306,26 +1359,22 @@ fn parse_csv_value(value: &str, col_type: ColumnType) -> Result<ColumnValue, Str
     }
 
     match col_type {
-        ColumnType::Int32 => {
-            trimmed.parse::<i32>()
-                .map(ColumnValue::Int32)
-                .map_err(|_| format!("Cannot parse '{}' as INT32", trimmed))
-        }
-        ColumnType::Int64 => {
-            trimmed.parse::<i64>()
-                .map(ColumnValue::Int64)
-                .map_err(|_| format!("Cannot parse '{}' as INT64", trimmed))
-        }
-        ColumnType::Float32 => {
-            trimmed.parse::<f32>()
-                .map(ColumnValue::Float32)
-                .map_err(|_| format!("Cannot parse '{}' as FLOAT32", trimmed))
-        }
-        ColumnType::Float64 => {
-            trimmed.parse::<f64>()
-                .map(ColumnValue::Float64)
-                .map_err(|_| format!("Cannot parse '{}' as FLOAT64", trimmed))
-        }
+        ColumnType::Int32 => trimmed
+            .parse::<i32>()
+            .map(ColumnValue::Int32)
+            .map_err(|_| format!("Cannot parse '{}' as INT32", trimmed)),
+        ColumnType::Int64 => trimmed
+            .parse::<i64>()
+            .map(ColumnValue::Int64)
+            .map_err(|_| format!("Cannot parse '{}' as INT64", trimmed)),
+        ColumnType::Float32 => trimmed
+            .parse::<f32>()
+            .map(ColumnValue::Float32)
+            .map_err(|_| format!("Cannot parse '{}' as FLOAT32", trimmed)),
+        ColumnType::Float64 => trimmed
+            .parse::<f64>()
+            .map(ColumnValue::Float64)
+            .map_err(|_| format!("Cannot parse '{}' as FLOAT64", trimmed)),
         ColumnType::Bool => {
             if trimmed.eq_ignore_ascii_case("true") {
                 Ok(ColumnValue::Bool(true))
@@ -1335,24 +1384,25 @@ fn parse_csv_value(value: &str, col_type: ColumnType) -> Result<ColumnValue, Str
                 Err(format!("Cannot parse '{}' as BOOL", trimmed))
             }
         }
-        ColumnType::String => {
-            Ok(ColumnValue::String(trimmed.to_string()))
-        }
-        ColumnType::Date => {
-            parse_date(trimmed)
-                .map(ColumnValue::Date)
-                .ok_or_else(|| format!("Cannot parse '{}' as DATE (expected YYYY-MM-DD)", trimmed))
-        }
-        ColumnType::DateTime => {
-            parse_datetime(trimmed)
-                .map(ColumnValue::DateTime)
-                .ok_or_else(|| format!("Cannot parse '{}' as DATETIME (expected YYYY-MM-DDTHH:MM:SS)", trimmed))
-        }
+        ColumnType::String => Ok(ColumnValue::String(trimmed.to_string())),
+        ColumnType::Date => parse_date(trimmed)
+            .map(ColumnValue::Date)
+            .ok_or_else(|| format!("Cannot parse '{}' as DATE (expected YYYY-MM-DD)", trimmed)),
+        ColumnType::DateTime => parse_datetime(trimmed)
+            .map(ColumnValue::DateTime)
+            .ok_or_else(|| {
+                format!(
+                    "Cannot parse '{}' as DATETIME (expected YYYY-MM-DDTHH:MM:SS)",
+                    trimmed
+                )
+            }),
     }
 }
 
 /// Infer schema from a JSON object
-fn infer_schema_from_json(obj: &serde_json::Map<String, serde_json::Value>) -> Result<Schema, String> {
+fn infer_schema_from_json(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Schema, String> {
     let mut columns = Vec::new();
 
     for (key, value) in obj {
@@ -1372,9 +1422,11 @@ fn infer_schema_from_json(obj: &serde_json::Map<String, serde_json::Value>) -> R
             serde_json::Value::String(s) => {
                 // Try to detect date/datetime strings
                 if (s.contains('T') || (s.contains(' ') && s.contains(':')))
-                    && parse_datetime(s).is_some() {
+                    && parse_datetime(s).is_some()
+                {
                     ColumnType::DateTime
-                } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some() {
+                } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some()
+                {
                     ColumnType::Date
                 } else {
                     ColumnType::String
@@ -1391,7 +1443,9 @@ fn infer_schema_from_json(obj: &serde_json::Map<String, serde_json::Value>) -> R
 }
 
 /// Convert a JSON object to a row map
-fn json_object_to_row_map(obj: &serde_json::Map<String, serde_json::Value>) -> Result<HashMap<String, ColumnValue>, String> {
+fn json_object_to_row_map(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<HashMap<String, ColumnValue>, String> {
     let mut row = HashMap::new();
 
     for (key, value) in obj {
@@ -1411,9 +1465,11 @@ fn json_object_to_row_map(obj: &serde_json::Map<String, serde_json::Value>) -> R
             serde_json::Value::String(s) => {
                 // Try to detect and parse date/datetime strings
                 if (s.contains('T') || (s.contains(' ') && s.contains(':')))
-                    && parse_datetime(s).is_some() {
+                    && parse_datetime(s).is_some()
+                {
                     ColumnValue::DateTime(parse_datetime(s).unwrap())
-                } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some() {
+                } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some()
+                {
                     ColumnValue::Date(parse_date(s).unwrap())
                 } else {
                     ColumnValue::String(s.clone())
@@ -1490,9 +1546,7 @@ mod tests {
 
     #[test]
     fn test_table_insert() {
-        let schema = Schema::new(vec![
-            ("id".to_string(), ColumnType::Int32, false),
-        ]);
+        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
 
         let mut table = Table::new("test".to_string(), schema);
 
@@ -1525,17 +1579,26 @@ mod tests {
 
         let mut row1 = HashMap::new();
         row1.insert("id".to_string(), ColumnValue::Int32(1));
-        row1.insert("value".to_string(), ColumnValue::String("first".to_string()));
+        row1.insert(
+            "value".to_string(),
+            ColumnValue::String("first".to_string()),
+        );
         table.append_row(row1).unwrap();
 
         let mut row2 = HashMap::new();
         row2.insert("id".to_string(), ColumnValue::Int32(2));
-        row2.insert("value".to_string(), ColumnValue::String("second".to_string()));
+        row2.insert(
+            "value".to_string(),
+            ColumnValue::String("second".to_string()),
+        );
         table.append_row(row2).unwrap();
 
         let mut row3 = HashMap::new();
         row3.insert("id".to_string(), ColumnValue::Int32(3));
-        row3.insert("value".to_string(), ColumnValue::String("third".to_string()));
+        row3.insert(
+            "value".to_string(),
+            ColumnValue::String("third".to_string()),
+        );
         table.append_row(row3).unwrap();
 
         // Delete middle row
@@ -1585,7 +1648,9 @@ mod tests {
         table.append_row(row).unwrap();
 
         // Update value
-        table.set_value(0, "value", ColumnValue::Int32(200)).unwrap();
+        table
+            .set_value(0, "value", ColumnValue::Int32(200))
+            .unwrap();
 
         assert_eq!(table.get_value(0, "value").unwrap().as_i32(), Some(200));
         assert_eq!(table.get_value(0, "id").unwrap().as_i32(), Some(1));
@@ -1606,34 +1671,64 @@ mod tests {
         // Add rows with repeated category strings
         let mut row1 = HashMap::new();
         row1.insert("id".to_string(), ColumnValue::Int32(1));
-        row1.insert("category".to_string(), ColumnValue::String("Electronics".to_string()));
+        row1.insert(
+            "category".to_string(),
+            ColumnValue::String("Electronics".to_string()),
+        );
         row1.insert("name".to_string(), ColumnValue::String("Phone".to_string()));
         table.append_row(row1).unwrap();
 
         let mut row2 = HashMap::new();
         row2.insert("id".to_string(), ColumnValue::Int32(2));
-        row2.insert("category".to_string(), ColumnValue::String("Electronics".to_string())); // Duplicate
-        row2.insert("name".to_string(), ColumnValue::String("Laptop".to_string()));
+        row2.insert(
+            "category".to_string(),
+            ColumnValue::String("Electronics".to_string()),
+        ); // Duplicate
+        row2.insert(
+            "name".to_string(),
+            ColumnValue::String("Laptop".to_string()),
+        );
         table.append_row(row2).unwrap();
 
         let mut row3 = HashMap::new();
         row3.insert("id".to_string(), ColumnValue::Int32(3));
-        row3.insert("category".to_string(), ColumnValue::String("Clothing".to_string()));
+        row3.insert(
+            "category".to_string(),
+            ColumnValue::String("Clothing".to_string()),
+        );
         row3.insert("name".to_string(), ColumnValue::String("Shirt".to_string()));
         table.append_row(row3).unwrap();
 
         let mut row4 = HashMap::new();
         row4.insert("id".to_string(), ColumnValue::Int32(4));
-        row4.insert("category".to_string(), ColumnValue::String("Electronics".to_string())); // Another duplicate
-        row4.insert("name".to_string(), ColumnValue::String("Tablet".to_string()));
+        row4.insert(
+            "category".to_string(),
+            ColumnValue::String("Electronics".to_string()),
+        ); // Another duplicate
+        row4.insert(
+            "name".to_string(),
+            ColumnValue::String("Tablet".to_string()),
+        );
         table.append_row(row4).unwrap();
 
         // Verify data is correct
         assert_eq!(table.len(), 4);
-        assert_eq!(table.get_value(0, "category").unwrap().as_string(), Some("Electronics"));
-        assert_eq!(table.get_value(1, "category").unwrap().as_string(), Some("Electronics"));
-        assert_eq!(table.get_value(2, "category").unwrap().as_string(), Some("Clothing"));
-        assert_eq!(table.get_value(3, "category").unwrap().as_string(), Some("Electronics"));
+        assert_eq!(
+            table.get_value(0, "category").unwrap().as_string(),
+            Some("Electronics")
+        );
+        assert_eq!(
+            table.get_value(1, "category").unwrap().as_string(),
+            Some("Electronics")
+        );
+        assert_eq!(
+            table.get_value(2, "category").unwrap().as_string(),
+            Some("Clothing")
+        );
+        assert_eq!(
+            table.get_value(3, "category").unwrap().as_string(),
+            Some("Electronics")
+        );
 
         // Check interner stats - should have deduplicated strings
         let stats = table.interner_stats().unwrap();
@@ -1654,19 +1749,33 @@ mod tests {
 
         let mut row1 = HashMap::new();
         row1.insert("id".to_string(), ColumnValue::Int32(1));
-        row1.insert("status".to_string(), ColumnValue::String("pending".to_string()));
+        row1.insert(
+            "status".to_string(),
+            ColumnValue::String("pending".to_string()),
+        );
         table.append_row(row1).unwrap();
 
         let mut row2 = HashMap::new();
         row2.insert("id".to_string(), ColumnValue::Int32(2));
-        row2.insert("status".to_string(), ColumnValue::String("pending".to_string()));
+        row2.insert(
+            "status".to_string(),
+            ColumnValue::String("pending".to_string()),
+        );
         table.append_row(row2).unwrap();
 
         // Update first order status
-        table.set_value(0, "status", ColumnValue::String("completed".to_string())).unwrap();
+        table
+            .set_value(0, "status", ColumnValue::String("completed".to_string()))
+            .unwrap();
 
-        assert_eq!(table.get_value(0, "status").unwrap().as_string(), Some("completed"));
-        assert_eq!(table.get_value(1, "status").unwrap().as_string(), Some("pending"));
+        assert_eq!(
+            table.get_value(0, "status").unwrap().as_string(),
+            Some("completed")
+        );
+        assert_eq!(
+            table.get_value(1, "status").unwrap().as_string(),
+            Some("pending")
+        );
 
         // Check stats after update
         let stats = table.interner_stats().unwrap();
@@ -1675,9 +1784,7 @@ mod tests {
 
     #[test]
     fn test_table_without_string_interning() {
-        let schema = Schema::new(vec![
-            ("name".to_string(), ColumnType::String, false),
-        ]);
+        let schema = Schema::new(vec![("name".to_string(), ColumnType::String, false)]);
 
         // Create table without string interning (default)
         let table = Table::new("simple".to_string(), schema);

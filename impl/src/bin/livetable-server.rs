@@ -2,7 +2,6 @@
 ///
 /// Standalone server that provides WebSocket access to LiveTable tables
 /// with real-time updates for frontend clients.
-
 use livetable::server::run_server;
 
 #[actix_web::main]

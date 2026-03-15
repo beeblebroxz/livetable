@@ -5,7 +5,6 @@
 /// - Inner Join: Only rows that exist in both tables
 /// - Handling nulls in left joins
 /// - Refreshing joins after data changes
-
 use livetable::{ColumnType, ColumnValue, JoinType, JoinView, Schema, Table};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -54,7 +53,10 @@ fn main() {
         ("amount".to_string(), ColumnType::Float64, false),
     ]);
 
-    let orders = Rc::new(RefCell::new(Table::new("orders".to_string(), orders_schema)));
+    let orders = Rc::new(RefCell::new(Table::new(
+        "orders".to_string(),
+        orders_schema,
+    )));
 
     {
         let mut o = orders.borrow_mut();
@@ -72,7 +74,10 @@ fn main() {
             let mut row = HashMap::new();
             row.insert("order_id".to_string(), ColumnValue::Int32(order_id));
             row.insert("user_id".to_string(), ColumnValue::Int32(user_id));
-            row.insert("product".to_string(), ColumnValue::String(product.to_string()));
+            row.insert(
+                "product".to_string(),
+                ColumnValue::String(product.to_string()),
+            );
             row.insert("amount".to_string(), ColumnValue::Float64(amount));
             o.append_row(row).unwrap();
         }
@@ -170,7 +175,10 @@ fn main() {
         let mut new_order = HashMap::new();
         new_order.insert("order_id".to_string(), ColumnValue::Int32(106));
         new_order.insert("user_id".to_string(), ColumnValue::Int32(2)); // Bob's first order!
-        new_order.insert("product".to_string(), ColumnValue::String("Tablet".to_string()));
+        new_order.insert(
+            "product".to_string(),
+            ColumnValue::String("Tablet".to_string()),
+        );
         new_order.insert("amount".to_string(), ColumnValue::Float64(599.99));
         o.append_row(new_order).unwrap();
     }
@@ -197,7 +205,8 @@ fn main() {
         let name = row.get("name").unwrap().as_string().unwrap();
         if name == "Bob" {
             if let Some(ColumnValue::String(product)) = row.get("right_product") {
-                println!("   Bob's order: {} - ${:.2}",
+                println!(
+                    "   Bob's order: {} - ${:.2}",
                     product,
                     row.get("right_amount").unwrap().as_f64().unwrap()
                 );
@@ -215,8 +224,8 @@ fn main() {
         "custom".to_string(),
         users.clone(),
         orders.clone(),
-        "user_id".to_string(),  // Column in users table
-        "user_id".to_string(),  // Column in orders table (same name, but could be different)
+        "user_id".to_string(), // Column in users table
+        "user_id".to_string(), // Column in orders table (same name, but could be different)
         JoinType::Left,
     )
     .unwrap();
@@ -226,8 +235,14 @@ fn main() {
 
     // 8. Summary
     println!("8. Summary:");
-    println!("   Left Join:  {} rows (includes all users)", left_join.len());
-    println!("   Inner Join: {} rows (only users with orders)", inner_join.len());
+    println!(
+        "   Left Join:  {} rows (includes all users)",
+        left_join.len()
+    );
+    println!(
+        "   Inner Join: {} rows (only users with orders)",
+        inner_join.len()
+    );
     println!();
     println!("   Left joins preserve all rows from the left table.");
     println!("   Inner joins only keep rows that match in both tables.");

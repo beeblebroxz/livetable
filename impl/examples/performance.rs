@@ -4,7 +4,6 @@
 /// - Difference between ArraySequence and TieredVectorSequence
 /// - When to use each storage backend
 /// - Performance characteristics of different operations
-
 use livetable::{ColumnType, ColumnValue, Schema, Table};
 use std::collections::HashMap;
 use std::time::Instant;

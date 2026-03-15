@@ -5,7 +5,6 @@
 /// - Creating ProjectionView to select columns
 /// - Creating ComputedView to add calculated columns
 /// - Combining multiple views
-
 use livetable::{ColumnType, ColumnValue, ComputedView, FilterView, ProjectionView, Schema, Table};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -40,8 +39,14 @@ fn main() {
 
         for (product, category, price, quantity, discount) in items {
             let mut row = HashMap::new();
-            row.insert("product".to_string(), ColumnValue::String(product.to_string()));
-            row.insert("category".to_string(), ColumnValue::String(category.to_string()));
+            row.insert(
+                "product".to_string(),
+                ColumnValue::String(product.to_string()),
+            );
+            row.insert(
+                "category".to_string(),
+                ColumnValue::String(category.to_string()),
+            );
             row.insert("price".to_string(), ColumnValue::Float64(price));
             row.insert("quantity".to_string(), ColumnValue::Int32(quantity));
             row.insert("discount".to_string(), ColumnValue::Float64(discount));
@@ -53,17 +58,13 @@ fn main() {
 
     // 2. FilterView - Show only Electronics
     println!("2. Creating FilterView for Electronics...");
-    let electronics_view = FilterView::new(
-        "electronics".to_string(),
-        table.clone(),
-        |row| {
-            if let Some(ColumnValue::String(cat)) = row.get("category") {
-                cat == "Electronics"
-            } else {
-                false
-            }
-        },
-    );
+    let electronics_view = FilterView::new("electronics".to_string(), table.clone(), |row| {
+        if let Some(ColumnValue::String(cat)) = row.get("category") {
+            cat == "Electronics"
+        } else {
+            false
+        }
+    });
 
     println!("   Electronics items: {}", electronics_view.len());
     for i in 0..electronics_view.len() {
@@ -133,35 +134,28 @@ fn main() {
 
     // 5. Filter high-revenue items
     println!("5. Filtering high-revenue items (> $1000)...");
-    let mut high_revenue = FilterView::new(
-        "high_revenue".to_string(),
-        table.clone(),
-        |row| {
-            // Note: This filters on base table, not computed view
-            // In a real scenario, we'd compute revenue here too
-            let price = match row.get("price") {
-                Some(ColumnValue::Float64(p)) => *p,
-                _ => 0.0,
-            };
-            let qty = match row.get("quantity") {
-                Some(ColumnValue::Int32(q)) => *q as f64,
-                _ => 0.0,
-            };
-            let discount = match row.get("discount") {
-                Some(ColumnValue::Float64(d)) => *d,
-                _ => 0.0,
-            };
-            price * qty * (1.0 - discount) > 1000.0
-        },
-    );
+    let mut high_revenue = FilterView::new("high_revenue".to_string(), table.clone(), |row| {
+        // Note: This filters on base table, not computed view
+        // In a real scenario, we'd compute revenue here too
+        let price = match row.get("price") {
+            Some(ColumnValue::Float64(p)) => *p,
+            _ => 0.0,
+        };
+        let qty = match row.get("quantity") {
+            Some(ColumnValue::Int32(q)) => *q as f64,
+            _ => 0.0,
+        };
+        let discount = match row.get("discount") {
+            Some(ColumnValue::Float64(d)) => *d,
+            _ => 0.0,
+        };
+        price * qty * (1.0 - discount) > 1000.0
+    });
 
     println!("   High-revenue items: {}", high_revenue.len());
     for i in 0..high_revenue.len() {
         let row = high_revenue.get_row(i).unwrap();
-        println!(
-            "      {}",
-            row.get("product").unwrap().as_string().unwrap()
-        );
+        println!("      {}", row.get("product").unwrap().as_string().unwrap());
     }
     println!();
 
@@ -170,8 +164,14 @@ fn main() {
     {
         let mut t = table.borrow_mut();
         let mut new_row = HashMap::new();
-        new_row.insert("product".to_string(), ColumnValue::String("Keyboard".to_string()));
-        new_row.insert("category".to_string(), ColumnValue::String("Electronics".to_string()));
+        new_row.insert(
+            "product".to_string(),
+            ColumnValue::String("Keyboard".to_string()),
+        );
+        new_row.insert(
+            "category".to_string(),
+            ColumnValue::String("Electronics".to_string()),
+        );
         new_row.insert("price".to_string(), ColumnValue::Float64(79.99));
         new_row.insert("quantity".to_string(), ColumnValue::Int32(15));
         new_row.insert("discount".to_string(), ColumnValue::Float64(0.0));

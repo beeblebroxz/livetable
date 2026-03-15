@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use livetable::*;
 use std::collections::HashMap;
 
@@ -126,7 +126,10 @@ fn bench_table_append(c: &mut Criterion) {
                     let mut row = HashMap::new();
                     row.insert("id".to_string(), ColumnValue::Int32(i));
                     row.insert("value".to_string(), ColumnValue::Float64(i as f64 * 1.5));
-                    row.insert("name".to_string(), ColumnValue::String(format!("item_{}", i)));
+                    row.insert(
+                        "name".to_string(),
+                        ColumnValue::String(format!("item_{}", i)),
+                    );
                     table.append_row(row).unwrap();
                 }
             });
@@ -151,7 +154,10 @@ fn bench_table_random_access(c: &mut Criterion) {
             let mut row = HashMap::new();
             row.insert("id".to_string(), ColumnValue::Int32(i));
             row.insert("value".to_string(), ColumnValue::Float64(i as f64 * 1.5));
-            row.insert("name".to_string(), ColumnValue::String(format!("item_{}", i)));
+            row.insert(
+                "name".to_string(),
+                ColumnValue::String(format!("item_{}", i)),
+            );
             table.append_row(row).unwrap();
         }
 
@@ -180,7 +186,8 @@ fn bench_column_operations(c: &mut Criterion) {
                 col.get((size / 2) as usize).unwrap();
 
                 // Update
-                col.set((size / 4) as usize, ColumnValue::Int32(999)).unwrap();
+                col.set((size / 4) as usize, ColumnValue::Int32(999))
+                    .unwrap();
             });
         });
     }

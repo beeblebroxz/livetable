@@ -8,52 +8,16 @@ use std::time::{Duration, Instant};
 
 use crate::column::{ColumnType, ColumnValue};
 use crate::messages::{ClientMessage, ServerMessage};
-use crate::table::Schema;
+use crate::table::{Schema, Table};
 
 /// How often heartbeat pings are sent
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long before lack of client response causes a timeout
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Simple table data storage (thread-safe)
-#[derive(Clone)]
-pub struct TableData {
-    pub name: String,
-    pub schema: Schema,
-    pub rows: Vec<HashMap<String, ColumnValue>>,
-}
-
-impl TableData {
-    pub fn new(name: String, schema: Schema) -> Self {
-        Self {
-            name,
-            schema,
-            rows: Vec::new(),
-        }
-    }
-
-    /// Convert to JSON format
-    pub fn to_json(&self) -> (Vec<String>, Vec<HashMap<String, JsonValue>>) {
-        let columns: Vec<String> = self
-            .schema
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let rows: Vec<HashMap<String, JsonValue>> = self
-            .rows
-            .iter()
-            .map(|row| row_to_json(row))
-            .collect();
-
-        (columns, rows)
-    }
-}
-
 /// Shared state for all WebSocket connections
 pub struct AppState {
-    pub tables: Arc<Mutex<HashMap<String, TableData>>>,
+    pub tables: Arc<Mutex<HashMap<String, Table>>>,
     pub subscribers: Arc<Mutex<HashMap<String, Vec<Addr<TableWebSocket>>>>>,
 }
 
@@ -68,20 +32,21 @@ impl AppState {
             ("value".to_string(), ColumnType::Float64, false),
         ]);
 
-        let mut demo_table = TableData::new("demo".to_string(), schema);
+        let mut demo_table = Table::new("demo".to_string(), schema);
 
         // Add some initial data
         let mut row1 = HashMap::new();
         row1.insert("id".to_string(), ColumnValue::Int32(1));
         row1.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
         row1.insert("value".to_string(), ColumnValue::Float64(100.5));
-        demo_table.rows.push(row1);
+        demo_table.append_row(row1).unwrap();
 
         let mut row2 = HashMap::new();
         row2.insert("id".to_string(), ColumnValue::Int32(2));
         row2.insert("name".to_string(), ColumnValue::String("Bob".to_string()));
         row2.insert("value".to_string(), ColumnValue::Float64(200.75));
-        demo_table.rows.push(row2);
+        demo_table.append_row(row2).unwrap();
+        demo_table.clear_changeset();
 
         tables.insert("demo".to_string(), demo_table);
 
@@ -101,7 +66,11 @@ impl AppState {
         if !subs.contains(&addr) {
             subs.push(addr);
         }
-        println!("[subscribe] {} now has {} subscriber(s)", table_name, subs.len());
+        println!(
+            "[subscribe] {} now has {} subscriber(s)",
+            table_name,
+            subs.len()
+        );
     }
 
     /// Broadcast a message to all subscribers of a table
@@ -121,8 +90,90 @@ impl AppState {
         let mut subscribers = self.subscribers.lock().unwrap();
         if let Some(subs) = subscribers.get_mut(table_name) {
             subs.retain(|a| a != addr);
-            println!("[unsubscribe] {} now has {} subscriber(s)", table_name, subs.len());
+            println!(
+                "[unsubscribe] {} now has {} subscriber(s)",
+                table_name,
+                subs.len()
+            );
         }
+    }
+
+    fn send_error(ctx: &mut ws::WebsocketContext<TableWebSocket>, message: String) {
+        ctx.text(serde_json::to_string(&ServerMessage::Error { message }).unwrap());
+    }
+
+    pub fn query_table(&self, table_name: &str) -> Result<ServerMessage, String> {
+        let tables = self.tables.lock().unwrap();
+        let table = tables
+            .get(table_name)
+            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+        let (columns, rows) = table_to_json(table)?;
+        Ok(ServerMessage::TableData {
+            table_name: table_name.to_string(),
+            columns,
+            rows,
+        })
+    }
+
+    pub fn insert_row(
+        &self,
+        table_name: &str,
+        row: HashMap<String, JsonValue>,
+    ) -> Result<ServerMessage, String> {
+        let mut tables = self.tables.lock().unwrap();
+        let table = tables
+            .get_mut(table_name)
+            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+        let converted_row = convert_row_for_schema(table.schema(), &row)?;
+        let index = table.len();
+        table.append_row(converted_row.clone())?;
+
+        Ok(ServerMessage::RowInserted {
+            table_name: table_name.to_string(),
+            index,
+            row: row_to_json(&converted_row),
+        })
+    }
+
+    pub fn update_cell(
+        &self,
+        table_name: &str,
+        row_index: usize,
+        column: &str,
+        value: &JsonValue,
+    ) -> Result<ServerMessage, String> {
+        let mut tables = self.tables.lock().unwrap();
+        let table = tables
+            .get_mut(table_name)
+            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+        let col_type = table
+            .schema()
+            .get_column_type(column)
+            .ok_or_else(|| format!("Column '{}' not found", column))?;
+        let nullable = table.schema().is_column_nullable(column).unwrap_or(false);
+        let col_value = json_to_column_value_typed(value, col_type, nullable)
+            .map_err(|e| format!("Column '{}': {}", column, e))?;
+        table.set_value(row_index, column, col_value.clone())?;
+
+        Ok(ServerMessage::CellUpdated {
+            table_name: table_name.to_string(),
+            row_index,
+            column: column.to_string(),
+            value: column_value_to_json(&col_value),
+        })
+    }
+
+    pub fn delete_row(&self, table_name: &str, row_index: usize) -> Result<ServerMessage, String> {
+        let mut tables = self.tables.lock().unwrap();
+        let table = tables
+            .get_mut(table_name)
+            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+        table.delete_row(row_index)?;
+
+        Ok(ServerMessage::RowDeleted {
+            table_name: table_name.to_string(),
+            index: row_index,
+        })
     }
 }
 
@@ -162,12 +213,7 @@ impl TableWebSocket {
         match msg {
             ClientMessage::Subscribe { table_name } => {
                 // Only allow subscriptions to existing tables
-                let table_exists = self
-                    .state
-                    .tables
-                    .lock()
-                    .unwrap()
-                    .contains_key(&table_name);
+                let table_exists = self.state.tables.lock().unwrap().contains_key(&table_name);
                 if !table_exists {
                     ctx.text(
                         serde_json::to_string(&ServerMessage::Error {
@@ -194,62 +240,15 @@ impl TableWebSocket {
                 ctx.text(serde_json::to_string(&response).unwrap());
             }
 
-            ClientMessage::Query { table_name } => {
-                let tables = self.state.tables.lock().unwrap();
-                if let Some(table_data) = tables.get(&table_name) {
-                    let (columns, rows) = table_data.to_json();
-                    let response = ServerMessage::TableData {
-                        table_name,
-                        columns,
-                        rows,
-                    };
-                    ctx.text(serde_json::to_string(&response).unwrap());
-                } else {
-                    ctx.text(
-                        serde_json::to_string(&ServerMessage::Error {
-                            message: format!("Table '{}' not found", table_name),
-                        })
-                        .unwrap(),
-                    );
-                }
-            }
+            ClientMessage::Query { table_name } => match self.state.query_table(&table_name) {
+                Ok(response) => ctx.text(serde_json::to_string(&response).unwrap()),
+                Err(err) => AppState::send_error(ctx, err),
+            },
 
             ClientMessage::InsertRow { table_name, row } => {
-                let mut tables = self.state.tables.lock().unwrap();
-
-                if let Some(table_data) = tables.get_mut(&table_name) {
-                    let converted_row = match convert_row_for_schema(&table_data.schema, &row) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            ctx.text(
-                                serde_json::to_string(&ServerMessage::Error {
-                                    message: e,
-                                })
-                                .unwrap(),
-                            );
-                            return;
-                        }
-                    };
-
-                    let index = table_data.rows.len();
-                    table_data.rows.push(converted_row.clone());
-
-                    drop(tables); // Release lock
-
-                    let response = ServerMessage::RowInserted {
-                        table_name: table_name.clone(),
-                        index,
-                        row: row_to_json(&converted_row),
-                    };
-
-                    self.state.broadcast(&table_name, response);
-                } else {
-                    ctx.text(
-                        serde_json::to_string(&ServerMessage::Error {
-                            message: "Table not found".to_string(),
-                        })
-                        .unwrap(),
-                    );
+                match self.state.insert_row(&table_name, row) {
+                    Ok(response) => self.state.broadcast(&table_name, response),
+                    Err(err) => AppState::send_error(ctx, err),
                 }
             }
 
@@ -259,97 +258,22 @@ impl TableWebSocket {
                 column,
                 value,
             } => {
-                let mut tables = self.state.tables.lock().unwrap();
-
-                if let Some(table_data) = tables.get_mut(&table_name) {
-                    if row_index < table_data.rows.len() {
-                        let Some(col_type) = table_data.schema.get_column_type(&column) else {
-                            ctx.text(
-                                serde_json::to_string(&ServerMessage::Error {
-                                    message: format!("Column '{}' not found", column),
-                                })
-                                .unwrap(),
-                            );
-                            return;
-                        };
-                        let nullable = table_data.schema.is_column_nullable(&column).unwrap_or(false);
-                        let col_value = match json_to_column_value_typed(&value, col_type, nullable) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                ctx.text(
-                                    serde_json::to_string(&ServerMessage::Error {
-                                        message: format!("Column '{}': {}", column, e),
-                                    })
-                                    .unwrap(),
-                                );
-                                return;
-                            }
-                        };
-                        table_data.rows[row_index].insert(column.clone(), col_value.clone());
-
-                        drop(tables); // Release lock
-
-                        let response = ServerMessage::CellUpdated {
-                            table_name: table_name.clone(),
-                            row_index,
-                            column,
-                            value: column_value_to_json(&col_value),
-                        };
-
-                        self.state.broadcast(&table_name, response);
-                    } else {
-                        ctx.text(
-                            serde_json::to_string(&ServerMessage::Error {
-                                message: "Row index out of bounds".to_string(),
-                            })
-                            .unwrap(),
-                        );
-                    }
-                } else {
-                    ctx.text(
-                        serde_json::to_string(&ServerMessage::Error {
-                            message: format!("Table '{}' not found", table_name),
-                        })
-                        .unwrap(),
-                    );
+                match self
+                    .state
+                    .update_cell(&table_name, row_index, &column, &value)
+                {
+                    Ok(response) => self.state.broadcast(&table_name, response),
+                    Err(err) => AppState::send_error(ctx, err),
                 }
             }
 
             ClientMessage::DeleteRow {
                 table_name,
                 row_index,
-            } => {
-                let mut tables = self.state.tables.lock().unwrap();
-
-                if let Some(table_data) = tables.get_mut(&table_name) {
-                    if row_index < table_data.rows.len() {
-                        table_data.rows.remove(row_index);
-
-                        drop(tables); // Release lock
-
-                        let response = ServerMessage::RowDeleted {
-                            table_name: table_name.clone(),
-                            index: row_index,
-                        };
-
-                        self.state.broadcast(&table_name, response);
-                    } else {
-                        ctx.text(
-                            serde_json::to_string(&ServerMessage::Error {
-                                message: "Row index out of bounds".to_string(),
-                            })
-                            .unwrap(),
-                        );
-                    }
-                } else {
-                    ctx.text(
-                        serde_json::to_string(&ServerMessage::Error {
-                            message: format!("Table '{}' not found", table_name),
-                        })
-                        .unwrap(),
-                    );
-                }
-            }
+            } => match self.state.delete_row(&table_name, row_index) {
+                Ok(response) => self.state.broadcast(&table_name, response),
+                Err(err) => AppState::send_error(ctx, err),
+            },
         }
     }
 }
@@ -380,21 +304,19 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for TableWebSocket {
             Ok(ws::Message::Pong(_)) => {
                 self.hb = Instant::now();
             }
-            Ok(ws::Message::Text(text)) => {
-                match serde_json::from_str::<ClientMessage>(&text) {
-                    Ok(client_msg) => {
-                        self.handle_client_message(client_msg, ctx);
-                    }
-                    Err(e) => {
-                        ctx.text(
-                            serde_json::to_string(&ServerMessage::Error {
-                                message: format!("Invalid message format: {}", e),
-                            })
-                            .unwrap(),
-                        );
-                    }
+            Ok(ws::Message::Text(text)) => match serde_json::from_str::<ClientMessage>(&text) {
+                Ok(client_msg) => {
+                    self.handle_client_message(client_msg, ctx);
                 }
-            }
+                Err(e) => {
+                    ctx.text(
+                        serde_json::to_string(&ServerMessage::Error {
+                            message: format!("Invalid message format: {}", e),
+                        })
+                        .unwrap(),
+                    );
+                }
+            },
             Ok(ws::Message::Binary(_)) => {
                 println!("Unexpected binary message");
             }
@@ -419,7 +341,11 @@ impl Handler<BroadcastMessage> for TableWebSocket {
 fn ymd_from_days(days: i32) -> (i32, u32, u32) {
     // Shift to March 1, year 0 epoch (simplifies leap year calculation)
     let z = days + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
     let doe = (z - era * 146097) as u32; // day of era [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
     let y = (yoe as i32) + era * 400;
@@ -458,16 +384,12 @@ fn column_value_to_json(cv: &ColumnValue) -> JsonValue {
     match cv {
         ColumnValue::Int32(v) => JsonValue::Number((*v).into()),
         ColumnValue::Int64(v) => JsonValue::Number((*v).into()),
-        ColumnValue::Float32(v) => {
-            serde_json::Number::from_f64(*v as f64)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }
-        ColumnValue::Float64(v) => {
-            serde_json::Number::from_f64(*v)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }
+        ColumnValue::Float32(v) => serde_json::Number::from_f64(*v as f64)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        ColumnValue::Float64(v) => serde_json::Number::from_f64(*v)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
         ColumnValue::String(v) => JsonValue::String(v.clone()),
         ColumnValue::Bool(v) => JsonValue::Bool(*v),
         ColumnValue::Date(days) => {
@@ -480,6 +402,22 @@ fn column_value_to_json(cv: &ColumnValue) -> JsonValue {
         }
         ColumnValue::Null => JsonValue::Null,
     }
+}
+
+fn table_to_json(table: &Table) -> Result<(Vec<String>, Vec<HashMap<String, JsonValue>>), String> {
+    let columns: Vec<String> = table
+        .schema()
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut rows = Vec::with_capacity(table.len());
+    for row_idx in 0..table.len() {
+        rows.push(row_to_json(&table.get_row(row_idx)?));
+    }
+
+    Ok((columns, rows))
 }
 
 /// Convert row to JSON
@@ -649,10 +587,8 @@ fn parse_datetime(s: &str) -> Option<i64> {
         return None;
     }
 
-    let time_ms = (hour as i64) * 3_600_000
-        + (minute as i64) * 60_000
-        + (second as i64) * 1000
-        + (ms as i64);
+    let time_ms =
+        (hour as i64) * 3_600_000 + (minute as i64) * 60_000 + (second as i64) * 1000 + (ms as i64);
 
     Some((days as i64) * 86_400_000 + time_ms)
 }
@@ -696,9 +632,7 @@ mod tests {
 
     #[test]
     fn test_convert_row_for_schema_rejects_unknown_column() {
-        let schema = Schema::new(vec![
-            ("id".to_string(), ColumnType::Int32, false),
-        ]);
+        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
 
         let mut row = HashMap::new();
         row.insert("id".to_string(), json!(1));
@@ -724,10 +658,97 @@ mod tests {
 
     #[test]
     fn test_json_to_column_value_typed_respects_nullability() {
-        let err = json_to_column_value_typed(&JsonValue::Null, ColumnType::Int32, false).unwrap_err();
+        let err =
+            json_to_column_value_typed(&JsonValue::Null, ColumnType::Int32, false).unwrap_err();
         assert!(err.contains("NULL value for non-nullable column"));
 
         let v = json_to_column_value_typed(&JsonValue::Null, ColumnType::Int32, true).unwrap();
         assert_eq!(v, ColumnValue::Null);
+    }
+
+    #[test]
+    fn test_app_state_initial_demo_table_clears_seed_changes() {
+        let state = AppState::new();
+        let tables = state.tables.lock().unwrap();
+        let demo = tables.get("demo").expect("demo table should exist");
+
+        assert_eq!(demo.len(), 2);
+        assert_eq!(demo.changeset().len(), 0);
+    }
+
+    #[test]
+    fn test_app_state_mutations_use_core_table_operations() {
+        let state = AppState::new();
+
+        let insert_response = state
+            .insert_row(
+                "demo",
+                HashMap::from([
+                    ("id".to_string(), json!(3)),
+                    ("name".to_string(), json!("Charlie")),
+                    ("value".to_string(), json!(300.25)),
+                ]),
+            )
+            .expect("insert should succeed");
+        assert!(matches!(
+            insert_response,
+            ServerMessage::RowInserted { index: 2, .. }
+        ));
+
+        let update_response = state
+            .update_cell("demo", 1, "value", &json!(250.5))
+            .expect("update should succeed");
+        assert!(matches!(
+            update_response,
+            ServerMessage::CellUpdated { row_index: 1, .. }
+        ));
+
+        let delete_response = state.delete_row("demo", 0).expect("delete should succeed");
+        assert!(matches!(
+            delete_response,
+            ServerMessage::RowDeleted { index: 0, .. }
+        ));
+
+        let tables = state.tables.lock().unwrap();
+        let demo = tables.get("demo").expect("demo table should exist");
+        assert_eq!(demo.len(), 2);
+        assert_eq!(demo.changeset().len(), 3);
+        assert_eq!(
+            demo.get_value(0, "name").unwrap(),
+            ColumnValue::String("Bob".to_string())
+        );
+        assert_eq!(
+            demo.get_value(0, "value").unwrap(),
+            ColumnValue::Float64(250.5)
+        );
+        assert_eq!(
+            demo.get_value(1, "name").unwrap(),
+            ColumnValue::String("Charlie".to_string())
+        );
+    }
+
+    #[test]
+    fn test_query_table_returns_json_from_core_table() {
+        let state = AppState::new();
+        state
+            .insert_row(
+                "demo",
+                HashMap::from([
+                    ("id".to_string(), json!(3)),
+                    ("name".to_string(), json!("Charlie")),
+                    ("value".to_string(), json!(300.25)),
+                ]),
+            )
+            .unwrap();
+
+        let response = state.query_table("demo").expect("query should succeed");
+        let ServerMessage::TableData { columns, rows, .. } = response else {
+            panic!("expected table data response");
+        };
+
+        assert_eq!(columns, vec!["id", "name", "value"]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].get("name"), Some(&json!("Charlie")));
+        assert_eq!(rows[2].get("value"), Some(&json!(300.25)));
     }
 }
