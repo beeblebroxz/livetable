@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface TableRow {
   [key: string]: string | number | boolean | null;
@@ -9,20 +9,77 @@ export interface ServerMessage {
   [key: string]: any;
 }
 
+const isDev = import.meta.env.DEV;
+
+const logDebug = (...args: unknown[]) => {
+  if (isDev) {
+    console.log(...args);
+  }
+};
+
+const applyServerMessage = (
+  prev: TableRow[],
+  message: ServerMessage
+): TableRow[] => {
+  switch (message.type) {
+    case 'TableData':
+      return message.rows || [];
+    case 'RowInserted': {
+      const next = prev.slice();
+      const insertIndex =
+        typeof message.index === 'number' ? message.index : next.length;
+      next.splice(insertIndex, 0, message.row);
+      return next;
+    }
+    case 'CellUpdated': {
+      if (
+        typeof message.row_index !== 'number' ||
+        message.row_index < 0 ||
+        message.row_index >= prev.length
+      ) {
+        return prev;
+      }
+
+      const next = prev.slice();
+      next[message.row_index] = {
+        ...next[message.row_index],
+        [message.column]: message.value,
+      };
+      return next;
+    }
+    case 'RowDeleted': {
+      if (
+        typeof message.index !== 'number' ||
+        message.index < 0 ||
+        message.index >= prev.length
+      ) {
+        return prev;
+      }
+
+      const next = prev.slice();
+      next.splice(message.index, 1);
+      return next;
+    }
+    default:
+      return prev;
+  }
+};
+
 export function useTableWebSocket(
   tableName: string,
   wsUrl: string = 'ws://localhost:8080/ws'
 ) {
   const [data, setData] = useState<TableRow[]>([]);
   const [columns, setColumns] = useState<string[]>([]);
-  const [ws, setWs] = useState<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     const socket = new WebSocket(wsUrl);
+    wsRef.current = socket;
 
     socket.onopen = () => {
-      console.log('WebSocket connected');
+      logDebug('WebSocket connected');
       setConnected(true);
 
       socket.send(JSON.stringify({ type: 'Subscribe', table_name: tableName }));
@@ -31,30 +88,20 @@ export function useTableWebSocket(
 
     socket.onmessage = (event) => {
       const message: ServerMessage = JSON.parse(event.data);
-      console.log('Received:', message);
+      logDebug('Received:', message);
 
       switch (message.type) {
         case 'TableData':
           setColumns(message.columns || []);
-          setData(message.rows || []);
+          setData((prev) => applyServerMessage(prev, message));
           break;
         case 'RowInserted':
-          setData((prev) => [...prev, message.row]);
-          break;
         case 'CellUpdated':
-          setData((prev) =>
-            prev.map((row, idx) =>
-              idx === message.row_index
-                ? { ...row, [message.column]: message.value }
-                : row
-            )
-          );
-          break;
         case 'RowDeleted':
-          setData((prev) => prev.filter((_, idx) => idx !== message.index));
+          setData((prev) => applyServerMessage(prev, message));
           break;
         case 'Subscribed':
-          console.log('Subscribed to', message.table_name);
+          logDebug('Subscribed to', message.table_name);
           break;
         case 'Error':
           console.error('Server error:', message.message);
@@ -63,23 +110,45 @@ export function useTableWebSocket(
     };
 
     socket.onerror = () => console.error('WebSocket error');
-    socket.onclose = () => { console.log('Disconnected'); setConnected(false); };
+    socket.onclose = () => {
+      logDebug('Disconnected');
+      if (wsRef.current === socket) {
+        wsRef.current = null;
+      }
+      setConnected(false);
+    };
 
-    setWs(socket);
-    return () => socket.close();
+    return () => {
+      if (wsRef.current === socket) {
+        wsRef.current = null;
+      }
+      socket.close();
+    };
   }, [tableName, wsUrl]);
 
-  const insertRow = (row: TableRow) => {
-    ws?.send(JSON.stringify({ type: 'InsertRow', table_name: tableName, row }));
-  };
+  const insertRow = useCallback((row: TableRow) => {
+    wsRef.current?.send(
+      JSON.stringify({ type: 'InsertRow', table_name: tableName, row })
+    );
+  }, [tableName]);
 
-  const updateCell = (rowIndex: number, column: string, value: any) => {
-    ws?.send(JSON.stringify({ type: 'UpdateCell', table_name: tableName, row_index: rowIndex, column, value }));
-  };
+  const updateCell = useCallback((rowIndex: number, column: string, value: unknown) => {
+    wsRef.current?.send(
+      JSON.stringify({
+        type: 'UpdateCell',
+        table_name: tableName,
+        row_index: rowIndex,
+        column,
+        value,
+      })
+    );
+  }, [tableName]);
 
-  const deleteRow = (rowIndex: number) => {
-    ws?.send(JSON.stringify({ type: 'DeleteRow', table_name: tableName, row_index: rowIndex }));
-  };
+  const deleteRow = useCallback((rowIndex: number) => {
+    wsRef.current?.send(
+      JSON.stringify({ type: 'DeleteRow', table_name: tableName, row_index: rowIndex })
+    );
+  }, [tableName]);
 
   return { data, columns, connected, insertRow, updateCell, deleteRow };
 }

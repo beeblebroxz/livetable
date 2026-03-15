@@ -1,9 +1,62 @@
-import React, { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useReactTable, getCoreRowModel, flexRender, ColumnDef } from '@tanstack/react-table';
 import { useTableWebSocket, TableRow } from '../hooks/useTableWebSocket';
 
 interface LiveTableProps {
   tableName: string;
+}
+
+interface EditableCellProps {
+  initialValue: TableRow[string];
+  rowIndex: number;
+  columnId: string;
+  updateCell: (rowIndex: number, column: string, value: unknown) => void;
+}
+
+function coerceEditedValue(
+  rawValue: string,
+  initialValue: TableRow[string]
+): string | number | boolean | null {
+  if (initialValue === null) {
+    return rawValue;
+  }
+  if (typeof initialValue === 'number') {
+    const parsed = Number(rawValue);
+    return Number.isNaN(parsed) ? initialValue : parsed;
+  }
+  if (typeof initialValue === 'boolean') {
+    return rawValue.toLowerCase() === 'true';
+  }
+  return rawValue;
+}
+
+function EditableCell({
+  initialValue,
+  rowIndex,
+  columnId,
+  updateCell,
+}: EditableCellProps) {
+  const [value, setValue] = useState(String(initialValue ?? ''));
+
+  useEffect(() => {
+    setValue(String(initialValue ?? ''));
+  }, [initialValue]);
+
+  const onBlur = () => {
+    const nextValue = coerceEditedValue(value, initialValue);
+    if (nextValue !== initialValue) {
+      updateCell(rowIndex, columnId, nextValue);
+    }
+  };
+
+  return (
+    <input
+      value={value}
+      onChange={(event) => setValue(event.target.value)}
+      onBlur={onBlur}
+      className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+    />
+  );
 }
 
 export function LiveTable({ tableName }: LiveTableProps) {
@@ -16,32 +69,14 @@ export function LiveTable({ tableName }: LiveTableProps) {
       id: colName,
       accessorKey: colName,
       header: colName.charAt(0).toUpperCase() + colName.slice(1),
-      cell: ({ getValue, row, column }: any) => {
-        const initialValue = getValue();
-        const [value, setValue] = React.useState(initialValue);
-
-        React.useEffect(() => {
-          setValue(initialValue);
-        }, [initialValue]);
-
-        const onBlur = () => {
-          if (value !== initialValue) {
-            let convertedValue = value;
-            if (colName === 'id') {
-              convertedValue = parseInt(value as string);
-            } else if (colName === 'value') {
-              convertedValue = parseFloat(value as string);
-            }
-            updateCell(row.index, column.id, convertedValue);
-          }
-        };
-
+      cell: ({ getValue, row, column }) => {
+        const initialValue = getValue() as TableRow[string];
         return (
-          <input
-            value={value as string ?? ''}
-            onChange={(e) => setValue(e.target.value)}
-            onBlur={onBlur}
-            className="w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+          <EditableCell
+            initialValue={initialValue}
+            rowIndex={row.index}
+            columnId={column.id}
+            updateCell={updateCell}
           />
         );
       },
@@ -56,13 +91,16 @@ export function LiveTable({ tableName }: LiveTableProps) {
 
   const addRow = () => {
     const newRow: TableRow = {};
+    const templateRow = data[0];
     columnNames.forEach((col) => {
       if (col === 'id') {
         newRow[col] = data.length + 1;
       } else if (col === 'name') {
         newRow[col] = `New Item ${data.length + 1}`;
-      } else if (col === 'value') {
-        newRow[col] = Math.random() * 100;
+      } else if (templateRow && typeof templateRow[col] === 'number') {
+        newRow[col] = 0;
+      } else if (templateRow && typeof templateRow[col] === 'boolean') {
+        newRow[col] = false;
       } else {
         newRow[col] = '';
       }
