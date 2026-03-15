@@ -31,20 +31,25 @@ class TestTickBasics:
         assert count == 0
 
     def test_registered_view_count(self, sales_table):
-        """registered_view_count() should return number of registered views."""
+        """registered_view_count() should return number of live registered views."""
         assert sales_table.registered_view_count() == 0
 
         # Create a filter view
-        _ = sales_table.filter(lambda row: row["amount"] > 500)
+        filtered = sales_table.filter(lambda row: row["amount"] > 500)
         assert sales_table.registered_view_count() == 1
 
         # Create a sorted view
-        _ = sales_table.sort("amount")
+        sorted_view = sales_table.sort("amount")
         assert sales_table.registered_view_count() == 2
 
         # Create an aggregate view
-        _ = sales_table.group_by("region", agg=[("total", "amount", "sum")])
+        aggregate_view = sales_table.group_by("region", agg=[("total", "amount", "sum")])
         assert sales_table.registered_view_count() == 3
+
+        # Keep the references alive for the duration of the assertion sequence.
+        assert filtered is not None
+        assert sorted_view is not None
+        assert aggregate_view is not None
 
 
 class TestFilterViewWithTick:

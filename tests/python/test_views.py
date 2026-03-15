@@ -4,6 +4,8 @@ Unit tests for view operations
 Tests FilterView, ProjectionView, ComputedView, and JoinView
 """
 
+import gc
+
 import pytest
 import livetable
 
@@ -233,6 +235,38 @@ class TestJoinView:
 
         assert row["name"] == "Alice"
         assert row["right_amount"] in [99.99, 49.50]
+
+
+class TestRegisteredViews:
+    """Test automatic view registration lifecycle"""
+
+    @pytest.fixture
+    def sample_table(self):
+        schema = livetable.Schema([
+            ("id", livetable.ColumnType.INT32, False),
+            ("score", livetable.ColumnType.FLOAT64, False),
+        ])
+        table = livetable.Table("scores", schema)
+        table.append_row({"id": 1, "score": 90.0})
+        return table
+
+    def test_tick_prunes_collected_views(self, sample_table):
+        live_view = sample_table.filter(lambda row: row["score"] >= 90)
+        dropped_view = sample_table.filter(lambda row: row["score"] >= 95)
+        sorted_view = sample_table.sort("score")
+
+        assert sample_table.registered_view_count() == 3
+
+        del dropped_view
+        gc.collect()
+
+        sample_table.append_row({"id": 2, "score": 99.0})
+        synced = sample_table.tick()
+
+        assert synced == 2
+        assert sample_table.registered_view_count() == 2
+        assert len(live_view) == 2
+        assert sorted_view.get_value(1, "score") == 99.0
 
 
 # Note: View chaining (calling .select() on a FilterView) is not currently supported
