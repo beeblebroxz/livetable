@@ -281,11 +281,16 @@ pip install target/wheels/livetable-*.whl
 # Run all tests (recommended)
 cd tests && ./run_all.sh
 
-# Individual test suites
-cd tests && pytest python/ -v      # Python unit tests (294 tests)
-cd tests && pytest integration/    # Integration tests (5 workflows)
-cd impl && cargo test --lib        # Rust tests (75 tests)
+# Individual verification steps
+cd impl && cargo clippy --all-targets -- -D warnings
+cd impl && cargo clippy --all-targets --features server -- -D warnings
+cd impl && env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo clippy --all-targets --features python -- -D warnings
+cd impl && cargo test --lib --features server
+cd tests && uv run pytest -c pytest.ini
+cd frontend && npm run lint && npm run test && npm run build
 ```
+
+See [tests/README.md](tests/README.md) for the full test matrix and toolchain split.
 
 ## React Frontend
 
@@ -301,27 +306,37 @@ cd frontend
 npm install && npm run dev
 ```
 
-Connects to `ws://127.0.0.1:8080/ws` by default. Override with `VITE_WS_URL`.
+The current demo client connects to `ws://localhost:8080/ws` by default.
 
 ## Project Structure
 
 ```
 livetable/
-├── impl/                   # Rust implementation + Python bindings
+├── impl/                       # Rust implementation + Python bindings
 │   ├── src/
-│   │   ├── lib.rs         # Library root
-│   │   ├── table.rs       # Table implementation
-│   │   ├── column.rs      # Column types and values
-│   │   ├── view.rs        # View implementations
-│   │   ├── sequence.rs    # Storage backends
-│   │   └── python_bindings.rs
-│   └── install.sh         # Build + install script
+│   │   ├── lib.rs              # Library root
+│   │   ├── table.rs            # Table, Schema, storage hints
+│   │   ├── column.rs           # Column types and values
+│   │   ├── sequence.rs         # Storage backends (Array / TieredVector)
+│   │   ├── view.rs             # FilterView, JoinView, SortedView, etc.
+│   │   ├── view/               # AggregateView support types
+│   │   ├── changeset.rs        # Incremental change tracking
+│   │   ├── expr.rs             # Expression parser for filter_expr()
+│   │   ├── interner.rs         # String interning engine
+│   │   ├── messages.rs         # WebSocket wire protocol types
+│   │   ├── websocket.rs        # WebSocket server (actix)
+│   │   ├── server.rs           # HTTP server setup
+│   │   ├── bin/                # Server binary entry point
+│   │   ├── python_bindings.rs  # PyO3 bindings
+│   │   └── python_bindings/    # Conversions and iterator types
+│   └── install.sh              # Build + install script
 │
-├── examples/               # Python examples
-├── tests/                  # Test suites
-├── frontend/               # React real-time editor
-├── docs/                   # Additional documentation
-└── benchmarks/             # Performance comparisons
+├── examples/                   # Python examples
+├── tests/                      # Python + integration test suites
+├── frontend/                   # React real-time editor + Vitest/ESLint
+├── .github/workflows/          # CI pipeline
+├── docs/                       # Additional documentation
+└── benchmarks/                 # Performance comparisons
 ```
 
 ## Architecture
