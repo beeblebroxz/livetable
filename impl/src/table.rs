@@ -34,6 +34,7 @@ use crate::changeset::{Changeset, TableChange};
 use crate::column::{Column, ColumnType, ColumnValue};
 use crate::interner::{InternerStats, StringInterner};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 /// Hint for selecting the underlying storage strategy.
@@ -61,10 +62,16 @@ pub enum StorageHint {
 }
 
 impl StorageHint {
-    /// Parse a storage hint from a string (for Python API).
-    ///
-    /// Accepts: "fast_reads", "fast_updates"
-    pub fn from_str(s: &str) -> Result<Self, String> {
+    /// Returns true if this hint uses tiered vector storage.
+    pub(crate) fn use_tiered_vector(&self) -> bool {
+        matches!(self, StorageHint::FastUpdates)
+    }
+}
+
+impl FromStr for StorageHint {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "fast_reads" | "fastreads" => Ok(StorageHint::FastReads),
             "fast_updates" | "fastupdates" => Ok(StorageHint::FastUpdates),
@@ -73,11 +80,6 @@ impl StorageHint {
                 s
             )),
         }
-    }
-
-    /// Returns true if this hint uses tiered vector storage.
-    pub(crate) fn use_tiered_vector(&self) -> bool {
-        matches!(self, StorageHint::FastUpdates)
     }
 }
 
@@ -1156,7 +1158,7 @@ fn parse_date(s: &str) -> Option<i32> {
     let month: u32 = parts[1].parse().ok()?;
     let day: u32 = parts[2].parse().ok()?;
 
-    if month < 1 || month > 12 || day < 1 || day > 31 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
 
@@ -1665,7 +1667,12 @@ mod tests {
         ]);
 
         // Create table with string interning enabled
-        let mut table = Table::new_with_interning("products".to_string(), schema, false, true);
+        let mut table = Table::with_hint_and_interning(
+            "products".to_string(),
+            schema,
+            StorageHint::FastReads,
+            true,
+        );
         assert!(table.uses_string_interning());
 
         // Add rows with repeated category strings
@@ -1745,7 +1752,12 @@ mod tests {
             ("status".to_string(), ColumnType::String, false),
         ]);
 
-        let mut table = Table::new_with_interning("orders".to_string(), schema, false, true);
+        let mut table = Table::with_hint_and_interning(
+            "orders".to_string(),
+            schema,
+            StorageHint::FastReads,
+            true,
+        );
 
         let mut row1 = HashMap::new();
         row1.insert("id".to_string(), ColumnValue::Int32(1));

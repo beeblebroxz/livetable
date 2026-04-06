@@ -441,7 +441,7 @@ mod tests {
 
         // Interleave appends and inserts to create non-uniform blocks
         for i in 0..50 {
-            seq.append((i * 2) as i32); // Even numbers
+            seq.append(i * 2); // Even numbers
         }
 
         // Insert odd numbers

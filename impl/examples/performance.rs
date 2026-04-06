@@ -57,7 +57,11 @@ fn main() {
     println!("   Good for: Mixed read/write, frequent inserts/deletes");
     println!("   Performance: O(1) access (small overhead), O(sqrt(N)) insert/delete\n");
 
-    let mut tiered_table = Table::new_with_options("tiered_table".to_string(), schema, true);
+    let mut tiered_table = Table::with_hint(
+        "tiered_table".to_string(),
+        schema,
+        livetable::StorageHint::FastUpdates,
+    );
 
     let start = Instant::now();
     for i in 0..n {

@@ -233,7 +233,7 @@ impl Lexer {
                     '-' if self
                         .input
                         .get(self.pos + 1)
-                        .map_or(false, |c| c.is_ascii_digit() || *c == '.') =>
+                        .is_some_and(|c| c.is_ascii_digit() || *c == '.') =>
                     {
                         self.advance(); // consume '-'
                         let token = self.read_number();

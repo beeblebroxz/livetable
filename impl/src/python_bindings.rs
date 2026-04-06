@@ -1,3 +1,6 @@
+#![allow(clippy::useless_conversion)]
+#![allow(non_snake_case)]
+
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
 /// Python bindings for LiveTable using PyO3
 ///
@@ -17,531 +20,7 @@ use crate::view::{
     SortOrder as RustSortOrder, SortedView as RustSortedView,
 };
 
-// ============================================================================
-// Date/Time Helper Functions
-// ============================================================================
-
-/// Convert a Python datetime.date to days since Unix epoch (1970-01-01)
-fn date_to_days_since_epoch(date: &Bound<'_, PyAny>) -> PyResult<i32> {
-    let year: i32 = date.getattr("year")?.extract()?;
-    let month: u32 = date.getattr("month")?.extract()?;
-    let day: u32 = date.getattr("day")?.extract()?;
-
-    // Calculate days since epoch using a simple algorithm
-    // This handles leap years correctly
-    let days = days_from_ymd(year, month, day);
-    Ok(days)
-}
-
-/// Convert a Python datetime.datetime to milliseconds since Unix epoch
-fn datetime_to_ms_since_epoch(dt: &Bound<'_, PyAny>) -> PyResult<i64> {
-    let year: i32 = dt.getattr("year")?.extract()?;
-    let month: u32 = dt.getattr("month")?.extract()?;
-    let day: u32 = dt.getattr("day")?.extract()?;
-    let hour: u32 = dt.getattr("hour")?.extract()?;
-    let minute: u32 = dt.getattr("minute")?.extract()?;
-    let second: u32 = dt.getattr("second")?.extract()?;
-    let microsecond: u32 = dt.getattr("microsecond")?.extract()?;
-
-    let days = days_from_ymd(year, month, day) as i64;
-    let ms = days * 24 * 60 * 60 * 1000
-        + (hour as i64) * 60 * 60 * 1000
-        + (minute as i64) * 60 * 1000
-        + (second as i64) * 1000
-        + (microsecond as i64) / 1000;
-    Ok(ms)
-}
-
-/// Convert days since epoch back to (year, month, day)
-fn ymd_from_days(days: i32) -> (i32, u32, u32) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = if z >= 0 {
-        z / 146097
-    } else {
-        (z - 146096) / 146097
-    };
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = (yoe as i32) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d)
-}
-
-/// Convert (year, month, day) to days since Unix epoch
-fn days_from_ymd(year: i32, month: u32, day: u32) -> i32 {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
-    let yoe = (y - era * 400) as u32;
-    let m = month;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146097 + doe as i32) - 719468
-}
-
-/// Convert milliseconds since epoch to (year, month, day, hour, minute, second, microsecond)
-fn datetime_from_ms(ms: i64) -> (i32, u32, u32, u32, u32, u32, u32) {
-    let ms_per_day: i64 = 24 * 60 * 60 * 1000;
-    // Use Euclidean division so remaining_ms is always non-negative.
-    // Truncating division (/) gives wrong results for pre-epoch timestamps:
-    //   -1 / 86400000 = 0 (truncated), but we need -1 (floored) to get the prior day.
-    let days = ms.div_euclid(ms_per_day) as i32;
-    let remaining_ms = ms.rem_euclid(ms_per_day);
-
-    let (year, month, day) = ymd_from_days(days);
-
-    let hour = (remaining_ms / (60 * 60 * 1000)) as u32;
-    let minute = ((remaining_ms % (60 * 60 * 1000)) / (60 * 1000)) as u32;
-    let second = ((remaining_ms % (60 * 1000)) / 1000) as u32;
-    let microsecond = ((remaining_ms % 1000) * 1000) as u32;
-
-    (year, month, day, hour, minute, second, microsecond)
-}
-
-// ============================================================================
-// Core Type Conversions
-// ============================================================================
-
-/// Python-exposed ColumnType enum
-#[pyclass(name = "ColumnType")]
-#[derive(Clone, Copy)]
-pub struct PyColumnType {
-    inner: RustColumnType,
-}
-
-#[pymethods]
-impl PyColumnType {
-    #[classattr]
-    const INT32: PyColumnType = PyColumnType {
-        inner: RustColumnType::Int32,
-    };
-
-    #[classattr]
-    const INT64: PyColumnType = PyColumnType {
-        inner: RustColumnType::Int64,
-    };
-
-    #[classattr]
-    const FLOAT32: PyColumnType = PyColumnType {
-        inner: RustColumnType::Float32,
-    };
-
-    #[classattr]
-    const FLOAT64: PyColumnType = PyColumnType {
-        inner: RustColumnType::Float64,
-    };
-
-    #[classattr]
-    const STRING: PyColumnType = PyColumnType {
-        inner: RustColumnType::String,
-    };
-
-    #[classattr]
-    const BOOL: PyColumnType = PyColumnType {
-        inner: RustColumnType::Bool,
-    };
-
-    /// Date type (days since 1970-01-01)
-    #[classattr]
-    const DATE: PyColumnType = PyColumnType {
-        inner: RustColumnType::Date,
-    };
-
-    /// DateTime type (milliseconds since 1970-01-01 00:00:00 UTC)
-    #[classattr]
-    const DATETIME: PyColumnType = PyColumnType {
-        inner: RustColumnType::DateTime,
-    };
-
-    fn __repr__(&self) -> String {
-        match self.inner {
-            RustColumnType::Int32 => "ColumnType.INT32".to_string(),
-            RustColumnType::Int64 => "ColumnType.INT64".to_string(),
-            RustColumnType::Float32 => "ColumnType.FLOAT32".to_string(),
-            RustColumnType::Float64 => "ColumnType.FLOAT64".to_string(),
-            RustColumnType::String => "ColumnType.STRING".to_string(),
-            RustColumnType::Bool => "ColumnType.BOOL".to_string(),
-            RustColumnType::Date => "ColumnType.DATE".to_string(),
-            RustColumnType::DateTime => "ColumnType.DATETIME".to_string(),
-        }
-    }
-}
-
-impl PyColumnType {
-    fn to_rust(&self) -> RustColumnType {
-        self.inner
-    }
-
-    fn from_rust(col_type: RustColumnType) -> Self {
-        PyColumnType { inner: col_type }
-    }
-}
-
-/// Convert Python value to ColumnValue
-fn py_to_column_value(_py: Python, value: &Bound<'_, PyAny>) -> PyResult<RustColumnValue> {
-    if value.is_none() {
-        return Ok(RustColumnValue::Null);
-    }
-
-    // Check type in order: bool, int, float, string
-    // This matches Python's type hierarchy
-
-    // Bool must be checked before int (bool is subclass of int in Python)
-    if let Ok(v) = value.extract::<bool>() {
-        // Double-check it's actually a bool, not just truthy
-        if value.is_instance_of::<pyo3::types::PyBool>() {
-            return Ok(RustColumnValue::Bool(v));
-        }
-    }
-
-    // Try integer types first
-    if let Ok(v) = value.extract::<i32>() {
-        return Ok(RustColumnValue::Int32(v));
-    }
-    if let Ok(v) = value.extract::<i64>() {
-        return Ok(RustColumnValue::Int64(v));
-    }
-
-    // Then floating point types
-    if let Ok(v) = value.extract::<f64>() {
-        return Ok(RustColumnValue::Float64(v));
-    }
-    if let Ok(v) = value.extract::<f32>() {
-        return Ok(RustColumnValue::Float32(v));
-    }
-
-    // Check for datetime types (before string, since datetime has __str__)
-    // Errors during datetime conversion must propagate, not silently fall through to string.
-    Python::with_gil(|py| -> PyResult<Option<RustColumnValue>> {
-        let datetime_mod = match py.import_bound("datetime") {
-            Ok(m) => m,
-            Err(_) => return Ok(None), // datetime module unavailable, try string
-        };
-        let datetime_type = datetime_mod.getattr("datetime")?;
-        let date_type = datetime_mod.getattr("date")?;
-
-        // datetime must be checked before date (datetime is subclass of date)
-        if value.is_instance(&datetime_type).unwrap_or(false) {
-            let ms = datetime_to_ms_since_epoch(value)?;
-            return Ok(Some(RustColumnValue::DateTime(ms)));
-        }
-        if value.is_instance(&date_type).unwrap_or(false) {
-            let days = date_to_days_since_epoch(value)?;
-            return Ok(Some(RustColumnValue::Date(days)));
-        }
-        Ok(None)
-    })
-    .and_then(|opt| {
-        if let Some(cv) = opt {
-            return Ok(cv);
-        }
-        // Finally strings
-        if let Ok(v) = value.extract::<String>() {
-            return Ok(RustColumnValue::String(v));
-        }
-        Err(PyValueError::new_err("Cannot convert value to ColumnValue"))
-    })
-}
-
-/// Convert Python value to ColumnValue using known column type (faster than guessing).
-/// This skips the type detection overhead by extracting directly based on expected type.
-fn py_to_column_value_typed(
-    value: &Bound<'_, PyAny>,
-    expected_type: RustColumnType,
-    nullable: bool,
-) -> PyResult<RustColumnValue> {
-    // Handle None/NULL
-    if value.is_none() {
-        if nullable {
-            return Ok(RustColumnValue::Null);
-        } else {
-            return Err(PyValueError::new_err("NULL value for non-nullable column"));
-        }
-    }
-
-    // Extract based on expected type - no guessing needed
-    match expected_type {
-        RustColumnType::Int32 => value
-            .extract::<i32>()
-            .map(RustColumnValue::Int32)
-            .map_err(|_| PyValueError::new_err("Expected INT32 value")),
-        RustColumnType::Int64 => {
-            // Try i64 first, fall back to i32 if needed
-            if let Ok(v) = value.extract::<i64>() {
-                Ok(RustColumnValue::Int64(v))
-            } else if let Ok(v) = value.extract::<i32>() {
-                Ok(RustColumnValue::Int64(v as i64))
-            } else {
-                Err(PyValueError::new_err("Expected INT64 value"))
-            }
-        }
-        RustColumnType::Float32 => value
-            .extract::<f32>()
-            .map(RustColumnValue::Float32)
-            .or_else(|_| {
-                value
-                    .extract::<f64>()
-                    .map(|v| RustColumnValue::Float32(v as f32))
-            })
-            .map_err(|_| PyValueError::new_err("Expected FLOAT32 value")),
-        RustColumnType::Float64 => value
-            .extract::<f64>()
-            .map(RustColumnValue::Float64)
-            .map_err(|_| PyValueError::new_err("Expected FLOAT64 value")),
-        RustColumnType::String => value
-            .extract::<String>()
-            .map(RustColumnValue::String)
-            .map_err(|_| PyValueError::new_err("Expected STRING value")),
-        RustColumnType::Bool => value
-            .extract::<bool>()
-            .map(RustColumnValue::Bool)
-            .map_err(|_| PyValueError::new_err("Expected BOOL value")),
-        RustColumnType::Date => {
-            // Accept datetime.date, datetime.datetime, or integer (days since epoch)
-            // Try integer first (days since epoch)
-            if let Ok(days) = value.extract::<i32>() {
-                return Ok(RustColumnValue::Date(days));
-            }
-            // Try datetime.date or datetime.datetime
-            Python::with_gil(|py| {
-                let datetime_mod = py.import_bound("datetime")?;
-                let date_type = datetime_mod.getattr("date")?;
-                let datetime_type = datetime_mod.getattr("datetime")?;
-
-                if value.is_instance(&datetime_type)? {
-                    // datetime.datetime - extract just the date part
-                    let date_obj = value.call_method0("date")?;
-                    let days = date_to_days_since_epoch(&date_obj)?;
-                    Ok(RustColumnValue::Date(days))
-                } else if value.is_instance(&date_type)? {
-                    let days = date_to_days_since_epoch(value)?;
-                    Ok(RustColumnValue::Date(days))
-                } else {
-                    Err(PyValueError::new_err("Expected DATE value (datetime.date, datetime.datetime, or integer days since epoch)"))
-                }
-            })
-        }
-        RustColumnType::DateTime => {
-            // Accept datetime.datetime, datetime.date, or integer (milliseconds since epoch)
-            // Try integer first (milliseconds since epoch)
-            if let Ok(ms) = value.extract::<i64>() {
-                return Ok(RustColumnValue::DateTime(ms));
-            }
-            // Try datetime.datetime or datetime.date
-            Python::with_gil(|py| {
-                let datetime_mod = py.import_bound("datetime")?;
-                let datetime_type = datetime_mod.getattr("datetime")?;
-                let date_type = datetime_mod.getattr("date")?;
-
-                if value.is_instance(&datetime_type)? {
-                    let ms = datetime_to_ms_since_epoch(value)?;
-                    Ok(RustColumnValue::DateTime(ms))
-                } else if value.is_instance(&date_type)? {
-                    // date -> datetime at midnight
-                    let days = date_to_days_since_epoch(value)?;
-                    let ms = (days as i64) * 24 * 60 * 60 * 1000;
-                    Ok(RustColumnValue::DateTime(ms))
-                } else {
-                    Err(PyValueError::new_err("Expected DATETIME value (datetime.datetime, datetime.date, or integer milliseconds since epoch)"))
-                }
-            })
-        }
-    }
-}
-
-/// Convert ColumnValue to Python object
-fn column_value_to_py(py: Python, value: &RustColumnValue) -> PyResult<PyObject> {
-    match value {
-        RustColumnValue::Int32(v) => Ok(v.to_object(py)),
-        RustColumnValue::Int64(v) => Ok(v.to_object(py)),
-        RustColumnValue::Float32(v) => Ok(v.to_object(py)),
-        RustColumnValue::Float64(v) => Ok(v.to_object(py)),
-        RustColumnValue::String(v) => Ok(v.to_object(py)),
-        RustColumnValue::Bool(v) => Ok(v.to_object(py)),
-        RustColumnValue::Date(days) => {
-            let (year, month, day) = ymd_from_days(*days);
-            let datetime_mod = py.import_bound("datetime")?;
-            let date_class = datetime_mod.getattr("date")?;
-            let date_obj = date_class.call1((year, month, day))?;
-            Ok(date_obj.to_object(py))
-        }
-        RustColumnValue::DateTime(ms) => {
-            let (year, month, day, hour, minute, second, microsecond) = datetime_from_ms(*ms);
-            let datetime_mod = py.import_bound("datetime")?;
-            let datetime_class = datetime_mod.getattr("datetime")?;
-            let dt_obj =
-                datetime_class.call1((year, month, day, hour, minute, second, microsecond))?;
-            Ok(dt_obj.to_object(py))
-        }
-        RustColumnValue::Null => Ok(py.None()),
-    }
-}
-
-/// Extract a string or list of strings from a Python object.
-/// Supports both single string and list of strings for backward compatibility.
-fn extract_string_or_list(value: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
-    // Try to extract as a single string first
-    if let Ok(s) = value.extract::<String>() {
-        return Ok(vec![s]);
-    }
-
-    // Try to extract as a list of strings
-    if let Ok(list) = value.downcast::<PyList>() {
-        let mut result = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            let s: String = item
-                .extract()
-                .map_err(|_| PyValueError::new_err("All items in key list must be strings"))?;
-            result.push(s);
-        }
-        return Ok(result);
-    }
-
-    Err(PyValueError::new_err(
-        "Key must be a string or list of strings",
-    ))
-}
-
-/// Convert pandas dtype string to ColumnType
-fn dtype_str_to_column_type(dtype_str: &str) -> RustColumnType {
-    match dtype_str {
-        "int32" => RustColumnType::Int32,
-        "int64" | "Int64" => RustColumnType::Int64,
-        "float32" => RustColumnType::Float32,
-        "float64" => RustColumnType::Float64,
-        "bool" | "boolean" => RustColumnType::Bool,
-        s if s.starts_with("datetime64") => RustColumnType::DateTime,
-        _ => RustColumnType::String, // Default for object, string, etc.
-    }
-}
-
-/// Convert pandas value to ColumnValue, handling NaN and special types
-fn pandas_value_to_column_value(
-    py: Python,
-    value: &Bound<'_, PyAny>,
-    expected_type: RustColumnType,
-) -> PyResult<RustColumnValue> {
-    // Check for pandas NA/NaN/None
-    if value.is_none() {
-        return Ok(RustColumnValue::Null);
-    }
-
-    // Check for pandas NaT (Not a Time) or numpy NaN
-    let is_na = || -> bool {
-        // Try to call pandas.isna() on the value
-        if let Ok(pandas) = py.import_bound("pandas") {
-            if let Ok(is_na_fn) = pandas.getattr("isna") {
-                if let Ok(result) = is_na_fn.call1((value,)) {
-                    if let Ok(is_null) = result.extract::<bool>() {
-                        return is_null;
-                    }
-                }
-            }
-        }
-        false
-    };
-
-    if is_na() {
-        return Ok(RustColumnValue::Null);
-    }
-
-    // Convert based on expected type to ensure type consistency
-    match expected_type {
-        RustColumnType::Bool => {
-            if let Ok(v) = value.extract::<bool>() {
-                return Ok(RustColumnValue::Bool(v));
-            }
-        }
-        RustColumnType::Int32 => {
-            if let Ok(v) = value.extract::<i32>() {
-                return Ok(RustColumnValue::Int32(v));
-            }
-            // Allow i64 to be converted if it fits
-            if let Ok(v) = value.extract::<i64>() {
-                if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
-                    return Ok(RustColumnValue::Int32(v as i32));
-                }
-            }
-        }
-        RustColumnType::Int64 => {
-            if let Ok(v) = value.extract::<i64>() {
-                return Ok(RustColumnValue::Int64(v));
-            }
-        }
-        RustColumnType::Float32 => {
-            if let Ok(v) = value.extract::<f32>() {
-                if v.is_nan() {
-                    return Ok(RustColumnValue::Null);
-                }
-                return Ok(RustColumnValue::Float32(v));
-            }
-            if let Ok(v) = value.extract::<f64>() {
-                if v.is_nan() {
-                    return Ok(RustColumnValue::Null);
-                }
-                return Ok(RustColumnValue::Float32(v as f32));
-            }
-        }
-        RustColumnType::Float64 => {
-            if let Ok(v) = value.extract::<f64>() {
-                if v.is_nan() {
-                    return Ok(RustColumnValue::Null);
-                }
-                return Ok(RustColumnValue::Float64(v));
-            }
-        }
-        RustColumnType::String => {
-            if let Ok(v) = value.extract::<String>() {
-                return Ok(RustColumnValue::String(v));
-            }
-            // Last resort: convert to string representation
-            if let Ok(v) = value.str() {
-                if let Ok(s) = v.extract::<String>() {
-                    return Ok(RustColumnValue::String(s));
-                }
-            }
-        }
-        RustColumnType::Date => {
-            // Try to extract days since epoch directly (integer)
-            if let Ok(days) = value.extract::<i32>() {
-                return Ok(RustColumnValue::Date(days));
-            }
-            // Try datetime.date object
-            if let Ok(days) = date_to_days_since_epoch(value) {
-                return Ok(RustColumnValue::Date(days));
-            }
-        }
-        RustColumnType::DateTime => {
-            // Try to extract milliseconds since epoch directly (integer)
-            if let Ok(ms) = value.extract::<i64>() {
-                return Ok(RustColumnValue::DateTime(ms));
-            }
-            // Try datetime.datetime object
-            if let Ok(ms) = datetime_to_ms_since_epoch(value) {
-                return Ok(RustColumnValue::DateTime(ms));
-            }
-            // Try pandas Timestamp (has timestamp() method returning seconds)
-            if let Ok(ts_method) = value.getattr("timestamp") {
-                if let Ok(ts_result) = ts_method.call0() {
-                    if let Ok(seconds) = ts_result.extract::<f64>() {
-                        let ms = (seconds * 1000.0) as i64;
-                        return Ok(RustColumnValue::DateTime(ms));
-                    }
-                }
-            }
-        }
-    }
-
-    Err(PyValueError::new_err(format!(
-        "Cannot convert pandas value to {:?}",
-        expected_type
-    )))
-}
+include!("python_bindings/conversions.rs");
 
 // ============================================================================
 // Schema
@@ -644,9 +123,7 @@ impl RegisteredView {
             RegisteredView::Aggregate(inner) => {
                 inner.upgrade().map(ActiveRegisteredView::Aggregate)
             }
-            RegisteredView::JoinLeft(inner) => {
-                inner.upgrade().map(ActiveRegisteredView::JoinLeft)
-            }
+            RegisteredView::JoinLeft(inner) => inner.upgrade().map(ActiveRegisteredView::JoinLeft),
             RegisteredView::JoinRight(inner) => {
                 inner.upgrade().map(ActiveRegisteredView::JoinRight)
             }
@@ -837,7 +314,7 @@ impl PyTable {
     ) -> PyResult<Self> {
         let hint = match storage {
             None => StorageHint::FastReads,
-            Some(s) => StorageHint::from_str(s).map_err(|e| PyValueError::new_err(e))?,
+            Some(s) => s.parse::<StorageHint>().map_err(PyValueError::new_err)?,
         };
 
         Ok(PyTable {
@@ -923,7 +400,7 @@ impl PyTable {
         self.inner
             .borrow_mut()
             .append_row(rust_row)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Append multiple rows at once (bulk insert).
@@ -998,7 +475,7 @@ impl PyTable {
         self.inner
             .borrow_mut()
             .append_rows(rust_rows)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Insert a row at a specific index
@@ -1038,7 +515,7 @@ impl PyTable {
         self.inner
             .borrow_mut()
             .insert_row(index, rust_row)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Delete a row at a specific index
@@ -1047,7 +524,7 @@ impl PyTable {
             .borrow_mut()
             .delete_row(index)
             .map(|_| ()) // Discard the returned row
-            .map_err(|e| PyIndexError::new_err(e))
+            .map_err(PyIndexError::new_err)
     }
 
     /// Get a value at (row, column)
@@ -1056,7 +533,7 @@ impl PyTable {
             .inner
             .borrow()
             .get_value(row, column)
-            .map_err(|e| PyKeyError::new_err(e))?;
+            .map_err(PyKeyError::new_err)?;
 
         column_value_to_py(py, &value)
     }
@@ -1084,7 +561,7 @@ impl PyTable {
         self.inner
             .borrow_mut()
             .set_value(row, column, col_value)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Get a full row as a dictionary
@@ -1093,7 +570,7 @@ impl PyTable {
             .inner
             .borrow()
             .get_row(index)
-            .map_err(|e| PyIndexError::new_err(e))?;
+            .map_err(PyIndexError::new_err)?;
 
         let dict = PyDict::new_bound(py);
         for (key, value) in row.iter() {
@@ -1162,7 +639,7 @@ impl PyTable {
             for i in 0..table_len {
                 let value = table
                     .get_value(i, &column_name)
-                    .map_err(|e| PyIndexError::new_err(e))?;
+                    .map_err(PyIndexError::new_err)?;
                 list.append(column_value_to_py(py, &value)?)?;
             }
             return Ok(list.to_object(py));
@@ -1218,7 +695,7 @@ impl PyTable {
         self.inner
             .borrow()
             .filter_expr(expression)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Create a projection view (select specific columns)
@@ -1302,7 +779,7 @@ impl PyTable {
         let name = format!("{}_sorted", self.inner.borrow().name());
 
         let view = RustSortedView::new(name, self.inner.clone(), sort_keys)
-            .map_err(|e| PyValueError::new_err(e))?;
+            .map_err(PyValueError::new_err)?;
 
         let inner = Rc::new(RefCell::new(view));
 
@@ -1398,7 +875,7 @@ impl PyTable {
             right_keys,
             join_type,
         )
-        .map_err(|e| PyValueError::new_err(e))?;
+        .map_err(PyValueError::new_err)?;
 
         let join_rc = Rc::new(RefCell::new(join));
 
@@ -1492,7 +969,7 @@ impl PyTable {
         let name = format!("{}_grouped", self.inner.borrow().name());
 
         let view = RustAggregateView::new(name, self.inner.clone(), group_cols, aggregations)
-            .map_err(|e| PyValueError::new_err(e))?;
+            .map_err(PyValueError::new_err)?;
 
         let inner = Rc::new(RefCell::new(view));
 
@@ -1559,7 +1036,7 @@ impl PyTable {
         self.inner
             .borrow()
             .sum(column)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Count the number of non-NULL values in a column.
@@ -1567,7 +1044,7 @@ impl PyTable {
         self.inner
             .borrow()
             .count_non_null(column)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Calculate the average of all numeric values in a column.
@@ -1576,7 +1053,7 @@ impl PyTable {
         self.inner
             .borrow()
             .avg(column)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Find the minimum numeric value in a column.
@@ -1585,7 +1062,7 @@ impl PyTable {
         self.inner
             .borrow()
             .min(column)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     /// Find the maximum numeric value in a column.
@@ -1594,7 +1071,7 @@ impl PyTable {
         self.inner
             .borrow()
             .max(column)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 
     // === Serialization Methods ===
@@ -1623,10 +1100,7 @@ impl PyTable {
     ///     with open("data.json", "w") as f:
     ///         f.write(json_str)
     fn to_json(&self) -> PyResult<String> {
-        self.inner
-            .borrow()
-            .to_json()
-            .map_err(|e| PyValueError::new_err(e))
+        self.inner.borrow().to_json().map_err(PyValueError::new_err)
     }
 
     /// Create a table from a CSV string.
@@ -1646,7 +1120,7 @@ impl PyTable {
     ///         table = livetable.Table.from_csv("my_table", f.read())
     #[staticmethod]
     fn from_csv(name: &str, csv: &str) -> PyResult<Self> {
-        let table = RustTable::from_csv(name, csv).map_err(|e| PyValueError::new_err(e))?;
+        let table = RustTable::from_csv(name, csv).map_err(PyValueError::new_err)?;
         Ok(PyTable {
             inner: Rc::new(RefCell::new(table)),
             registered_views: Rc::new(RefCell::new(Vec::new())),
@@ -1664,7 +1138,7 @@ impl PyTable {
     ///         table = livetable.Table.from_json("my_table", f.read())
     #[staticmethod]
     fn from_json(name: &str, json: &str) -> PyResult<Self> {
-        let table = RustTable::from_json(name, json).map_err(|e| PyValueError::new_err(e))?;
+        let table = RustTable::from_json(name, json).map_err(PyValueError::new_err)?;
         Ok(PyTable {
             inner: Rc::new(RefCell::new(table)),
             registered_views: Rc::new(RefCell::new(Vec::new())),
@@ -1707,7 +1181,7 @@ impl PyTable {
                 for row_idx in 0..table.len() {
                     let value = table
                         .get_value(row_idx, col_name)
-                        .map_err(|e| PyValueError::new_err(e))?;
+                        .map_err(PyValueError::new_err)?;
                     col_values.push(value);
                 }
                 data.push(col_values);
@@ -1793,9 +1267,7 @@ impl PyTable {
                 rust_row.insert(col_name.clone(), col_value);
             }
 
-            table
-                .append_row(rust_row)
-                .map_err(|e| PyValueError::new_err(e))?;
+            table.append_row(rust_row).map_err(PyValueError::new_err)?;
         }
 
         Ok(PyTable {
@@ -2087,7 +1559,7 @@ impl PyProjectionView {
             .inner
             .borrow()
             .get_row(index)
-            .map_err(|e| PyIndexError::new_err(e))?;
+            .map_err(PyIndexError::new_err)?;
 
         let dict = PyDict::new_bound(py);
         for col in &self.columns {
@@ -2209,7 +1681,7 @@ impl PyComputedView {
             .inner
             .borrow()
             .get_row(index)
-            .map_err(|e| PyIndexError::new_err(e))?;
+            .map_err(PyIndexError::new_err)?;
 
         // Convert to dict
         let dict = PyDict::new_bound(py);
@@ -2280,7 +1752,7 @@ impl PyComputedView {
                 .inner
                 .borrow()
                 .get_row(row)
-                .map_err(|e| PyIndexError::new_err(e))?;
+                .map_err(PyIndexError::new_err)?;
 
             let dict = PyDict::new_bound(py);
             for (key, value) in full_row.iter() {
@@ -2393,7 +1865,7 @@ impl PyJoinView {
             right_keys_vec,
             join_type.inner,
         )
-        .map_err(|e| PyValueError::new_err(e))?;
+        .map_err(PyValueError::new_err)?;
 
         Ok(PyJoinView {
             inner: Rc::new(RefCell::new(join)),
@@ -2422,7 +1894,7 @@ impl PyJoinView {
             .inner
             .borrow()
             .get_row(index)
-            .map_err(|e| PyIndexError::new_err(e))?;
+            .map_err(PyIndexError::new_err)?;
 
         let dict = PyDict::new_bound(py);
         for (key, value) in row.iter() {
@@ -2478,7 +1950,7 @@ impl PyJoinView {
             .inner
             .borrow()
             .get_value(row, column)
-            .map_err(|e| PyKeyError::new_err(e))?;
+            .map_err(PyKeyError::new_err)?;
 
         column_value_to_py(py, &value)
     }
@@ -2629,7 +2101,7 @@ impl PySortedView {
         let rust_keys: Vec<RustSortKey> = sort_keys.iter().map(|k| k.to_rust()).collect();
 
         let view = RustSortedView::new(name, table.inner.clone(), rust_keys)
-            .map_err(|e| PyValueError::new_err(e))?;
+            .map_err(PyValueError::new_err)?;
 
         Ok(PySortedView {
             inner: Rc::new(RefCell::new(view)),
@@ -2658,7 +2130,7 @@ impl PySortedView {
             .inner
             .borrow()
             .get_row(index)
-            .map_err(|e| PyIndexError::new_err(e))?;
+            .map_err(PyIndexError::new_err)?;
 
         let dict = PyDict::new_bound(py);
         for (key, value) in row.iter() {
@@ -2714,7 +2186,7 @@ impl PySortedView {
             .inner
             .borrow()
             .get_value(row, column)
-            .map_err(|e| PyKeyError::new_err(e))?;
+            .map_err(PyKeyError::new_err)?;
 
         column_value_to_py(py, &value)
     }
@@ -2836,7 +2308,7 @@ impl PyAggregateFunction {
 }
 
 impl PyAggregateFunction {
-    fn to_rust(&self) -> RustAggregateFunction {
+    fn to_rust(self) -> RustAggregateFunction {
         self.inner
     }
 }
@@ -2874,7 +2346,7 @@ impl PyAggregateView {
             .collect();
 
         let view = RustAggregateView::new(name, table.inner.clone(), group_by, rust_aggregations)
-            .map_err(|e| PyValueError::new_err(e))?;
+            .map_err(PyValueError::new_err)?;
 
         Ok(PyAggregateView {
             inner: Rc::new(RefCell::new(view)),
@@ -2915,7 +2387,7 @@ impl PyAggregateView {
             .inner
             .borrow()
             .get_row(index)
-            .map_err(|e| PyIndexError::new_err(e))?;
+            .map_err(PyIndexError::new_err)?;
 
         let dict = PyDict::new_bound(py);
         for (key, value) in row.iter() {
@@ -2976,7 +2448,7 @@ impl PyAggregateView {
             .inner
             .borrow()
             .get_value(row, column)
-            .map_err(|e| PyKeyError::new_err(e))?;
+            .map_err(PyKeyError::new_err)?;
 
         column_value_to_py(py, &value)
     }
@@ -3004,183 +2476,7 @@ impl PyAggregateView {
     }
 }
 
-// ============================================================================
-// Iterator Types
-// ============================================================================
-
-/// Iterator for PyTable - enables `for row in table:` syntax
-#[pyclass(name = "TableIterator", unsendable)]
-pub struct PyTableIterator {
-    table: PyTable,
-    index: usize,
-    length: usize,
-}
-
-#[pymethods]
-impl PyTableIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        if self.index >= self.length {
-            return Ok(None);
-        }
-        let row = self.table.get_row(py, self.index)?;
-        self.index += 1;
-        Ok(Some(row))
-    }
-}
-
-/// Iterator for PyFilterView
-#[pyclass(name = "FilterViewIterator", unsendable)]
-pub struct PyFilterViewIterator {
-    view: Py<PyFilterView>,
-    index: usize,
-    length: usize,
-}
-
-#[pymethods]
-impl PyFilterViewIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        if self.index >= self.length {
-            return Ok(None);
-        }
-        let view = self.view.borrow(py);
-        let row = view.get_row(py, self.index)?;
-        self.index += 1;
-        Ok(Some(row))
-    }
-}
-
-/// Iterator for PyProjectionView
-#[pyclass(name = "ProjectionViewIterator", unsendable)]
-pub struct PyProjectionViewIterator {
-    view: Py<PyProjectionView>,
-    index: usize,
-    length: usize,
-}
-
-#[pymethods]
-impl PyProjectionViewIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        if self.index >= self.length {
-            return Ok(None);
-        }
-        let view = self.view.borrow(py);
-        let row = view.get_row(py, self.index)?;
-        self.index += 1;
-        Ok(Some(row))
-    }
-}
-
-/// Iterator for PyComputedView
-#[pyclass(name = "ComputedViewIterator", unsendable)]
-pub struct PyComputedViewIterator {
-    view: Py<PyComputedView>,
-    index: usize,
-    length: usize,
-}
-
-#[pymethods]
-impl PyComputedViewIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        if self.index >= self.length {
-            return Ok(None);
-        }
-        let view = self.view.borrow(py);
-        let row = view.get_row(py, self.index)?;
-        self.index += 1;
-        Ok(Some(row))
-    }
-}
-
-/// Iterator for PyJoinView
-#[pyclass(name = "JoinViewIterator", unsendable)]
-pub struct PyJoinViewIterator {
-    view: Py<PyJoinView>,
-    index: usize,
-    length: usize,
-}
-
-#[pymethods]
-impl PyJoinViewIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        if self.index >= self.length {
-            return Ok(None);
-        }
-        let view = self.view.borrow(py);
-        let row = view.get_row(py, self.index)?;
-        self.index += 1;
-        Ok(Some(row))
-    }
-}
-
-/// Iterator for PySortedView
-#[pyclass(name = "SortedViewIterator", unsendable)]
-pub struct PySortedViewIterator {
-    view: Py<PySortedView>,
-    index: usize,
-    length: usize,
-}
-
-#[pymethods]
-impl PySortedViewIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        if self.index >= self.length {
-            return Ok(None);
-        }
-        let view = self.view.borrow(py);
-        let row = view.get_row(py, self.index)?;
-        self.index += 1;
-        Ok(Some(row))
-    }
-}
-
-/// Iterator for PyAggregateView
-#[pyclass(name = "AggregateViewIterator", unsendable)]
-pub struct PyAggregateViewIterator {
-    view: Py<PyAggregateView>,
-    index: usize,
-    length: usize,
-}
-
-#[pymethods]
-impl PyAggregateViewIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
-        if self.index >= self.length {
-            return Ok(None);
-        }
-        let view = self.view.borrow(py);
-        let row = view.get_row(py, self.index)?;
-        self.index += 1;
-        Ok(Some(row))
-    }
-}
+include!("python_bindings/iterators.rs");
 
 // ============================================================================
 // Module Definition

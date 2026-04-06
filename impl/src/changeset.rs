@@ -216,7 +216,7 @@ impl IndexAdjuster {
     }
 
     /// Adjust an entire index mapping for an insert
-    pub fn adjust_mapping_for_insert(mapping: &mut Vec<usize>, insert_index: usize) {
+    pub fn adjust_mapping_for_insert(mapping: &mut [usize], insert_index: usize) {
         for parent_idx in mapping.iter_mut() {
             if *parent_idx >= insert_index {
                 *parent_idx += 1;
@@ -226,7 +226,7 @@ impl IndexAdjuster {
 
     /// Adjust an entire index mapping for a delete
     /// Returns indices in the mapping that need to be removed (were pointing to deleted row)
-    pub fn adjust_mapping_for_delete(mapping: &mut Vec<usize>, delete_index: usize) -> Vec<usize> {
+    pub fn adjust_mapping_for_delete(mapping: &mut [usize], delete_index: usize) -> Vec<usize> {
         let mut to_remove = Vec::new();
 
         for (view_idx, parent_idx) in mapping.iter_mut().enumerate() {

@@ -10,6 +10,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+type RowPredicate = dyn Fn(&HashMap<String, ColumnValue>) -> bool;
+type ComputeFunction = dyn Fn(&HashMap<String, ColumnValue>) -> ColumnValue;
+
 /// A FilterView filters rows from the parent table based on a predicate.
 /// Maintains a mapping from view indices to parent indices.
 ///
@@ -18,7 +21,7 @@ use std::rc::Rc;
 pub struct FilterView {
     name: String,
     parent: Rc<RefCell<Table>>,
-    predicate: Box<dyn Fn(&HashMap<String, ColumnValue>) -> bool>,
+    predicate: Box<RowPredicate>,
     view_to_parent: Vec<usize>,
     /// Last synced generation from parent's changeset
     last_synced_generation: u64,
@@ -291,7 +294,7 @@ pub struct ComputedView {
     name: String,
     parent: Rc<RefCell<Table>>,
     computed_col_name: String,
-    compute_func: Box<dyn Fn(&HashMap<String, ColumnValue>) -> ColumnValue>,
+    compute_func: Box<ComputeFunction>,
 }
 
 impl ComputedView {
@@ -622,7 +625,7 @@ impl JoinView {
 
         for i in 0..right.len() {
             if let Some(key_str) = Self::build_key_from_indices(&right, i, &right_col_indices) {
-                right_index.entry(key_str).or_insert_with(Vec::new).push(i);
+                right_index.entry(key_str).or_default().push(i);
             }
         }
 
@@ -691,7 +694,7 @@ impl JoinView {
 
         for i in 0..right.len() {
             if let Some(key_str) = Self::build_key_from_indices(&right, i, &right_col_indices) {
-                right_index.entry(key_str).or_insert_with(Vec::new).push(i);
+                right_index.entry(key_str).or_default().push(i);
             }
         }
 
@@ -948,9 +951,11 @@ impl JoinView {
                         // Remove those before inserting the proper matched entries.
                         if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
                             for &right_idx in matching_indices {
-                                if let Some(pos) = self.join_index.iter().position(|(l, r)| {
-                                    l.is_none() && *r == Some(right_idx)
-                                }) {
+                                if let Some(pos) = self
+                                    .join_index
+                                    .iter()
+                                    .position(|(l, r)| l.is_none() && *r == Some(right_idx))
+                                {
                                     self.join_index.remove(pos);
                                 }
                             }
@@ -962,9 +967,7 @@ impl JoinView {
                                 .insert(insert_pos + offset, (Some(*index), Some(right_idx)));
                             modified = true;
                         }
-                    } else if self.join_type == JoinType::Left
-                        || self.join_type == JoinType::Full
-                    {
+                    } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                         self.join_index.insert(insert_pos, (Some(*index), None));
                         modified = true;
                     }
@@ -1020,28 +1023,24 @@ impl JoinView {
                                     || self.join_type == JoinType::Full
                                 {
                                     // Check if there's an existing null match to replace
-                                    let existing_null = self.join_index.iter().position(|(l, r)| {
-                                        *l == Some(left_idx) && r.is_none()
-                                    });
+                                    let existing_null = self
+                                        .join_index
+                                        .iter()
+                                        .position(|(l, r)| *l == Some(left_idx) && r.is_none());
 
                                     if let Some(pos) = existing_null {
-                                        self.join_index[pos] =
-                                            (Some(left_idx), Some(*right_idx));
+                                        self.join_index[pos] = (Some(left_idx), Some(*right_idx));
                                     } else {
                                         let insert_pos =
                                             self.find_right_insert_position(left_idx, *right_idx);
-                                        self.join_index.insert(
-                                            insert_pos,
-                                            (Some(left_idx), Some(*right_idx)),
-                                        );
+                                        self.join_index
+                                            .insert(insert_pos, (Some(left_idx), Some(*right_idx)));
                                     }
                                 } else {
                                     let insert_pos =
                                         self.find_right_insert_position(left_idx, *right_idx);
-                                    self.join_index.insert(
-                                        insert_pos,
-                                        (Some(left_idx), Some(*right_idx)),
-                                    );
+                                    self.join_index
+                                        .insert(insert_pos, (Some(left_idx), Some(*right_idx)));
                                 }
                                 modified = true;
                             }
@@ -1050,8 +1049,7 @@ impl JoinView {
 
                     // RIGHT/FULL: if no left match, append as unmatched right row
                     if !any_match
-                        && (self.join_type == JoinType::Right
-                            || self.join_type == JoinType::Full)
+                        && (self.join_type == JoinType::Right || self.join_type == JoinType::Full)
                     {
                         self.join_index.push((None, Some(*right_idx)));
                         modified = true;
@@ -1565,393 +1563,7 @@ impl IncrementalView for SortedView {
 // AggregateView - Grouped aggregations with incremental updates
 // ============================================================================
 
-/// Supported aggregation functions
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AggregateFunction {
-    Sum,
-    Count,
-    Avg,
-    Min,
-    Max,
-    Percentile(f64), // p value in 0.0..=1.0
-    Median,          // Sugar for Percentile(0.5)
-}
-
-/// Internal state for tracking aggregate statistics for one source column
-#[derive(Debug, Clone)]
-struct ColumnAggState {
-    /// Running sum for SUM and AVG calculations
-    sum: f64,
-    /// Count of non-null values
-    count: usize,
-    /// Current minimum value
-    min: Option<f64>,
-    /// Current maximum value
-    max: Option<f64>,
-    /// Sorted values for percentile calculations. Only populated when
-    /// a Percentile or Median aggregation targets this source column.
-    sorted_values: Option<Vec<f64>>,
-}
-
-impl ColumnAggState {
-    fn new(needs_sorted: bool) -> Self {
-        ColumnAggState {
-            sum: 0.0,
-            count: 0,
-            min: None,
-            max: None,
-            sorted_values: if needs_sorted { Some(Vec::new()) } else { None },
-        }
-    }
-
-    /// Add a numeric value to the aggregate state
-    fn add_value(&mut self, value: f64) {
-        self.sum += value;
-        self.count += 1;
-        self.min = Some(self.min.map_or(value, |m| m.min(value)));
-        self.max = Some(self.max.map_or(value, |m| m.max(value)));
-        if let Some(ref mut sorted) = self.sorted_values {
-            let pos = sorted.partition_point(|&v| v < value);
-            sorted.insert(pos, value);
-        }
-    }
-
-    /// Remove a numeric value from the aggregate state
-    /// Returns false if MIN/MAX needs recalculation (deleted value was min or max)
-    fn remove_value(&mut self, value: f64) -> bool {
-        self.sum -= value;
-        self.count = self.count.saturating_sub(1);
-
-        if let Some(ref mut sorted) = self.sorted_values {
-            let pos = sorted.partition_point(|&v| v < value);
-            if pos < sorted.len() && sorted[pos] == value {
-                sorted.remove(pos);
-            }
-        }
-
-        // Check if we need to recalculate min/max
-        let needs_recalc =
-            self.min.map_or(false, |m| m == value) || self.max.map_or(false, |m| m == value);
-
-        !needs_recalc
-    }
-
-    /// Recalculate MIN/MAX from a set of values
-    fn recalculate_min_max(&mut self, values: &[f64]) {
-        if values.is_empty() {
-            self.min = None;
-            self.max = None;
-        } else {
-            self.min = values.iter().copied().reduce(f64::min);
-            self.max = values.iter().copied().reduce(f64::max);
-        }
-        // Rebuild sorted_values if tracking percentiles
-        if self.sorted_values.is_some() {
-            let mut sorted = values.to_vec();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            self.sorted_values = Some(sorted);
-        }
-    }
-
-    /// Compute percentile using linear interpolation (PERCENTILE_CONT semantics).
-    /// p must be in 0.0..=1.0. Returns None if no values.
-    fn percentile(&self, p: f64) -> Option<f64> {
-        let sorted = self.sorted_values.as_ref()?;
-        if sorted.is_empty() {
-            return None;
-        }
-        if sorted.len() == 1 {
-            return Some(sorted[0]);
-        }
-        let idx = p * (sorted.len() - 1) as f64;
-        let lo = idx.floor() as usize;
-        let hi = lo + 1;
-        if hi >= sorted.len() {
-            return Some(sorted[lo]);
-        }
-        let frac = idx - lo as f64;
-        Some(sorted[lo] * (1.0 - frac) + sorted[hi] * frac)
-    }
-
-    fn get_result(&self, func: AggregateFunction) -> ColumnValue {
-        match func {
-            AggregateFunction::Sum => ColumnValue::Float64(self.sum),
-            AggregateFunction::Count => ColumnValue::Int64(self.count as i64),
-            AggregateFunction::Avg => {
-                if self.count > 0 {
-                    ColumnValue::Float64(self.sum / self.count as f64)
-                } else {
-                    ColumnValue::Null
-                }
-            }
-            AggregateFunction::Min => self.min.map_or(ColumnValue::Null, ColumnValue::Float64),
-            AggregateFunction::Max => self.max.map_or(ColumnValue::Null, ColumnValue::Float64),
-            AggregateFunction::Percentile(p) => self
-                .percentile(p)
-                .map_or(ColumnValue::Null, ColumnValue::Float64),
-            AggregateFunction::Median => self
-                .percentile(0.5)
-                .map_or(ColumnValue::Null, ColumnValue::Float64),
-        }
-    }
-}
-
-/// Internal state for tracking aggregates per group
-#[derive(Debug, Clone)]
-struct GroupState {
-    /// Per-source-column aggregate statistics
-    column_stats: HashMap<String, ColumnAggState>,
-    /// Parent row indices belonging to this group (for MIN/MAX recalc on delete)
-    row_indices: HashSet<usize>,
-    /// Source columns that need sorted_values for percentile calculations
-    percentile_columns: HashSet<String>,
-}
-
-impl GroupState {
-    fn new() -> Self {
-        GroupState {
-            column_stats: HashMap::new(),
-            row_indices: HashSet::new(),
-            percentile_columns: HashSet::new(),
-        }
-    }
-
-    /// Add a value for a specific source column
-    fn add_column_value(&mut self, source_col: &str, value: f64) {
-        let needs_sorted = self.percentile_columns.contains(source_col);
-        let stats = self
-            .column_stats
-            .entry(source_col.to_string())
-            .or_insert_with(|| ColumnAggState::new(needs_sorted));
-        stats.add_value(value);
-    }
-
-    /// Remove a value for a specific source column
-    /// Returns false if MIN/MAX needs recalculation
-    fn remove_column_value(&mut self, source_col: &str, value: f64) -> bool {
-        if let Some(stats) = self.column_stats.get_mut(source_col) {
-            stats.remove_value(value)
-        } else {
-            true
-        }
-    }
-
-    /// Get result for a specific aggregation (source column + function)
-    fn get_result(&self, source_col: &str, func: AggregateFunction) -> ColumnValue {
-        if let Some(stats) = self.column_stats.get(source_col) {
-            stats.get_result(func)
-        } else {
-            ColumnValue::Null
-        }
-    }
-
-    /// Recalculate MIN/MAX for a source column from a set of values
-    fn recalculate_column_min_max(&mut self, source_col: &str, values: &[f64]) {
-        if let Some(stats) = self.column_stats.get_mut(source_col) {
-            stats.recalculate_min_max(values);
-        }
-    }
-}
-
-/// A key for grouping rows - vector of column values converted to comparable strings
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GroupKey(Vec<Option<String>>);
-
-impl GroupKey {
-    fn from_row(row: &HashMap<String, ColumnValue>, group_by: &[String]) -> Self {
-        let values: Vec<Option<String>> = group_by
-            .iter()
-            .map(|col| {
-                row.get(col).and_then(|v| {
-                    // Use compact format consistent with from_indices
-                    match v {
-                        ColumnValue::Null => None,
-                        ColumnValue::Int32(n) => Some(format!("i{}", n)),
-                        ColumnValue::Int64(n) => Some(format!("I{}", n)),
-                        ColumnValue::Float32(f) => Some(format!("f{}", f)),
-                        ColumnValue::Float64(f) => Some(format!("F{}", f)),
-                        ColumnValue::String(s) => Some(format!("s{}", s)),
-                        ColumnValue::Bool(b) => Some(if *b {
-                            "B1".to_string()
-                        } else {
-                            "B0".to_string()
-                        }),
-                        ColumnValue::Date(d) => Some(format!("d{}", d)),
-                        ColumnValue::DateTime(dt) => Some(format!("D{}", dt)),
-                    }
-                })
-            })
-            .collect();
-        GroupKey(values)
-    }
-
-    /// Build GroupKey directly from table using column indices (faster than from_row)
-    fn from_indices(table: &Table, row_idx: usize, col_indices: &[usize]) -> Self {
-        let values: Vec<Option<String>> = col_indices
-            .iter()
-            .map(|&col_idx| {
-                match table.get_value_by_index(row_idx, col_idx) {
-                    Ok(ColumnValue::Null) => None,
-                    // Use simpler string representation - just the value
-                    // We prepend a type marker byte to disambiguate types with same string repr
-                    Ok(ColumnValue::Int32(v)) => Some(format!("i{}", v)),
-                    Ok(ColumnValue::Int64(v)) => Some(format!("I{}", v)),
-                    Ok(ColumnValue::Float32(v)) => Some(format!("f{}", v)),
-                    Ok(ColumnValue::Float64(v)) => Some(format!("F{}", v)),
-                    Ok(ColumnValue::String(s)) => Some(format!("s{}", s)),
-                    Ok(ColumnValue::Bool(b)) => Some(if b {
-                        "B1".to_string()
-                    } else {
-                        "B0".to_string()
-                    }),
-                    Ok(ColumnValue::Date(d)) => Some(format!("d{}", d)),
-                    Ok(ColumnValue::DateTime(dt)) => Some(format!("D{}", dt)),
-                    Err(_) => None,
-                }
-            })
-            .collect();
-        GroupKey(values)
-    }
-
-    /// Build GroupKey for a single integer column (most common case) - ultra fast path
-    #[inline]
-    fn from_single_int(value: i32) -> Self {
-        // Avoid string allocation for the most common case - we use a static prefix
-        GroupKey(vec![Some(format!("i{}", value))])
-    }
-
-    fn to_column_values(
-        &self,
-        group_by: &[String],
-        parent: &Table,
-    ) -> HashMap<String, ColumnValue> {
-        let mut result = HashMap::new();
-        for (i, col_name) in group_by.iter().enumerate() {
-            let value = match &self.0[i] {
-                None => ColumnValue::Null,
-                Some(s) => {
-                    // Try to reconstruct the original value based on column type
-                    if let Some(col_idx) = parent.schema().get_column_index(col_name) {
-                        if let Some((_, col_type, _)) = parent.schema().get_column_info(col_idx) {
-                            // Parse the key string back to ColumnValue
-                            // Supports both old format (Int32(...)) and new compact format (i...)
-                            match col_type {
-                                crate::column::ColumnType::String => {
-                                    // New format: s<value>
-                                    if s.starts_with('s') {
-                                        ColumnValue::String(s[1..].to_string())
-                                    // Old format: String("value")
-                                    } else if s.starts_with("String(\"") && s.ends_with("\")") {
-                                        let inner = &s[8..s.len() - 2];
-                                        ColumnValue::String(inner.to_string())
-                                    } else {
-                                        ColumnValue::String(s.clone())
-                                    }
-                                }
-                                crate::column::ColumnType::Int32 => {
-                                    // New format: i<value>
-                                    if s.starts_with('i') {
-                                        s[1..]
-                                            .parse()
-                                            .map(ColumnValue::Int32)
-                                            .unwrap_or(ColumnValue::Null)
-                                    // Old format: Int32(value)
-                                    } else if s.starts_with("Int32(") && s.ends_with(")") {
-                                        let inner = &s[6..s.len() - 1];
-                                        inner
-                                            .parse()
-                                            .map(ColumnValue::Int32)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Int64 => {
-                                    // New format: I<value>
-                                    if s.starts_with('I') {
-                                        s[1..]
-                                            .parse()
-                                            .map(ColumnValue::Int64)
-                                            .unwrap_or(ColumnValue::Null)
-                                    // Old format: Int64(value)
-                                    } else if s.starts_with("Int64(") && s.ends_with(")") {
-                                        let inner = &s[6..s.len() - 1];
-                                        inner
-                                            .parse()
-                                            .map(ColumnValue::Int64)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Float32 => {
-                                    // New format: f<value>
-                                    if s.starts_with('f') {
-                                        s[1..]
-                                            .parse()
-                                            .map(ColumnValue::Float32)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Float64 => {
-                                    // New format: F<value>
-                                    if s.starts_with('F') {
-                                        s[1..]
-                                            .parse()
-                                            .map(ColumnValue::Float64)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Bool => {
-                                    // New format: B0 or B1
-                                    if s == "B1" || s == "Bool(true)" {
-                                        ColumnValue::Bool(true)
-                                    } else if s == "B0" || s == "Bool(false)" {
-                                        ColumnValue::Bool(false)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Date => {
-                                    // New format: d<days>
-                                    if s.starts_with('d') {
-                                        s[1..]
-                                            .parse()
-                                            .map(ColumnValue::Date)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::DateTime => {
-                                    // New format: D<milliseconds>
-                                    if s.starts_with('D') {
-                                        s[1..]
-                                            .parse()
-                                            .map(ColumnValue::DateTime)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                            }
-                        } else {
-                            ColumnValue::String(s.clone())
-                        }
-                    } else {
-                        ColumnValue::String(s.clone())
-                    }
-                }
-            };
-            result.insert(col_name.clone(), value);
-        }
-        result
-    }
-}
+include!("view/aggregate_support.rs");
 
 /// AggregateView groups rows and computes aggregate functions per group.
 /// Supports incremental updates when the parent table changes.
@@ -2243,7 +1855,7 @@ impl AggregateView {
             .into_iter()
             .filter_map(|col| {
                 row.get(&col)
-                    .and_then(|v| Self::extract_numeric(v))
+                    .and_then(Self::extract_numeric)
                     .map(|num| (col, num))
             })
             .collect();
@@ -2287,7 +1899,7 @@ impl AggregateView {
             .into_iter()
             .filter_map(|col| {
                 row.get(&col)
-                    .and_then(|v| Self::extract_numeric(v))
+                    .and_then(Self::extract_numeric)
                     .map(|num| (col, num))
             })
             .collect();
@@ -2567,7 +2179,7 @@ impl AggregateView {
     fn adjust_indices_for_insert(&mut self, inserted_index: usize) {
         // Fast path: appending at the end doesn't shift any existing indices
         let max_existing = self.row_to_group.keys().max().copied();
-        if max_existing.map_or(true, |max| inserted_index > max) {
+        if max_existing.is_none_or(|max| inserted_index > max) {
             return;
         }
 
@@ -2965,7 +2577,7 @@ mod tests {
         let row = view.get_row(0).unwrap();
         assert_eq!(row.get("id").unwrap().as_i32(), Some(1));
         assert_eq!(row.get("name").unwrap().as_string(), Some("Alice"));
-        assert!(row.get("secret").is_none()); // Secret column not in projection
+        assert!(!row.contains_key("secret")); // Secret column not in projection
     }
 
     #[test]
@@ -4809,18 +4421,12 @@ mod tests {
             let mut l = left.borrow_mut();
             l.append_row(HashMap::from([
                 ("key".to_string(), ColumnValue::Int32(1)),
-                (
-                    "name".to_string(),
-                    ColumnValue::String("Alice".to_string()),
-                ),
+                ("name".to_string(), ColumnValue::String("Alice".to_string())),
             ]))
             .unwrap();
             l.append_row(HashMap::from([
                 ("key".to_string(), ColumnValue::Null),
-                (
-                    "name".to_string(),
-                    ColumnValue::String("Ghost".to_string()),
-                ),
+                ("name".to_string(), ColumnValue::String("Ghost".to_string())),
             ]))
             .unwrap();
         }
@@ -4879,19 +4485,14 @@ mod tests {
         // Row 2: Phantom (NULL key, right only)
         let row2 = joined.get_row(2).unwrap();
         assert!(row2.get("name").unwrap().is_null());
-        assert_eq!(
-            row2.get("right_data").unwrap().as_string(),
-            Some("Phantom")
-        );
+        assert_eq!(row2.get("right_data").unwrap().as_string(), Some("Phantom"));
     }
 
     // === RIGHT/FULL JOIN incremental sync tests ===
 
     /// Helper: collect join_index from a JoinView by reading rows and extracting
     /// a comparable tuple for each row. Returns Vec of (Option<left_key>, Option<right_key>).
-    fn collect_join_rows(
-        joined: &JoinView,
-    ) -> Vec<(Option<i32>, Option<i32>)> {
+    fn collect_join_rows(joined: &JoinView) -> Vec<(Option<i32>, Option<i32>)> {
         (0..joined.len())
             .map(|idx| {
                 let row = joined.get_row(idx).unwrap();
