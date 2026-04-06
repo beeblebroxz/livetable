@@ -27,9 +27,11 @@ cd tests
 ```
 
 This runs:
-1. Rust unit tests (23 tests in impl/src/)
-2. Python unit tests (pytest)
-3. Integration tests
+1. Rust `clippy` for the core library, `server`, and `python` features
+2. Rust library tests with the `server` feature enabled
+3. Python unit tests
+4. Integration tests
+5. Frontend lint, Vitest, and production build
 
 ### Python Tests Only
 
@@ -57,7 +59,25 @@ pytest -s
 
 ```bash
 cd ../impl
-env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib
+env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib --features server
+```
+
+### Rust Lint Only
+
+```bash
+cd ../impl
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features server -- -D warnings
+env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo clippy --all-targets --features python -- -D warnings
+```
+
+### Frontend Checks Only
+
+```bash
+cd ../frontend
+npm run lint
+npm run test
+npm run build
 ```
 
 ## Test Categories
@@ -94,21 +114,14 @@ env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib
 ### Rust Tests (`../impl/src/`)
 
 Located in Rust source files with `#[cfg(test)]` modules:
-- **sequence.rs** - Storage backends (6 tests)
-- **column.rs** - Column operations (3 tests)
-- **table.rs** - Table operations (5 tests)
-- **view.rs** - Views and joins (8 tests)
-- **lib.rs** - Integration workflow (1 test)
+- **sequence.rs** - Storage backends
+- **column.rs** - Column operations
+- **table.rs** - Table operations
+- **view.rs** - Views and incremental propagation
+- **websocket.rs** - WebSocket protocol and JSON conversion
+- **lib.rs** - Integration workflow
 
 ## Test Coverage
-
-### Current Coverage
-
-| Component | Tests | Status |
-|-----------|-------|--------|
-| Rust Core | 23 | ✅ Passing |
-| Python Bindings | 40+ | ✅ Passing |
-| Integration | 6 workflows | ✅ Passing |
 
 ### What's Tested
 
@@ -121,17 +134,16 @@ Located in Rust source files with `#[cfg(test)]` modules:
 ✅ ComputedView (dynamic columns)
 ✅ JoinView (LEFT and INNER joins)
 ✅ View chaining
+✅ WebSocket row mutation semantics
 ✅ Real-world workflows
 ✅ Performance with 1000+ rows
 
 ### What's NOT Tested (Yet)
 
-⚠️ Type conversion edge cases (bool vs int, f64 vs f32)
-⚠️ Error handling (invalid schemas, type mismatches)
-⚠️ Schema validation edge cases
-⚠️ Concurrent access patterns
+⚠️ Full browser E2E coverage across real sockets and tabs
+⚠️ Multi-client race conditions at browser level
 ⚠️ Memory stress tests
-⚠️ Python bindings code (`python_bindings.rs` has 0 unit tests)
+⚠️ Performance regression thresholds in CI
 
 ## Writing New Tests
 
@@ -184,29 +196,26 @@ mod tests {
 
 ## Continuous Integration
 
-To add CI (GitHub Actions example):
+GitHub Actions now lives in [.github/workflows/ci.yml](../.github/workflows/ci.yml).
+It runs:
 
-```yaml
-name: Tests
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-      - name: Install Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: '3.10'
-      - name: Install dependencies
-        run: |
-          pip install pytest maturin
-          cd impl && maturin develop
-      - name: Run tests
-        run: cd tests && ./run_all.sh
-```
+1. Rust `clippy` with `-D warnings` for the core library
+2. Rust `clippy` with `-D warnings` for the `server` feature
+3. Rust `clippy` with `-D warnings` for the `python` feature
+4. Rust tests with the `server` feature enabled
+   The workflow exercises the core library plus server/WebSocket paths.
+5. Python package build plus pytest suite on Python 3.12
+6. Frontend lint, Vitest, and production build
+
+### Toolchain Split
+
+The project intentionally validates different surfaces with different tools:
+
+1. Core, server, and python Rust feature sets are linted directly with Cargo.
+2. Python bindings are built as a wheel with `maturin` and validated with `pytest`.
+3. Frontend behavior is validated with ESLint, Vitest, and `vite build`.
+
+This avoids relying on `cargo test --all-features` for the PyO3 extension target, which is less stable across local Python installations. When running Cargo commands locally against newer Python runtimes, set `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`.
 
 ## Performance Testing
 
