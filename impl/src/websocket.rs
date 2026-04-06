@@ -7,18 +7,82 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::column::{ColumnType, ColumnValue};
-use crate::messages::{ClientMessage, ServerMessage};
+use crate::messages::{ClientMessage, ServerMessage, WireTableRow};
 use crate::table::{Schema, Table};
 
 /// How often heartbeat pings are sent
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long before lack of client response causes a timeout
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+type JsonRow = HashMap<String, JsonValue>;
+
+struct TableState {
+    table: Table,
+    row_ids: Vec<u64>,
+    next_row_id: u64,
+}
+
+impl TableState {
+    fn with_seed_data(table: Table) -> Self {
+        let row_count = table.len() as u64;
+        Self {
+            table,
+            row_ids: (1..=row_count).collect(),
+            next_row_id: row_count + 1,
+        }
+    }
+
+    fn row_index_by_id(&self, row_id: u64) -> Option<usize> {
+        self.row_ids
+            .iter()
+            .position(|candidate| *candidate == row_id)
+    }
+
+    fn insert_row(
+        &mut self,
+        row: HashMap<String, ColumnValue>,
+    ) -> Result<(usize, u64, JsonRow), String> {
+        let index = self.table.len();
+        let row_id = self.next_row_id;
+        self.next_row_id += 1;
+        self.table.append_row(row.clone())?;
+        self.row_ids.insert(index, row_id);
+        Ok((index, row_id, row_to_json(&row)))
+    }
+
+    fn update_cell(
+        &mut self,
+        row_id: u64,
+        column: &str,
+        value: ColumnValue,
+    ) -> Result<JsonValue, String> {
+        let row_index = self
+            .row_index_by_id(row_id)
+            .ok_or_else(|| format!("Row '{}' not found", row_id))?;
+        self.table.set_value(row_index, column, value.clone())?;
+        Ok(column_value_to_json(&value))
+    }
+
+    fn delete_row(&mut self, row_id: u64) -> Result<(), String> {
+        let row_index = self
+            .row_index_by_id(row_id)
+            .ok_or_else(|| format!("Row '{}' not found", row_id))?;
+        self.table.delete_row(row_index)?;
+        self.row_ids.remove(row_index);
+        Ok(())
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Shared state for all WebSocket connections
 pub struct AppState {
-    pub tables: Arc<Mutex<HashMap<String, Table>>>,
-    pub subscribers: Arc<Mutex<HashMap<String, Vec<Addr<TableWebSocket>>>>>,
+    tables: Arc<Mutex<HashMap<String, TableState>>>,
+    subscribers: Arc<Mutex<HashMap<String, Vec<Addr<TableWebSocket>>>>>,
 }
 
 impl AppState {
@@ -48,7 +112,7 @@ impl AppState {
         demo_table.append_row(row2).unwrap();
         demo_table.clear_changeset();
 
-        tables.insert("demo".to_string(), demo_table);
+        tables.insert("demo".to_string(), TableState::with_seed_data(demo_table));
 
         Self {
             tables: Arc::new(Mutex::new(tables)),
@@ -59,9 +123,7 @@ impl AppState {
     /// Subscribe a WebSocket connection to a table
     pub fn subscribe(&self, table_name: &str, addr: Addr<TableWebSocket>) {
         let mut subscribers = self.subscribers.lock().unwrap();
-        let subs = subscribers
-            .entry(table_name.to_string())
-            .or_insert_with(Vec::new);
+        let subs = subscribers.entry(table_name.to_string()).or_default();
         // Prevent duplicate subscriptions from the same actor
         if !subs.contains(&addr) {
             subs.push(addr);
@@ -104,10 +166,10 @@ impl AppState {
 
     pub fn query_table(&self, table_name: &str) -> Result<ServerMessage, String> {
         let tables = self.tables.lock().unwrap();
-        let table = tables
+        let table_state = tables
             .get(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
-        let (columns, rows) = table_to_json(table)?;
+        let (columns, rows) = table_to_json(table_state)?;
         Ok(ServerMessage::TableData {
             table_name: table_name.to_string(),
             columns,
@@ -121,58 +183,63 @@ impl AppState {
         row: HashMap<String, JsonValue>,
     ) -> Result<ServerMessage, String> {
         let mut tables = self.tables.lock().unwrap();
-        let table = tables
+        let table_state = tables
             .get_mut(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
-        let converted_row = convert_row_for_schema(table.schema(), &row)?;
-        let index = table.len();
-        table.append_row(converted_row.clone())?;
+        let converted_row = convert_row_for_schema(table_state.table.schema(), &row)?;
+        let (index, row_id, json_row) = table_state.insert_row(converted_row)?;
 
         Ok(ServerMessage::RowInserted {
             table_name: table_name.to_string(),
             index,
-            row: row_to_json(&converted_row),
+            row_id,
+            row: json_row,
         })
     }
 
     pub fn update_cell(
         &self,
         table_name: &str,
-        row_index: usize,
+        row_id: u64,
         column: &str,
         value: &JsonValue,
     ) -> Result<ServerMessage, String> {
         let mut tables = self.tables.lock().unwrap();
-        let table = tables
+        let table_state = tables
             .get_mut(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
-        let col_type = table
+        let col_type = table_state
+            .table
             .schema()
             .get_column_type(column)
             .ok_or_else(|| format!("Column '{}' not found", column))?;
-        let nullable = table.schema().is_column_nullable(column).unwrap_or(false);
+        let nullable = table_state
+            .table
+            .schema()
+            .is_column_nullable(column)
+            .unwrap_or(false);
         let col_value = json_to_column_value_typed(value, col_type, nullable)
             .map_err(|e| format!("Column '{}': {}", column, e))?;
-        table.set_value(row_index, column, col_value.clone())?;
+        let json_value = table_state.update_cell(row_id, column, col_value)?;
 
         Ok(ServerMessage::CellUpdated {
             table_name: table_name.to_string(),
-            row_index,
+            row_id,
             column: column.to_string(),
-            value: column_value_to_json(&col_value),
+            value: json_value,
         })
     }
 
-    pub fn delete_row(&self, table_name: &str, row_index: usize) -> Result<ServerMessage, String> {
+    pub fn delete_row(&self, table_name: &str, row_id: u64) -> Result<ServerMessage, String> {
         let mut tables = self.tables.lock().unwrap();
-        let table = tables
+        let table_state = tables
             .get_mut(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
-        table.delete_row(row_index)?;
+        table_state.delete_row(row_id)?;
 
         Ok(ServerMessage::RowDeleted {
             table_name: table_name.to_string(),
-            index: row_index,
+            row_id,
         })
     }
 }
@@ -254,26 +321,20 @@ impl TableWebSocket {
 
             ClientMessage::UpdateCell {
                 table_name,
-                row_index,
+                row_id,
                 column,
                 value,
-            } => {
-                match self
-                    .state
-                    .update_cell(&table_name, row_index, &column, &value)
-                {
+            } => match self.state.update_cell(&table_name, row_id, &column, &value) {
+                Ok(response) => self.state.broadcast(&table_name, response),
+                Err(err) => AppState::send_error(ctx, err),
+            },
+
+            ClientMessage::DeleteRow { table_name, row_id } => {
+                match self.state.delete_row(&table_name, row_id) {
                     Ok(response) => self.state.broadcast(&table_name, response),
                     Err(err) => AppState::send_error(ctx, err),
                 }
             }
-
-            ClientMessage::DeleteRow {
-                table_name,
-                row_index,
-            } => match self.state.delete_row(&table_name, row_index) {
-                Ok(response) => self.state.broadcast(&table_name, response),
-                Err(err) => AppState::send_error(ctx, err),
-            },
         }
     }
 }
@@ -404,24 +465,28 @@ fn column_value_to_json(cv: &ColumnValue) -> JsonValue {
     }
 }
 
-fn table_to_json(table: &Table) -> Result<(Vec<String>, Vec<HashMap<String, JsonValue>>), String> {
-    let columns: Vec<String> = table
+fn table_to_json(table_state: &TableState) -> Result<(Vec<String>, Vec<WireTableRow>), String> {
+    let columns: Vec<String> = table_state
+        .table
         .schema()
         .get_column_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-    let mut rows = Vec::with_capacity(table.len());
-    for row_idx in 0..table.len() {
-        rows.push(row_to_json(&table.get_row(row_idx)?));
+    let mut rows = Vec::with_capacity(table_state.table.len());
+    for (row_idx, row_id) in table_state.row_ids.iter().enumerate() {
+        rows.push(WireTableRow {
+            row_id: *row_id,
+            row: row_to_json(&table_state.table.get_row(row_idx)?),
+        });
     }
 
     Ok((columns, rows))
 }
 
 /// Convert row to JSON
-fn row_to_json(row: &HashMap<String, ColumnValue>) -> HashMap<String, JsonValue> {
+fn row_to_json(row: &HashMap<String, ColumnValue>) -> JsonRow {
     row.iter()
         .map(|(k, v)| (k.clone(), column_value_to_json(v)))
         .collect()
@@ -672,12 +737,14 @@ mod tests {
         let tables = state.tables.lock().unwrap();
         let demo = tables.get("demo").expect("demo table should exist");
 
-        assert_eq!(demo.len(), 2);
-        assert_eq!(demo.changeset().len(), 0);
+        assert_eq!(demo.table.len(), 2);
+        assert_eq!(demo.table.changeset().len(), 0);
+        assert_eq!(demo.row_ids, vec![1, 2]);
+        assert_eq!(demo.next_row_id, 3);
     }
 
     #[test]
-    fn test_app_state_mutations_use_core_table_operations() {
+    fn test_app_state_mutations_use_stable_row_ids() {
         let state = AppState::new();
 
         let insert_response = state
@@ -690,39 +757,44 @@ mod tests {
                 ]),
             )
             .expect("insert should succeed");
-        assert!(matches!(
-            insert_response,
-            ServerMessage::RowInserted { index: 2, .. }
-        ));
+        let inserted_row_id = match insert_response {
+            ServerMessage::RowInserted { index, row_id, .. } => {
+                assert_eq!(index, 2);
+                row_id
+            }
+            _ => panic!("expected row inserted response"),
+        };
+        assert_eq!(inserted_row_id, 3);
 
         let update_response = state
-            .update_cell("demo", 1, "value", &json!(250.5))
+            .update_cell("demo", 2, "value", &json!(250.5))
             .expect("update should succeed");
         assert!(matches!(
             update_response,
-            ServerMessage::CellUpdated { row_index: 1, .. }
+            ServerMessage::CellUpdated { row_id: 2, .. }
         ));
 
-        let delete_response = state.delete_row("demo", 0).expect("delete should succeed");
+        let delete_response = state.delete_row("demo", 1).expect("delete should succeed");
         assert!(matches!(
             delete_response,
-            ServerMessage::RowDeleted { index: 0, .. }
+            ServerMessage::RowDeleted { row_id: 1, .. }
         ));
 
         let tables = state.tables.lock().unwrap();
         let demo = tables.get("demo").expect("demo table should exist");
-        assert_eq!(demo.len(), 2);
-        assert_eq!(demo.changeset().len(), 3);
+        assert_eq!(demo.table.len(), 2);
+        assert_eq!(demo.table.changeset().len(), 3);
+        assert_eq!(demo.row_ids, vec![2, 3]);
         assert_eq!(
-            demo.get_value(0, "name").unwrap(),
+            demo.table.get_value(0, "name").unwrap(),
             ColumnValue::String("Bob".to_string())
         );
         assert_eq!(
-            demo.get_value(0, "value").unwrap(),
+            demo.table.get_value(0, "value").unwrap(),
             ColumnValue::Float64(250.5)
         );
         assert_eq!(
-            demo.get_value(1, "name").unwrap(),
+            demo.table.get_value(1, "name").unwrap(),
             ColumnValue::String("Charlie".to_string())
         );
     }
@@ -748,7 +820,21 @@ mod tests {
 
         assert_eq!(columns, vec!["id", "name", "value"]);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2].get("name"), Some(&json!("Charlie")));
-        assert_eq!(rows[2].get("value"), Some(&json!(300.25)));
+        assert_eq!(rows[2].row_id, 3);
+        assert_eq!(rows[2].row.get("name"), Some(&json!("Charlie")));
+        assert_eq!(rows[2].row.get("value"), Some(&json!(300.25)));
+    }
+
+    #[test]
+    fn test_app_state_rejects_unknown_row_id() {
+        let state = AppState::new();
+
+        let update_err = state
+            .update_cell("demo", 999, "value", &json!(250.5))
+            .unwrap_err();
+        assert!(update_err.contains("Row '999' not found"));
+
+        let delete_err = state.delete_row("demo", 999).unwrap_err();
+        assert!(delete_err.contains("Row '999' not found"));
     }
 }

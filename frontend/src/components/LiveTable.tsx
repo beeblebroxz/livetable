@@ -1,30 +1,38 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useReactTable, getCoreRowModel, flexRender, ColumnDef } from '@tanstack/react-table';
-import { useTableWebSocket, TableRow } from '../hooks/useTableWebSocket';
+import { useTableWebSocket } from '../hooks/useTableWebSocket';
+import { buildDraftRow } from '../lib/liveTableDraftRow';
+import type { ScalarValue, TableRecord, TableRow } from '../types';
 
 interface LiveTableProps {
   tableName: string;
 }
 
 interface EditableCellProps {
-  initialValue: TableRow[string];
-  rowIndex: number;
+  initialValue: ScalarValue;
+  rowId: number;
   columnId: string;
-  updateCell: (rowIndex: number, column: string, value: unknown) => void;
+  updateCell: (rowId: number, column: string, value: ScalarValue) => void;
 }
 
 function coerceEditedValue(
   rawValue: string,
-  initialValue: TableRow[string]
-): string | number | boolean | null {
+  initialValue: ScalarValue
+): ScalarValue {
   if (initialValue === null) {
-    return rawValue;
+    return rawValue === '' ? null : rawValue;
   }
   if (typeof initialValue === 'number') {
+    if (rawValue === '') {
+      return null;
+    }
     const parsed = Number(rawValue);
     return Number.isNaN(parsed) ? initialValue : parsed;
   }
   if (typeof initialValue === 'boolean') {
+    if (rawValue === '') {
+      return null;
+    }
     return rawValue.toLowerCase() === 'true';
   }
   return rawValue;
@@ -32,7 +40,7 @@ function coerceEditedValue(
 
 function EditableCell({
   initialValue,
-  rowIndex,
+  rowId,
   columnId,
   updateCell,
 }: EditableCellProps) {
@@ -45,7 +53,7 @@ function EditableCell({
   const onBlur = () => {
     const nextValue = coerceEditedValue(value, initialValue);
     if (nextValue !== initialValue) {
-      updateCell(rowIndex, columnId, nextValue);
+      updateCell(rowId, columnId, nextValue);
     }
   };
 
@@ -62,19 +70,19 @@ function EditableCell({
 export function LiveTable({ tableName }: LiveTableProps) {
   const { data, columns: columnNames, connected, insertRow, updateCell, deleteRow } = useTableWebSocket(tableName);
 
-  const columns = useMemo<ColumnDef<TableRow>[]>(() => {
+  const columns = useMemo<ColumnDef<TableRecord>[]>(() => {
     if (columnNames.length === 0) return [];
 
     return columnNames.map((colName) => ({
       id: colName,
-      accessorKey: colName,
+      accessorFn: (record) => record.values[colName] ?? null,
       header: colName.charAt(0).toUpperCase() + colName.slice(1),
-      cell: ({ getValue, row, column }) => {
-        const initialValue = getValue() as TableRow[string];
+      cell: ({ row, column }) => {
+        const initialValue = row.original.values[column.id] ?? null;
         return (
           <EditableCell
             initialValue={initialValue}
-            rowIndex={row.index}
+            rowId={row.original.rowId}
             columnId={column.id}
             updateCell={updateCell}
           />
@@ -90,21 +98,7 @@ export function LiveTable({ tableName }: LiveTableProps) {
   });
 
   const addRow = () => {
-    const newRow: TableRow = {};
-    const templateRow = data[0];
-    columnNames.forEach((col) => {
-      if (col === 'id') {
-        newRow[col] = data.length + 1;
-      } else if (col === 'name') {
-        newRow[col] = `New Item ${data.length + 1}`;
-      } else if (templateRow && typeof templateRow[col] === 'number') {
-        newRow[col] = 0;
-      } else if (templateRow && typeof templateRow[col] === 'boolean') {
-        newRow[col] = false;
-      } else {
-        newRow[col] = '';
-      }
-    });
+    const newRow: TableRow = buildDraftRow(columnNames, data);
     insertRow(newRow);
   };
 
@@ -174,7 +168,7 @@ export function LiveTable({ tableName }: LiveTableProps) {
                   ))}
                   <td className="border-b border-gray-200 p-3">
                     <button
-                      onClick={() => deleteRow(row.index)}
+                      onClick={() => deleteRow(row.original.rowId)}
                       className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition text-sm font-semibold"
                     >
                       Delete

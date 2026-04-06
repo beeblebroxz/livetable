@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
-import { useTableWebSocket, TableRow } from '../hooks/useTableWebSocket';
+import { useTableWebSocket } from '../hooks/useTableWebSocket';
+import type { TableRow } from '../types';
 
 // Types
 interface SaleRow extends TableRow {
@@ -140,11 +141,13 @@ interface CascadeDemoProps {
 
 export function CascadeDemo({ onBack }: CascadeDemoProps) {
   // Connect to WebSocket
-  const { data, connected } = useTableWebSocket('demo');
+  const { data: records, connected } = useTableWebSocket('demo');
 
   // Track recently added rows for highlighting
   const [recentIndices, setRecentIndices] = useState<Set<number>>(new Set());
   const prevLengthRef = useRef(0);
+
+  const data = useMemo(() => records.map((record) => record.values), [records]);
 
   // When new rows arrive, highlight them briefly
   useEffect(() => {
