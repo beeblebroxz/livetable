@@ -8,6 +8,8 @@ pub struct PyTableIterator {
     table: PyTable,
     index: usize,
     length: usize,
+    /// Table version at iterator creation; used to detect mutation during iteration.
+    start_version: u64,
 }
 
 #[pymethods]
@@ -19,6 +21,11 @@ impl PyTableIterator {
     fn __next__(&mut self, py: Python) -> PyResult<Option<PyObject>> {
         if self.index >= self.length {
             return Ok(None);
+        }
+        if self.table.inner.borrow().version() != self.start_version {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Table mutated during iteration",
+            ));
         }
         let row = self.table.get_row(py, self.index)?;
         self.index += 1;
@@ -32,6 +39,7 @@ pub struct PyFilterViewIterator {
     view: Py<PyFilterView>,
     index: usize,
     length: usize,
+    start_version: u64,
 }
 
 #[pymethods]
@@ -45,6 +53,11 @@ impl PyFilterViewIterator {
             return Ok(None);
         }
         let view = self.view.borrow(py);
+        if view.table.inner.borrow().version() != self.start_version {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parent table mutated during iteration",
+            ));
+        }
         let row = view.get_row(py, self.index)?;
         self.index += 1;
         Ok(Some(row))
@@ -57,6 +70,7 @@ pub struct PyProjectionViewIterator {
     view: Py<PyProjectionView>,
     index: usize,
     length: usize,
+    start_version: u64,
 }
 
 #[pymethods]
@@ -70,6 +84,11 @@ impl PyProjectionViewIterator {
             return Ok(None);
         }
         let view = self.view.borrow(py);
+        if view.table.inner.borrow().version() != self.start_version {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parent table mutated during iteration",
+            ));
+        }
         let row = view.get_row(py, self.index)?;
         self.index += 1;
         Ok(Some(row))
@@ -82,6 +101,7 @@ pub struct PyComputedViewIterator {
     view: Py<PyComputedView>,
     index: usize,
     length: usize,
+    start_version: u64,
 }
 
 #[pymethods]
@@ -95,6 +115,11 @@ impl PyComputedViewIterator {
             return Ok(None);
         }
         let view = self.view.borrow(py);
+        if view.table.inner.borrow().version() != self.start_version {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parent table mutated during iteration",
+            ));
+        }
         let row = view.get_row(py, self.index)?;
         self.index += 1;
         Ok(Some(row))

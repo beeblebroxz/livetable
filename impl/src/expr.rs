@@ -125,7 +125,7 @@ impl Lexer {
         ident
     }
 
-    fn read_number(&mut self) -> Token {
+    fn read_number(&mut self) -> Result<Token, String> {
         let mut num_str = String::new();
         let mut is_float = false;
 
@@ -143,9 +143,15 @@ impl Lexer {
         }
 
         if is_float {
-            Token::Float(num_str.parse().unwrap_or(0.0))
+            num_str
+                .parse::<f64>()
+                .map(Token::Float)
+                .map_err(|e| format!("Invalid float literal '{}': {}", num_str, e))
         } else {
-            Token::Int(num_str.parse().unwrap_or(0))
+            num_str
+                .parse::<i64>()
+                .map(Token::Int)
+                .map_err(|e| format!("Invalid integer literal '{}': {}", num_str, e))
         }
     }
 
@@ -236,14 +242,13 @@ impl Lexer {
                         .is_some_and(|c| c.is_ascii_digit() || *c == '.') =>
                     {
                         self.advance(); // consume '-'
-                        let token = self.read_number();
-                        match token {
+                        match self.read_number()? {
                             Token::Int(v) => Ok(Token::Int(-v)),
                             Token::Float(v) => Ok(Token::Float(-v)),
                             other => Ok(other),
                         }
                     }
-                    _ if c.is_ascii_digit() => Ok(self.read_number()),
+                    _ if c.is_ascii_digit() => self.read_number(),
                     _ if c.is_alphabetic() || c == '_' => {
                         let ident = self.read_ident();
                         // Check for keywords
@@ -622,5 +627,27 @@ mod tests {
 
         let expr = parse_expr("(score < 90 OR id == 1) AND active == true").unwrap();
         assert!(eval_expr(&expr, &row));
+    }
+
+    #[test]
+    fn test_integer_literal_overflow_errors() {
+        // Integer literals exceeding i64 range must error, not silently become 0.
+        // Previously `parse().unwrap_or(0)` meant `id == 99...` matched rows where id == 0.
+        let result = parse_expr("id == 99999999999999999999999");
+        assert!(
+            result.is_err(),
+            "Expected parse error for overflowing integer, got Ok({:?})",
+            result
+        );
+    }
+
+    #[test]
+    fn test_negative_integer_overflow_errors() {
+        let result = parse_expr("id == -99999999999999999999999");
+        assert!(
+            result.is_err(),
+            "Expected parse error for overflowing negative integer, got Ok({:?})",
+            result
+        );
     }
 }

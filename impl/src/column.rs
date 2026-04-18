@@ -462,8 +462,8 @@ impl Column {
         }
     }
 
-    pub fn append(&mut self, value: ColumnValue) {
-        let value = self.validate_value(value).expect("Invalid value");
+    pub fn append(&mut self, value: ColumnValue) -> Result<(), String> {
+        let value = self.validate_value(value)?;
 
         if value.is_null() {
             if let Some(ref mut null_flags) = self.null_flags {
@@ -483,13 +483,35 @@ impl Column {
                 (&mut self.string_ids, &self.interner)
             {
                 if let ColumnValue::String(ref s) = value {
-                    let id = interner.lock().unwrap().intern(s);
+                    let id = interner
+                        .lock()
+                        .map_err(|_| {
+                            "string interner mutex was poisoned by a prior panic".to_string()
+                        })?
+                        .intern(s);
                     string_ids.append(id);
                     self.sequence.append(ColumnValue::String(String::new()));
-                    return;
+                    return Ok(());
                 }
             }
             self.sequence.append(value);
+        }
+        Ok(())
+    }
+
+    /// Truncate the column back to `target_len` entries. Used by Table for
+    /// rolling back partial mutations when a multi-column append fails
+    /// mid-loop. Idempotent if the column is already <= target_len.
+    pub(crate) fn truncate_to(&mut self, target_len: usize) {
+        while self.len() > target_len {
+            let last = self.len() - 1;
+            let _ = self.sequence.delete(last);
+            if let Some(ref mut nf) = self.null_flags {
+                let _ = nf.delete(last);
+            }
+            if let Some(ref mut sids) = self.string_ids {
+                let _ = sids.delete(last);
+            }
         }
     }
 
@@ -566,9 +588,9 @@ mod tests {
     #[test]
     fn test_column_basic() {
         let mut col = Column::new("test".to_string(), ColumnType::Int32, false);
-        col.append(ColumnValue::Int32(10));
-        col.append(ColumnValue::Int32(20));
-        col.append(ColumnValue::Int32(30));
+        col.append(ColumnValue::Int32(10)).unwrap();
+        col.append(ColumnValue::Int32(20)).unwrap();
+        col.append(ColumnValue::Int32(30)).unwrap();
 
         assert_eq!(col.len(), 3);
         assert_eq!(col.get(0).unwrap().as_i32(), Some(10));
@@ -579,9 +601,9 @@ mod tests {
     #[test]
     fn test_column_nullable() {
         let mut col = Column::new("test".to_string(), ColumnType::Int32, true);
-        col.append(ColumnValue::Int32(10));
-        col.append(ColumnValue::Null);
-        col.append(ColumnValue::Int32(30));
+        col.append(ColumnValue::Int32(10)).unwrap();
+        col.append(ColumnValue::Null).unwrap();
+        col.append(ColumnValue::Int32(30)).unwrap();
 
         assert_eq!(col.len(), 3);
         assert_eq!(col.get(0).unwrap().as_i32(), Some(10));
@@ -593,8 +615,8 @@ mod tests {
     #[test]
     fn test_column_set() {
         let mut col = Column::new("test".to_string(), ColumnType::Int32, false);
-        col.append(ColumnValue::Int32(10));
-        col.append(ColumnValue::Int32(20));
+        col.append(ColumnValue::Int32(10)).unwrap();
+        col.append(ColumnValue::Int32(20)).unwrap();
 
         col.set(1, ColumnValue::Int32(99)).unwrap();
         assert_eq!(col.get(1).unwrap().as_i32(), Some(99));
@@ -613,11 +635,11 @@ mod tests {
         );
 
         // Add some repeated strings
-        col.append(ColumnValue::String("Alice".to_string()));
-        col.append(ColumnValue::String("Bob".to_string()));
-        col.append(ColumnValue::String("Alice".to_string())); // Duplicate
-        col.append(ColumnValue::String("Charlie".to_string()));
-        col.append(ColumnValue::String("Alice".to_string())); // Another duplicate
+        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Bob".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string())).unwrap(); // Duplicate
+        col.append(ColumnValue::String("Charlie".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string())).unwrap(); // Another duplicate
 
         // Verify we can read values back
         assert_eq!(col.get(0).unwrap().as_string(), Some("Alice"));
@@ -648,8 +670,8 @@ mod tests {
             Some(interner.clone()),
         );
 
-        col.append(ColumnValue::String("Alice".to_string()));
-        col.append(ColumnValue::String("Alice".to_string()));
+        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string())).unwrap();
 
         // Update one "Alice" to "Bob"
         col.set(1, ColumnValue::String("Bob".to_string())).unwrap();
@@ -674,9 +696,9 @@ mod tests {
             Some(interner.clone()),
         );
 
-        col.append(ColumnValue::String("Alice".to_string()));
-        col.append(ColumnValue::String("Bob".to_string()));
-        col.append(ColumnValue::String("Alice".to_string()));
+        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Bob".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string())).unwrap();
 
         // Delete the only "Bob"
         let deleted = col.delete(1).unwrap();

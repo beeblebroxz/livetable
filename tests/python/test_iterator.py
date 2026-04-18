@@ -320,3 +320,104 @@ class TestIteratorIntegration:
         names = ["Alice", "Bob", "Charlie"]
         for row, expected_name in zip(sample_table, names):
             assert row["name"] == expected_name
+
+
+# ============================================================================
+# Mutation-during-iteration Tests
+# ============================================================================
+
+class TestMutationDuringIteration:
+    """Iterators must detect concurrent mutation and raise RuntimeError,
+    matching Python's built-in dict/set semantics, instead of silently
+    producing duplicated or skipped rows."""
+
+    def test_append_during_iteration_raises(self, sample_table):
+        it = iter(sample_table)
+        next(it)
+        sample_table.append_row({"id": 99, "name": "Eve", "score": 70.0})
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
+    def test_delete_during_iteration_raises(self, sample_table):
+        it = iter(sample_table)
+        next(it)
+        sample_table.delete_row(2)
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
+    def test_set_value_during_iteration_raises(self, sample_table):
+        it = iter(sample_table)
+        next(it)
+        sample_table.set_value(1, "score", 99.0)
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
+    def test_filter_view_detects_parent_mutation(self, sample_table):
+        view = sample_table.filter(lambda r: r["score"] >= 90)
+        it = iter(view)
+        next(it)
+        sample_table.append_row({"id": 99, "name": "Eve", "score": 99.0})
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
+    def test_projection_view_detects_parent_mutation(self, sample_table):
+        view = sample_table.select(["name", "score"])
+        it = iter(view)
+        next(it)
+        sample_table.delete_row(0)
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
+    def test_iteration_completes_without_mutation(self, sample_table):
+        """Baseline: unmutated iteration must still work."""
+        rows = list(sample_table)
+        assert len(rows) == 3
+
+
+class TestReentrantCallbackSafety:
+    """User-supplied filter/compute lambdas can in principle mutate the
+    parent table re-entrantly. Previously this triggered a RefCell 'already
+    borrowed' panic that aborted the Python interpreter. The contract now
+    is: the user's callback must not mutate the parent — if it does, a
+    Python RuntimeError is raised rather than panicking."""
+
+    def _schema(self):
+        return livetable.Schema([
+            ("id", livetable.ColumnType.INT32, False),
+            ("name", livetable.ColumnType.STRING, False),
+            ("score", livetable.ColumnType.FLOAT64, True),
+        ])
+
+    def test_filter_lambda_reentrant_append_raises(self):
+        table = livetable.Table("t", self._schema())
+        table.append_row({"id": 1, "name": "a", "score": 10.0})
+        table.append_row({"id": 2, "name": "b", "score": 20.0})
+
+        def bad(row):
+            table.append_row({"id": 99, "name": "x", "score": 99.0})
+            return True
+
+        with pytest.raises(RuntimeError, match="mutated during"):
+            table.filter(bad)
+
+    def test_filter_lambda_reentrant_set_value_raises(self):
+        table = livetable.Table("t", self._schema())
+        table.append_row({"id": 1, "name": "a", "score": 10.0})
+        table.append_row({"id": 2, "name": "b", "score": 20.0})
+
+        def bad(row):
+            if row["id"] == 1:
+                table.set_value(1, "score", 77.7)
+            return True
+
+        with pytest.raises(RuntimeError, match="mutated during"):
+            table.filter(bad)
+
+    def test_filter_readonly_lambda_still_works(self):
+        """Baseline: a well-behaved lambda that only reads must still work."""
+        table = livetable.Table("t", self._schema())
+        table.append_row({"id": 1, "name": "a", "score": 10.0})
+        table.append_row({"id": 2, "name": "b", "score": 20.0})
+
+        view = table.filter(lambda r: r["score"] >= 15)
+        assert len(view) == 1

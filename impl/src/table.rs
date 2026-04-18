@@ -201,6 +201,10 @@ pub struct Table {
     changeset: Changeset,
     /// Optional string interner shared across all string columns
     interner: Option<Arc<Mutex<StringInterner>>>,
+    /// Monotonic counter bumped on every row-data mutation. Used by
+    /// iterators to detect mutation-during-iteration. Never decreases;
+    /// unaffected by changeset lifecycle operations.
+    mutation_count: u64,
 }
 
 impl Table {
@@ -282,7 +286,16 @@ impl Table {
             row_count: 0,
             changeset: Changeset::new(),
             interner,
+            mutation_count: 0,
         }
+    }
+
+    /// Returns a monotonic counter that bumps on every row-data mutation.
+    /// Iterators capture this at creation and recheck during `__next__`
+    /// to detect mutation-during-iteration (Python dict/set semantics).
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.mutation_count
     }
 
     // ==================== Backward-compatible methods ====================
@@ -396,6 +409,7 @@ impl Table {
             old_value,
             new_value: value,
         });
+        self.mutation_count += 1;
 
         Ok(())
     }
@@ -425,12 +439,20 @@ impl Table {
         }
 
         let insert_index = self.row_count;
+        let snapshot_len = self.row_count;
 
-        // All values validated — safe to mutate
+        // Two-phase commit: if any column.append fails (e.g. interner mutex
+        // poisoned from a prior panic), roll every column back to the
+        // pre-append length so table invariants stay consistent.
         for (i, col) in self.columns.iter_mut().enumerate() {
             let col_name = self.schema.get_column_info(i).unwrap().0;
             let value = row.get(col_name).unwrap().clone();
-            col.append(value);
+            if let Err(e) = col.append(value) {
+                for c in self.columns.iter_mut() {
+                    c.truncate_to(snapshot_len);
+                }
+                return Err(format!("Column '{}': {}", col_name, e));
+            }
         }
 
         self.row_count += 1;
@@ -440,6 +462,7 @@ impl Table {
             index: insert_index,
             data: row,
         });
+        self.mutation_count += 1;
 
         Ok(())
     }
@@ -521,16 +544,25 @@ impl Table {
 
         let start_index = self.row_count;
         let num_rows = rows.len();
+        let snapshot_len = self.row_count;
+        let snapshot_changeset_len = self.changeset.total_len();
 
-        // Insert all rows
+        // Insert all rows. On any per-column append failure, truncate every
+        // column back to the pre-batch length so no partial rows remain.
         for (row_offset, row) in rows.into_iter().enumerate() {
             let insert_index = start_index + row_offset;
 
-            // Append to each column
             for (i, col) in self.columns.iter_mut().enumerate() {
                 let col_name = col_names[i];
                 let value = row.get(col_name).unwrap().clone();
-                col.append(value);
+                if let Err(e) = col.append(value) {
+                    for c in self.columns.iter_mut() {
+                        c.truncate_to(snapshot_len);
+                    }
+                    self.row_count = snapshot_len;
+                    self.changeset.truncate_to(snapshot_changeset_len);
+                    return Err(format!("Row {} column '{}': {}", row_offset, col_name, e));
+                }
             }
 
             self.row_count += 1;
@@ -540,6 +572,7 @@ impl Table {
                 index: insert_index,
                 data: row,
             });
+            self.mutation_count += 1;
         }
 
         Ok(num_rows)
@@ -566,11 +599,17 @@ impl Table {
             }
         }
 
-        // All values validated — safe to mutate
-        for (i, col) in self.columns.iter_mut().enumerate() {
+        // Two-phase commit with rollback on any col.insert failure.
+        for i in 0..self.columns.len() {
             let col_name = self.schema.get_column_info(i).unwrap().0;
             let value = row.get(col_name).unwrap().clone();
-            col.insert(index, value)?;
+            if let Err(e) = self.columns[i].insert(index, value) {
+                // Roll back every column that already inserted.
+                for j in 0..i {
+                    let _ = self.columns[j].delete(index);
+                }
+                return Err(format!("Column '{}': {}", col_name, e));
+            }
         }
 
         self.row_count += 1;
@@ -578,6 +617,7 @@ impl Table {
         // Record the change
         self.changeset
             .push(TableChange::RowInserted { index, data: row });
+        self.mutation_count += 1;
 
         Ok(())
     }
@@ -604,6 +644,7 @@ impl Table {
             index,
             data: result.clone(),
         });
+        self.mutation_count += 1;
 
         Ok(result)
     }
@@ -1802,5 +1843,122 @@ mod tests {
         let table = Table::new("simple".to_string(), schema);
         assert!(!table.uses_string_interning());
         assert!(table.interner_stats().is_none());
+    }
+
+    /// Helper: assert that every column's length equals row_count.
+    /// This is the core invariant that partial-mutation bugs violate.
+    fn assert_table_consistent(table: &Table) {
+        let rc = table.len();
+        for (i, col) in table.columns.iter().enumerate() {
+            assert_eq!(
+                col.len(),
+                rc,
+                "column {} has length {} but table.row_count is {}",
+                i,
+                col.len(),
+                rc
+            );
+        }
+    }
+
+    #[test]
+    fn test_append_row_failure_preserves_column_length_invariant() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+            ("score".to_string(), ColumnType::Float64, false),
+        ]);
+        let mut table = Table::new("t".to_string(), schema);
+
+        let mut good = HashMap::new();
+        good.insert("id".to_string(), ColumnValue::Int32(1));
+        good.insert("name".to_string(), ColumnValue::String("a".to_string()));
+        good.insert("score".to_string(), ColumnValue::Float64(1.5));
+        table.append_row(good).unwrap();
+        assert_table_consistent(&table);
+
+        // Type mismatch on a later column: must not partially mutate earlier columns.
+        let mut bad = HashMap::new();
+        bad.insert("id".to_string(), ColumnValue::Int32(2));
+        bad.insert("name".to_string(), ColumnValue::String("b".to_string()));
+        bad.insert(
+            "score".to_string(),
+            ColumnValue::String("not-a-float".to_string()),
+        );
+        assert!(table.append_row(bad).is_err());
+        assert_table_consistent(&table);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn test_append_rows_failure_rolls_back_all_partial_rows() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let mut table = Table::new("t".to_string(), schema);
+
+        let r = |id: i32, name: &str| {
+            let mut h = HashMap::new();
+            h.insert("id".to_string(), ColumnValue::Int32(id));
+            h.insert("name".to_string(), ColumnValue::String(name.to_string()));
+            h
+        };
+        table.append_row(r(1, "a")).unwrap();
+        let start_len = table.len();
+
+        // First two rows valid, third has type mismatch.
+        let mut bad_third = HashMap::new();
+        bad_third.insert("id".to_string(), ColumnValue::Int32(4));
+        bad_third.insert("name".to_string(), ColumnValue::Int32(99)); // wrong type
+
+        let rows = vec![r(2, "b"), r(3, "c"), bad_third];
+        assert!(table.append_rows(rows).is_err());
+        assert_table_consistent(&table);
+        assert_eq!(
+            table.len(),
+            start_len,
+            "no rows should have been added on failure"
+        );
+    }
+
+    #[test]
+    fn test_version_increments_monotonically_on_mutation() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let mut table = Table::new("t".to_string(), schema);
+
+        let v0 = table.version();
+
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), ColumnValue::Int32(1));
+        row.insert("name".to_string(), ColumnValue::String("a".to_string()));
+        table.append_row(row).unwrap();
+        let v1 = table.version();
+        assert!(v1 > v0, "append_row must increment version");
+
+        table
+            .set_value(0, "name", ColumnValue::String("b".to_string()))
+            .unwrap();
+        let v2 = table.version();
+        assert!(v2 > v1, "set_value must increment version");
+
+        table.delete_row(0).unwrap();
+        let v3 = table.version();
+        assert!(v3 > v2, "delete_row must increment version");
+
+        // Reads must not change version
+        let v4 = table.version();
+        let _ = table.len();
+        assert_eq!(v4, table.version(), "reads must not change version");
+
+        // clear_changeset must not decrement version (monotonic)
+        table.clear_changeset();
+        assert!(
+            table.version() >= v3,
+            "clear_changeset must not rewind version"
+        );
     }
 }

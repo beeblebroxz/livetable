@@ -16,6 +16,29 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 type JsonRow = HashMap<String, JsonValue>;
 
+/// Acquire a mutex guard even if the mutex was poisoned by a prior panic.
+/// A poisoned mutex means the data MIGHT be in an inconsistent state, but
+/// for our use cases (HashMap<String, TableState>, Vec<Addr>) the invariants
+/// are statement-local and a partial mutation is tolerable — we prefer to
+/// keep the server running over crashing every future request.
+#[inline]
+fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Serialize a `ServerMessage` to JSON. If serialization fails (e.g. a
+/// NaN/Infinity float slipped through), return a minimal Error envelope
+/// instead of panicking and tearing down the connection.
+fn serialize_ws_message(msg: &ServerMessage) -> String {
+    serde_json::to_string(msg).unwrap_or_else(|e| {
+        let safe = e.to_string().replace('"', "'").replace('\\', "/");
+        format!(
+            r#"{{"type":"Error","message":"Server serialization failure: {}"}}"#,
+            safe
+        )
+    })
+}
+
 struct TableState {
     table: Table,
     row_ids: Vec<u64>,
@@ -122,7 +145,7 @@ impl AppState {
 
     /// Subscribe a WebSocket connection to a table
     pub fn subscribe(&self, table_name: &str, addr: Addr<TableWebSocket>) {
-        let mut subscribers = self.subscribers.lock().unwrap();
+        let mut subscribers = lock_unpoisoned(&self.subscribers);
         let subs = subscribers.entry(table_name.to_string()).or_default();
         // Prevent duplicate subscriptions from the same actor
         if !subs.contains(&addr) {
@@ -137,7 +160,7 @@ impl AppState {
 
     /// Broadcast a message to all subscribers of a table
     pub fn broadcast(&self, table_name: &str, msg: ServerMessage) {
-        let mut subscribers = self.subscribers.lock().unwrap();
+        let mut subscribers = lock_unpoisoned(&self.subscribers);
         if let Some(addrs) = subscribers.get_mut(table_name) {
             println!("[broadcast] {} -> {} subscribers", table_name, addrs.len());
             // Prune dead/full addresses: retain only subscribers that accepted the message
@@ -149,7 +172,7 @@ impl AppState {
 
     /// Unsubscribe a WebSocket connection from a table
     pub fn unsubscribe(&self, table_name: &str, addr: &Addr<TableWebSocket>) {
-        let mut subscribers = self.subscribers.lock().unwrap();
+        let mut subscribers = lock_unpoisoned(&self.subscribers);
         if let Some(subs) = subscribers.get_mut(table_name) {
             subs.retain(|a| a != addr);
             println!(
@@ -161,11 +184,11 @@ impl AppState {
     }
 
     fn send_error(ctx: &mut ws::WebsocketContext<TableWebSocket>, message: String) {
-        ctx.text(serde_json::to_string(&ServerMessage::Error { message }).unwrap());
+        ctx.text(serialize_ws_message(&ServerMessage::Error { message }));
     }
 
     pub fn query_table(&self, table_name: &str) -> Result<ServerMessage, String> {
-        let tables = self.tables.lock().unwrap();
+        let tables = lock_unpoisoned(&self.tables);
         let table_state = tables
             .get(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
@@ -182,7 +205,7 @@ impl AppState {
         table_name: &str,
         row: HashMap<String, JsonValue>,
     ) -> Result<ServerMessage, String> {
-        let mut tables = self.tables.lock().unwrap();
+        let mut tables = lock_unpoisoned(&self.tables);
         let table_state = tables
             .get_mut(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
@@ -204,7 +227,7 @@ impl AppState {
         column: &str,
         value: &JsonValue,
     ) -> Result<ServerMessage, String> {
-        let mut tables = self.tables.lock().unwrap();
+        let mut tables = lock_unpoisoned(&self.tables);
         let table_state = tables
             .get_mut(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
@@ -231,7 +254,7 @@ impl AppState {
     }
 
     pub fn delete_row(&self, table_name: &str, row_id: u64) -> Result<ServerMessage, String> {
-        let mut tables = self.tables.lock().unwrap();
+        let mut tables = lock_unpoisoned(&self.tables);
         let table_state = tables
             .get_mut(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
@@ -280,14 +303,11 @@ impl TableWebSocket {
         match msg {
             ClientMessage::Subscribe { table_name } => {
                 // Only allow subscriptions to existing tables
-                let table_exists = self.state.tables.lock().unwrap().contains_key(&table_name);
+                let table_exists = lock_unpoisoned(&self.state.tables).contains_key(&table_name);
                 if !table_exists {
-                    ctx.text(
-                        serde_json::to_string(&ServerMessage::Error {
-                            message: format!("Table '{}' not found", table_name),
-                        })
-                        .unwrap(),
-                    );
+                    ctx.text(serialize_ws_message(&ServerMessage::Error {
+                        message: format!("Table '{}' not found", table_name),
+                    }));
                     return;
                 }
 
@@ -304,11 +324,11 @@ impl TableWebSocket {
                 let response = ServerMessage::Subscribed {
                     table_name: table_name.clone(),
                 };
-                ctx.text(serde_json::to_string(&response).unwrap());
+                ctx.text(serialize_ws_message(&response));
             }
 
             ClientMessage::Query { table_name } => match self.state.query_table(&table_name) {
-                Ok(response) => ctx.text(serde_json::to_string(&response).unwrap()),
+                Ok(response) => ctx.text(serialize_ws_message(&response)),
                 Err(err) => AppState::send_error(ctx, err),
             },
 
@@ -370,12 +390,9 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for TableWebSocket {
                     self.handle_client_message(client_msg, ctx);
                 }
                 Err(e) => {
-                    ctx.text(
-                        serde_json::to_string(&ServerMessage::Error {
-                            message: format!("Invalid message format: {}", e),
-                        })
-                        .unwrap(),
-                    );
+                    ctx.text(serialize_ws_message(&ServerMessage::Error {
+                        message: format!("Invalid message format: {}", e),
+                    }));
                 }
             },
             Ok(ws::Message::Binary(_)) => {
@@ -394,7 +411,7 @@ impl Handler<BroadcastMessage> for TableWebSocket {
     type Result = ();
 
     fn handle(&mut self, msg: BroadcastMessage, ctx: &mut Self::Context) {
-        ctx.text(serde_json::to_string(&msg.0).unwrap());
+        ctx.text(serialize_ws_message(&msg.0));
     }
 }
 
@@ -836,5 +853,53 @@ mod tests {
 
         let delete_err = state.delete_row("demo", 999).unwrap_err();
         assert!(delete_err.contains("Row '999' not found"));
+    }
+
+    #[test]
+    fn test_app_state_survives_poisoned_tables_mutex() {
+        // A panic in one handler must not take down the entire server by
+        // poisoning the Mutex — subsequent requests must continue to work.
+        let state = AppState::new();
+        let tables = state.tables.clone();
+
+        let _ = std::thread::spawn(move || {
+            let _guard = tables.lock().unwrap();
+            panic!("simulate handler panic while holding lock");
+        })
+        .join();
+
+        assert!(
+            state.tables.is_poisoned(),
+            "sanity: the mutex should be poisoned after the panicking thread"
+        );
+
+        let result = state.query_table("demo");
+        assert!(
+            result.is_ok(),
+            "query_table must succeed on poisoned mutex, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_app_state_survives_poisoned_subscribers_mutex() {
+        let state = AppState::new();
+        let subs = state.subscribers.clone();
+
+        let _ = std::thread::spawn(move || {
+            let _guard = subs.lock().unwrap();
+            panic!("simulate handler panic while holding subscribers lock");
+        })
+        .join();
+
+        assert!(state.subscribers.is_poisoned());
+
+        // broadcast must not panic on poisoned subscribers mutex
+        state.broadcast(
+            "demo",
+            ServerMessage::Error {
+                message: "test".to_string(),
+            },
+        );
     }
 }

@@ -140,29 +140,62 @@ struct PyFilterViewInner {
     last_processed_change_count: usize,
 }
 
+/// Call the user's predicate and translate the cryptic "Already borrowed"
+/// error that PyO3 raises when the predicate re-enters the parent table
+/// with a mutation into a clearer, domain-specific message.
+fn call_predicate_bool(
+    predicate: &PyObject,
+    py: Python,
+    dict: Bound<'_, PyDict>,
+) -> PyResult<bool> {
+    match predicate.call1(py, (dict,)) {
+        Ok(v) => v.extract::<bool>(py),
+        Err(e) => {
+            if e.to_string().contains("Already borrowed") {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Table mutated during filter predicate — predicates must not mutate the parent",
+                ))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 impl PyFilterViewInner {
-    /// Rebuild all indices by re-evaluating the predicate for all rows
+    /// Rebuild all indices by re-evaluating the predicate for all rows.
+    ///
+    /// The parent table borrow is released before calling the user's
+    /// predicate so read-only callbacks can safely access other rows.
+    /// Mutations from within the predicate are rejected with a clear error.
     fn refresh(&mut self, py: Python) -> PyResult<()> {
         self.indices.clear();
-        let table_ref = self.table_inner.borrow();
 
-        for i in 0..table_ref.len() {
-            if let Ok(row) = table_ref.get_row(i) {
-                // Convert row to Python dict
-                let dict = PyDict::new_bound(py);
-                for (key, value) in row.iter() {
-                    dict.set_item(key, column_value_to_py(py, value)?)?;
-                }
+        // Snapshot rows + metadata while the borrow is live, then drop it.
+        let (rows, generation, change_count) = {
+            let table_ref = self.table_inner.borrow();
+            let rows: Vec<_> = (0..table_ref.len())
+                .filter_map(|i| table_ref.get_row(i).ok())
+                .collect();
+            (
+                rows,
+                table_ref.changeset_generation(),
+                table_ref.changeset().total_len(),
+            )
+        };
 
-                let result: bool = self.predicate.call1(py, (dict,))?.extract(py)?;
-                if result {
-                    self.indices.push(i);
-                }
+        for (i, row) in rows.iter().enumerate() {
+            let dict = PyDict::new_bound(py);
+            for (key, value) in row.iter() {
+                dict.set_item(key, column_value_to_py(py, value)?)?;
+            }
+            if call_predicate_bool(&self.predicate, py, dict)? {
+                self.indices.push(i);
             }
         }
 
-        self.last_synced_generation = table_ref.changeset_generation();
-        self.last_processed_change_count = table_ref.changeset().total_len();
+        self.last_synced_generation = generation;
+        self.last_processed_change_count = change_count;
         Ok(())
     }
 
@@ -204,8 +237,7 @@ impl PyFilterViewInner {
                         dict.set_item(key, column_value_to_py(py, value)?)?;
                     }
 
-                    let result: bool = self.predicate.call1(py, (dict,))?.extract(py)?;
-                    if result {
+                    if call_predicate_bool(&self.predicate, py, dict)? {
                         let insert_pos = self
                             .indices
                             .iter()
@@ -234,16 +266,15 @@ impl PyFilterViewInner {
 
                 TableChange::CellUpdated { row, .. } => {
                     let currently_in_view = self.indices.contains(&row);
-                    let table_ref = self.table_inner.borrow();
-                    let now_matches = if let Ok(row_data) = table_ref.get_row(row) {
+                    // Snapshot the row and drop the borrow before any Python call.
+                    let row_data = self.table_inner.borrow().get_row(row).ok();
+                    let now_matches = if let Some(row_data) = row_data {
                         let dict = PyDict::new_bound(py);
                         for (key, value) in row_data.iter() {
                             dict.set_item(key, column_value_to_py(py, value)?)?;
                         }
-                        drop(table_ref);
-                        self.predicate.call1(py, (dict,))?.extract::<bool>(py)?
+                        call_predicate_bool(&self.predicate, py, dict)?
                     } else {
-                        drop(table_ref);
                         false
                     };
 
@@ -1279,10 +1310,12 @@ impl PyTable {
     /// Return an iterator over the table rows.
     /// Enables: `for row in table:`
     fn __iter__(slf: PyRef<'_, Self>) -> PyTableIterator {
+        let inner = slf.inner.borrow();
         PyTableIterator {
             table: slf.clone(),
             index: 0,
-            length: slf.inner.borrow().len(),
+            length: inner.len(),
+            start_version: inner.version(),
         }
     }
 
@@ -1499,13 +1532,15 @@ impl PyFilterView {
 
     /// Return an iterator over the filtered rows.
     /// Enables: `for row in filter_view:`
-    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyFilterViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyFilterViewIterator> {
         let length = slf.inner.borrow().indices.len();
-        PyFilterViewIterator {
-            view: slf.into_py(py).extract(py).unwrap(),
+        let start_version = slf.table.inner.borrow().version();
+        Ok(PyFilterViewIterator {
+            view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
-        }
+            start_version,
+        })
     }
 }
 
@@ -1625,13 +1660,17 @@ impl PyProjectionView {
 
     /// Return an iterator over the projected rows.
     /// Enables: `for row in projection_view:`
-    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyProjectionViewIterator {
-        let length = slf.table.inner.borrow().len();
-        PyProjectionViewIterator {
-            view: slf.into_py(py).extract(py).unwrap(),
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyProjectionViewIterator> {
+        let inner = slf.table.inner.borrow();
+        let length = inner.len();
+        let start_version = inner.version();
+        drop(inner);
+        Ok(PyProjectionViewIterator {
+            view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
-        }
+            start_version,
+        })
     }
 }
 
@@ -1767,13 +1806,17 @@ impl PyComputedView {
 
     /// Return an iterator over the rows with computed column.
     /// Enables: `for row in computed_view:`
-    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyComputedViewIterator {
-        let length = slf.table.inner.borrow().len();
-        PyComputedViewIterator {
-            view: slf.into_py(py).extract(py).unwrap(),
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyComputedViewIterator> {
+        let inner = slf.table.inner.borrow();
+        let length = inner.len();
+        let start_version = inner.version();
+        drop(inner);
+        Ok(PyComputedViewIterator {
+            view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
-        }
+            start_version,
+        })
     }
 }
 
@@ -1967,13 +2010,13 @@ impl PyJoinView {
 
     /// Return an iterator over the joined rows.
     /// Enables: `for row in join_view:`
-    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyJoinViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyJoinViewIterator> {
         let length = slf.inner.borrow().len();
-        PyJoinViewIterator {
-            view: slf.into_py(py).extract(py).unwrap(),
+        Ok(PyJoinViewIterator {
+            view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
-        }
+        })
     }
 }
 
@@ -2209,13 +2252,13 @@ impl PySortedView {
 
     /// Return an iterator over the sorted rows.
     /// Enables: `for row in sorted_view:`
-    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PySortedViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PySortedViewIterator> {
         let length = slf.inner.borrow().len();
-        PySortedViewIterator {
-            view: slf.into_py(py).extract(py).unwrap(),
+        Ok(PySortedViewIterator {
+            view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
-        }
+        })
     }
 }
 
@@ -2466,13 +2509,13 @@ impl PyAggregateView {
 
     /// Return an iterator over the aggregated groups.
     /// Enables: `for group in aggregate_view:`
-    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyAggregateViewIterator {
+    fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyAggregateViewIterator> {
         let length = slf.inner.borrow().len();
-        PyAggregateViewIterator {
-            view: slf.into_py(py).extract(py).unwrap(),
+        Ok(PyAggregateViewIterator {
+            view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
-        }
+        })
     }
 }
 

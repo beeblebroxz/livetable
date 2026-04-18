@@ -153,6 +153,24 @@ impl Changeset {
         std::mem::take(&mut self.changes)
     }
 
+    /// Truncate the changeset back to the given absolute total length.
+    /// Used by `Table` to roll back pending changes when a bulk mutation
+    /// fails partway through. `target_total_len` must be >= `base_index`.
+    pub fn truncate_to(&mut self, target_total_len: usize) {
+        let current = self.total_len();
+        if target_total_len >= current {
+            return;
+        }
+        debug_assert!(
+            target_total_len >= self.base_index,
+            "cannot truncate below base_index {} (target={})",
+            self.base_index,
+            target_total_len
+        );
+        let keep = target_total_len.saturating_sub(self.base_index);
+        self.changes.truncate(keep);
+    }
+
     /// Compact changes up to (but not including) the given absolute index.
     pub fn compact(&mut self, up_to_index: usize) {
         if up_to_index <= self.base_index {

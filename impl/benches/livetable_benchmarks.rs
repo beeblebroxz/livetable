@@ -179,7 +179,7 @@ fn bench_column_operations(c: &mut Criterion) {
             b.iter(|| {
                 let mut col = Column::new("test".to_string(), ColumnType::Int32, false);
                 for i in 0..size {
-                    col.append(ColumnValue::Int32(i));
+                    col.append(ColumnValue::Int32(i)).unwrap();
                 }
 
                 // Random access
