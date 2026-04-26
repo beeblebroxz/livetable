@@ -306,7 +306,8 @@ cd frontend
 npm install && npm run dev
 ```
 
-The current demo client connects to `ws://localhost:8080/ws` by default.
+The current demo client connects to `ws://<current-host>:8080/ws` by default. Set
+`VITE_LIVETABLE_WS_URL=ws://host:port/ws` when starting Vite to override it.
 
 ## Project Structure
 

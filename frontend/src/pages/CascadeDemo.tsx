@@ -208,11 +208,11 @@ export function CascadeDemo({ onBack }: CascadeDemoProps) {
         <div className="max-w-7xl mx-auto py-4 px-4 flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-3">
-              Real-Time Reactive Views
+              Real-Time Derived Views
               <ConnectionBadge connected={connected} />
             </h1>
             <p className="text-gray-600 text-sm">
-              Watch cascading view updates from live WebSocket stream
+              Live WebSocket rows with browser-computed filters, sorting, and totals
             </p>
           </div>
           <button
@@ -255,21 +255,21 @@ export function CascadeDemo({ onBack }: CascadeDemoProps) {
         {/* Architecture diagram */}
         <div className="bg-white rounded-lg shadow-md p-4 mb-6">
           <div className="flex items-center justify-center gap-2 text-sm text-gray-600 font-mono">
-            <span className="px-3 py-1 bg-blue-100 rounded text-blue-700">WebSocket Stream</span>
+            <span className="px-3 py-1 bg-blue-100 rounded text-blue-700">WebSocket Rows</span>
             <span>&rarr;</span>
             <span className="px-3 py-1 bg-blue-100 rounded text-blue-700">Base Table</span>
             <span>──┬─&gt;</span>
-            <span className="px-3 py-1 bg-green-100 rounded text-green-700">FilterView (&gt;$500)</span>
+            <span className="px-3 py-1 bg-green-100 rounded text-green-700">Filtered Rows (&gt;$500)</span>
           </div>
           <div className="flex items-center justify-center gap-2 text-sm text-gray-600 font-mono mt-1">
             <span className="w-64"></span>
             <span className="ml-6">├─&gt;</span>
-            <span className="px-3 py-1 bg-purple-100 rounded text-purple-700">SortedView (by amount)</span>
+            <span className="px-3 py-1 bg-purple-100 rounded text-purple-700">Sorted Rows (by amount)</span>
           </div>
           <div className="flex items-center justify-center gap-2 text-sm text-gray-600 font-mono mt-1">
             <span className="w-64"></span>
             <span className="ml-6">└─&gt;</span>
-            <span className="px-3 py-1 bg-orange-100 rounded text-orange-700">AggregateView (by region)</span>
+            <span className="px-3 py-1 bg-orange-100 rounded text-orange-700">Regional Totals</span>
           </div>
         </div>
 
@@ -298,7 +298,7 @@ export function CascadeDemo({ onBack }: CascadeDemoProps) {
 
           {/* Filter View */}
           <TableCard
-            title="[2] FilterView"
+            title="[2] Filtered Rows"
             subtitle="amount > $500 only"
             color="green"
             count={filteredView.length}
@@ -315,7 +315,7 @@ export function CascadeDemo({ onBack }: CascadeDemoProps) {
 
           {/* Sorted View */}
           <TableCard
-            title="[3] SortedView"
+            title="[3] Sorted Rows"
             subtitle="Ordered by amount descending"
             color="purple"
             count={sortedView.length}
@@ -334,7 +334,7 @@ export function CascadeDemo({ onBack }: CascadeDemoProps) {
 
           {/* Aggregate View */}
           <TableCard
-            title="[4] AggregateView"
+            title="[4] Regional Totals"
             subtitle="Grouped by region"
             color="orange"
             count={aggregateView.length}

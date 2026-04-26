@@ -13,12 +13,13 @@ Usage:
 
 import asyncio
 import json
+import os
 import random
 import sys
 import websockets
 
 # WebSocket server URL
-WS_URL = "ws://127.0.0.1:8080/ws"
+WS_URL = os.environ.get("LIVETABLE_WS_URL", "ws://127.0.0.1:8080/ws")
 
 # Sample data for generating sales
 REGIONS = ["West", "East", "North", "South", "Central"]

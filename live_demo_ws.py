@@ -14,26 +14,27 @@ Then open http://localhost:5173 in multiple browser tabs to see synchronized upd
 import asyncio
 import websockets
 import json
+import os
 import random
 from datetime import datetime
 
-# Sample data for generating random entries
-NAMES = ["Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Ivy", "Jack"]
-DEPARTMENTS = ["Engineering", "Sales", "Marketing", "HR", "Finance", "Operations", "Support"]
-CITIES = ["New York", "San Francisco", "London", "Tokyo", "Berlin", "Sydney", "Toronto"]
+# WebSocket server URL
+WS_URL = os.environ.get("LIVETABLE_WS_URL", "ws://localhost:8080/ws")
+
+# Sample data for generating sales entries
+REGIONS = ["West", "East", "North", "South", "Central"]
+PRODUCTS = ["Widget", "Gadget", "Premium", "Basic", "Deluxe", "Ultra", "Pro", "Lite"]
 
 def create_random_row():
-    """Generate a random person record."""
+    """Generate a random sale record matching the server demo table."""
     return {
-        "name": random.choice(NAMES),
-        "age": random.randint(22, 65),
-        "department": random.choice(DEPARTMENTS),
-        "salary": random.randint(50000, 150000),
-        "city": random.choice(CITIES),
+        "region": random.choice(REGIONS),
+        "product": random.choice(PRODUCTS),
+        "amount": random.randint(100, 2500),
     }
 
 async def live_demo():
-    uri = "ws://localhost:8080/ws"
+    uri = WS_URL
 
     print("🚀 Starting Live Table Demo")
     print("=" * 60)
@@ -66,7 +67,7 @@ async def live_demo():
         print()
 
         iteration = 0
-        row_count = len(msg.get('rows', []))
+        row_ids = [row["row_id"] for row in msg.get("rows", [])]
 
         try:
             while True:
@@ -88,47 +89,51 @@ async def live_demo():
                         "row": new_row
                     }
                     await websocket.send(json.dumps(message))
-                    row_count += 1
-                    print(f"[{timestamp}] #{iteration:3d} ➕ INSERT: {new_row['name']}, {new_row['age']}, {new_row['department']} (Total: {row_count})")
+                    print(f"[{timestamp}] #{iteration:3d} ➕ INSERT: {new_row['region']}, {new_row['product']}, ${new_row['amount']:,}")
 
-                elif operation == "update" and row_count > 0:
-                    row_idx = random.randint(0, row_count - 1)
-                    column = random.choice(["age", "salary", "department", "city"])
+                elif operation == "update" and row_ids:
+                    row_id = random.choice(row_ids)
+                    column = random.choice(["region", "product", "amount"])
 
-                    if column == "age":
-                        new_value = random.randint(22, 65)
-                    elif column == "salary":
-                        new_value = random.randint(50000, 150000)
-                    elif column == "department":
-                        new_value = random.choice(DEPARTMENTS)
-                    else:  # city
-                        new_value = random.choice(CITIES)
+                    if column == "region":
+                        new_value = random.choice(REGIONS)
+                    elif column == "product":
+                        new_value = random.choice(PRODUCTS)
+                    else:
+                        new_value = random.randint(100, 2500)
 
                     message = {
                         "type": "UpdateCell",
                         "table_name": "demo",
-                        "row_index": row_idx,
+                        "row_id": row_id,
                         "column": column,
                         "value": new_value
                     }
                     await websocket.send(json.dumps(message))
-                    print(f"[{timestamp}] #{iteration:3d} ✏️  UPDATE: Row {row_idx}, {column} = {new_value}")
+                    print(f"[{timestamp}] #{iteration:3d} ✏️  UPDATE: Row ID {row_id}, {column} = {new_value}")
 
-                elif operation == "delete" and row_count > 1:  # Keep at least 1 row
-                    row_idx = random.randint(0, row_count - 1)
+                elif operation == "delete" and len(row_ids) > 1:  # Keep at least 1 row
+                    row_id = random.choice(row_ids)
                     message = {
                         "type": "DeleteRow",
                         "table_name": "demo",
-                        "row_index": row_idx
+                        "row_id": row_id
                     }
                     await websocket.send(json.dumps(message))
-                    row_count -= 1
-                    print(f"[{timestamp}] #{iteration:3d} ❌ DELETE: Row {row_idx} (Total: {row_count})")
+                    print(f"[{timestamp}] #{iteration:3d} ❌ DELETE: Row ID {row_id}")
 
-                # Read server response (non-blocking)
+                # Read and apply this connection's broadcast response.
                 try:
-                    response = await asyncio.wait_for(websocket.recv(), timeout=0.1)
-                    # Just consume the response, don't print it
+                    response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    msg = json.loads(response)
+                    if msg["type"] == "RowInserted":
+                        row_ids.append(msg["row_id"])
+                    elif msg["type"] == "RowDeleted":
+                        row_ids = [existing for existing in row_ids if existing != msg["row_id"]]
+                    elif msg["type"] == "TableData":
+                        row_ids = [row["row_id"] for row in msg.get("rows", [])]
+                    elif msg["type"] == "Error":
+                        print(f"Server error: {msg['message']}")
                 except asyncio.TimeoutError:
                     pass
 
@@ -139,7 +144,7 @@ async def live_demo():
             print()
             print("=" * 60)
             print("👋 Demo stopped by user")
-            print(f"Final estimated row count: {row_count}")
+            print(f"Final estimated row count: {len(row_ids)}")
             print("=" * 60)
 
 if __name__ == "__main__":

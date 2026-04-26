@@ -9,6 +9,21 @@ import type {
 } from '../types';
 
 const isDev = import.meta.env.DEV;
+const configuredWsUrl = import.meta.env.VITE_LIVETABLE_WS_URL;
+
+const getDefaultWebSocketUrl = () => {
+  if (configuredWsUrl) {
+    return configuredWsUrl;
+  }
+
+  if (typeof window === 'undefined') {
+    return 'ws://localhost:8080/ws';
+  }
+
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const hostname = window.location.hostname || 'localhost';
+  return `${protocol}//${hostname}:8080/ws`;
+};
 
 const logDebug = (...args: unknown[]) => {
   if (isDev) {
@@ -151,7 +166,7 @@ const applyServerMessage = (
 
 export function useTableWebSocket(
   tableName: string,
-  wsUrl: string = 'ws://localhost:8080/ws'
+  wsUrl: string = getDefaultWebSocketUrl()
 ) {
   const [data, setData] = useState<TableRecord[]>([]);
   const [columns, setColumns] = useState<string[]>([]);

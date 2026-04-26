@@ -25,7 +25,7 @@ function App() {
             onClick={() => setShowDemo(true)}
             className="px-4 py-2 bg-purple-600 text-white rounded-lg font-medium hover:bg-purple-700 transition flex items-center gap-2"
           >
-            View Reactive Demo
+            View Derived Demo
             <span>&rarr;</span>
           </button>
         </div>

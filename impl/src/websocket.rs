@@ -112,26 +112,38 @@ impl AppState {
     pub fn new() -> Self {
         let mut tables = HashMap::new();
 
-        // Create a demo table
+        // Create a demo sales table used by the frontend editor and cascade demo.
         let schema = Schema::new(vec![
-            ("id".to_string(), ColumnType::Int32, false),
-            ("name".to_string(), ColumnType::String, false),
-            ("value".to_string(), ColumnType::Float64, false),
+            ("region".to_string(), ColumnType::String, false),
+            ("product".to_string(), ColumnType::String, false),
+            ("amount".to_string(), ColumnType::Float64, false),
         ]);
 
         let mut demo_table = Table::new("demo".to_string(), schema);
 
         // Add some initial data
         let mut row1 = HashMap::new();
-        row1.insert("id".to_string(), ColumnValue::Int32(1));
-        row1.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
-        row1.insert("value".to_string(), ColumnValue::Float64(100.5));
+        row1.insert(
+            "region".to_string(),
+            ColumnValue::String("West".to_string()),
+        );
+        row1.insert(
+            "product".to_string(),
+            ColumnValue::String("Widget".to_string()),
+        );
+        row1.insert("amount".to_string(), ColumnValue::Float64(100.5));
         demo_table.append_row(row1).unwrap();
 
         let mut row2 = HashMap::new();
-        row2.insert("id".to_string(), ColumnValue::Int32(2));
-        row2.insert("name".to_string(), ColumnValue::String("Bob".to_string()));
-        row2.insert("value".to_string(), ColumnValue::Float64(200.75));
+        row2.insert(
+            "region".to_string(),
+            ColumnValue::String("East".to_string()),
+        );
+        row2.insert(
+            "product".to_string(),
+            ColumnValue::String("Gadget".to_string()),
+        );
+        row2.insert("amount".to_string(), ColumnValue::Float64(200.75));
         demo_table.append_row(row2).unwrap();
         demo_table.clear_changeset();
 
@@ -768,9 +780,9 @@ mod tests {
             .insert_row(
                 "demo",
                 HashMap::from([
-                    ("id".to_string(), json!(3)),
-                    ("name".to_string(), json!("Charlie")),
-                    ("value".to_string(), json!(300.25)),
+                    ("region".to_string(), json!("North")),
+                    ("product".to_string(), json!("Premium")),
+                    ("amount".to_string(), json!(300.25)),
                 ]),
             )
             .expect("insert should succeed");
@@ -784,7 +796,7 @@ mod tests {
         assert_eq!(inserted_row_id, 3);
 
         let update_response = state
-            .update_cell("demo", 2, "value", &json!(250.5))
+            .update_cell("demo", 2, "amount", &json!(250.5))
             .expect("update should succeed");
         assert!(matches!(
             update_response,
@@ -803,16 +815,16 @@ mod tests {
         assert_eq!(demo.table.changeset().len(), 3);
         assert_eq!(demo.row_ids, vec![2, 3]);
         assert_eq!(
-            demo.table.get_value(0, "name").unwrap(),
-            ColumnValue::String("Bob".to_string())
+            demo.table.get_value(0, "region").unwrap(),
+            ColumnValue::String("East".to_string())
         );
         assert_eq!(
-            demo.table.get_value(0, "value").unwrap(),
+            demo.table.get_value(0, "amount").unwrap(),
             ColumnValue::Float64(250.5)
         );
         assert_eq!(
-            demo.table.get_value(1, "name").unwrap(),
-            ColumnValue::String("Charlie".to_string())
+            demo.table.get_value(1, "product").unwrap(),
+            ColumnValue::String("Premium".to_string())
         );
     }
 
@@ -823,9 +835,9 @@ mod tests {
             .insert_row(
                 "demo",
                 HashMap::from([
-                    ("id".to_string(), json!(3)),
-                    ("name".to_string(), json!("Charlie")),
-                    ("value".to_string(), json!(300.25)),
+                    ("region".to_string(), json!("North")),
+                    ("product".to_string(), json!("Premium")),
+                    ("amount".to_string(), json!(300.25)),
                 ]),
             )
             .unwrap();
@@ -835,11 +847,11 @@ mod tests {
             panic!("expected table data response");
         };
 
-        assert_eq!(columns, vec!["id", "name", "value"]);
+        assert_eq!(columns, vec!["region", "product", "amount"]);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].row_id, 3);
-        assert_eq!(rows[2].row.get("name"), Some(&json!("Charlie")));
-        assert_eq!(rows[2].row.get("value"), Some(&json!(300.25)));
+        assert_eq!(rows[2].row.get("product"), Some(&json!("Premium")));
+        assert_eq!(rows[2].row.get("amount"), Some(&json!(300.25)));
     }
 
     #[test]
@@ -847,7 +859,7 @@ mod tests {
         let state = AppState::new();
 
         let update_err = state
-            .update_cell("demo", 999, "value", &json!(250.5))
+            .update_cell("demo", 999, "amount", &json!(250.5))
             .unwrap_err();
         assert!(update_err.contains("Row '999' not found"));
 
