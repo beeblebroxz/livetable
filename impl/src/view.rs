@@ -442,10 +442,6 @@ pub struct JoinView {
     /// after Table construction in this crate).
     left_column_names: Vec<String>,
     right_column_names: Vec<String>,
-    /// Last synced generation from left table's changeset
-    left_last_synced: u64,
-    /// Last synced generation from right table's changeset
-    right_last_synced: u64,
     /// Number of changes already processed from left table (absolute index)
     left_last_processed_change_count: usize,
     /// Number of changes already processed from right table (absolute index)
@@ -541,8 +537,6 @@ impl JoinView {
             }
         }
 
-        let left_gen = left_table.borrow().changeset_generation();
-        let right_gen = right_table.borrow().changeset_generation();
         let left_change_count = left_table.borrow().changeset().total_len();
         let right_change_count = right_table.borrow().changeset().total_len();
 
@@ -573,8 +567,6 @@ impl JoinView {
             join_index: Vec::new(),
             left_column_names,
             right_column_names,
-            left_last_synced: left_gen,
-            right_last_synced: right_gen,
             left_last_processed_change_count: left_change_count,
             right_last_processed_change_count: right_change_count,
         };
@@ -681,9 +673,7 @@ impl JoinView {
             }
         }
 
-        // Update generation trackers
-        self.left_last_synced = left.changeset_generation();
-        self.right_last_synced = right.changeset_generation();
+        // Update cursor trackers (one per parent)
         self.left_last_processed_change_count = left.changeset().total_len();
         self.right_last_processed_change_count = right.changeset().total_len();
     }
@@ -1315,17 +1305,23 @@ impl JoinView {
                         }
                     }
 
-                    // RIGHT/FULL: if no left match, append as unmatched right row
+                    // RIGHT/FULL: if no left match, insert as unmatched right
+                    // row at the sorted position within the None-left tail.
+                    // (Push-at-end happened to produce sorted output today
+                    // because parent right indices are monotonic, but the
+                    // invariant should be structural, not incidental.)
                     if !any_match
                         && (self.join_type == JoinType::Right || self.join_type == JoinType::Full)
                     {
-                        self.join_index.push((None, Some(*right_idx)));
+                        let pos = self.find_orphan_insert_position(*right_idx);
+                        self.join_index.insert(pos, (None, Some(*right_idx)));
                         modified = true;
                     }
                 } else {
-                    // NULL key on right — for RIGHT/FULL, add as unmatched
+                    // NULL key on right — for RIGHT/FULL, add as unmatched.
                     if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
-                        self.join_index.push((None, Some(*right_idx)));
+                        let pos = self.find_orphan_insert_position(*right_idx);
+                        self.join_index.insert(pos, (None, Some(*right_idx)));
                         modified = true;
                     }
                 }
@@ -1439,8 +1435,6 @@ impl JoinView {
         let right_table = self.right_table.borrow();
         self.left_last_processed_change_count = left_table.changeset().total_len();
         self.right_last_processed_change_count = right_table.changeset().total_len();
-        self.left_last_synced = left_table.changeset_generation();
-        self.right_last_synced = right_table.changeset_generation();
 
         modified
     }
@@ -1918,7 +1912,9 @@ impl IncrementalView for SortedView {
 // AggregateView - Grouped aggregations with incremental updates
 // ============================================================================
 
-include!("view/aggregate_support.rs");
+pub mod aggregate_support;
+pub use aggregate_support::AggregateFunction;
+use aggregate_support::{GroupKey, GroupState};
 
 /// AggregateView groups rows and computes aggregate functions per group.
 /// Supports incremental updates when the parent table changes.
@@ -2779,6 +2775,7 @@ impl TickableTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::aggregate_support::ColumnAggState;
     use crate::column::ColumnType;
     use crate::table::Schema;
 

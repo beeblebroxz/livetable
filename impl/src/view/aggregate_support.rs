@@ -1,3 +1,13 @@
+//! Aggregate-support types — was previously spliced into view.rs via
+//! `include!()`. Promoted to a real submodule so the file participates in
+//! Rust's normal module/privacy boundary. All types and methods used by
+//! `view.rs::AggregateView` are exposed as `pub(super)`; the rest stays
+//! private to this submodule.
+
+use crate::column::ColumnValue;
+use crate::table::Table;
+use std::collections::{HashMap, HashSet};
+
 /// Supported aggregation functions
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggregateFunction {
@@ -12,22 +22,22 @@ pub enum AggregateFunction {
 
 /// Internal state for tracking aggregate statistics for one source column
 #[derive(Debug, Clone)]
-struct ColumnAggState {
+pub(super) struct ColumnAggState {
     /// Running sum for SUM and AVG calculations
-    sum: f64,
+    pub(super) sum: f64,
     /// Count of non-null values
-    count: usize,
+    pub(super) count: usize,
     /// Current minimum value
-    min: Option<f64>,
+    pub(super) min: Option<f64>,
     /// Current maximum value
-    max: Option<f64>,
+    pub(super) max: Option<f64>,
     /// Sorted values for percentile calculations. Only populated when
     /// a Percentile or Median aggregation targets this source column.
-    sorted_values: Option<Vec<f64>>,
+    pub(super) sorted_values: Option<Vec<f64>>,
 }
 
 impl ColumnAggState {
-    fn new(needs_sorted: bool) -> Self {
+    pub(super) fn new(needs_sorted: bool) -> Self {
         ColumnAggState {
             sum: 0.0,
             count: 0,
@@ -38,7 +48,7 @@ impl ColumnAggState {
     }
 
     /// Add a numeric value to the aggregate state
-    fn add_value(&mut self, value: f64) {
+    pub(super) fn add_value(&mut self, value: f64) {
         self.sum += value;
         self.count += 1;
         self.min = Some(self.min.map_or(value, |m| m.min(value)));
@@ -51,7 +61,7 @@ impl ColumnAggState {
 
     /// Remove a numeric value from the aggregate state
     /// Returns false if MIN/MAX needs recalculation (deleted value was min or max)
-    fn remove_value(&mut self, value: f64) -> bool {
+    pub(super) fn remove_value(&mut self, value: f64) -> bool {
         self.sum -= value;
         self.count = self.count.saturating_sub(1);
 
@@ -67,7 +77,7 @@ impl ColumnAggState {
     }
 
     /// Recalculate MIN/MAX from a set of values
-    fn recalculate_min_max(&mut self, values: &[f64]) {
+    pub(super) fn recalculate_min_max(&mut self, values: &[f64]) {
         if values.is_empty() {
             self.min = None;
             self.max = None;
@@ -84,7 +94,7 @@ impl ColumnAggState {
 
     /// Compute percentile using linear interpolation (PERCENTILE_CONT semantics).
     /// p must be in 0.0..=1.0. Returns None if no values.
-    fn percentile(&self, p: f64) -> Option<f64> {
+    pub(super) fn percentile(&self, p: f64) -> Option<f64> {
         let sorted = self.sorted_values.as_ref()?;
         if sorted.is_empty() {
             return None;
@@ -102,7 +112,7 @@ impl ColumnAggState {
         Some(sorted[lo] * (1.0 - frac) + sorted[hi] * frac)
     }
 
-    fn get_result(&self, func: AggregateFunction) -> ColumnValue {
+    pub(super) fn get_result(&self, func: AggregateFunction) -> ColumnValue {
         match func {
             AggregateFunction::Sum => ColumnValue::Float64(self.sum),
             AggregateFunction::Count => ColumnValue::Int64(self.count as i64),
@@ -127,17 +137,17 @@ impl ColumnAggState {
 
 /// Internal state for tracking aggregates per group
 #[derive(Debug, Clone)]
-struct GroupState {
+pub(super) struct GroupState {
     /// Per-source-column aggregate statistics
     column_stats: HashMap<String, ColumnAggState>,
     /// Parent row indices belonging to this group (for MIN/MAX recalc on delete)
-    row_indices: HashSet<usize>,
+    pub(super) row_indices: HashSet<usize>,
     /// Source columns that need sorted_values for percentile calculations
-    percentile_columns: HashSet<String>,
+    pub(super) percentile_columns: HashSet<String>,
 }
 
 impl GroupState {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         GroupState {
             column_stats: HashMap::new(),
             row_indices: HashSet::new(),
@@ -146,7 +156,7 @@ impl GroupState {
     }
 
     /// Add a value for a specific source column
-    fn add_column_value(&mut self, source_col: &str, value: f64) {
+    pub(super) fn add_column_value(&mut self, source_col: &str, value: f64) {
         let needs_sorted = self.percentile_columns.contains(source_col);
         let stats = self
             .column_stats
@@ -157,7 +167,7 @@ impl GroupState {
 
     /// Remove a value for a specific source column
     /// Returns false if MIN/MAX needs recalculation
-    fn remove_column_value(&mut self, source_col: &str, value: f64) -> bool {
+    pub(super) fn remove_column_value(&mut self, source_col: &str, value: f64) -> bool {
         if let Some(stats) = self.column_stats.get_mut(source_col) {
             stats.remove_value(value)
         } else {
@@ -166,7 +176,7 @@ impl GroupState {
     }
 
     /// Get result for a specific aggregation (source column + function)
-    fn get_result(&self, source_col: &str, func: AggregateFunction) -> ColumnValue {
+    pub(super) fn get_result(&self, source_col: &str, func: AggregateFunction) -> ColumnValue {
         if let Some(stats) = self.column_stats.get(source_col) {
             stats.get_result(func)
         } else {
@@ -175,7 +185,7 @@ impl GroupState {
     }
 
     /// Recalculate MIN/MAX for a source column from a set of values
-    fn recalculate_column_min_max(&mut self, source_col: &str, values: &[f64]) {
+    pub(super) fn recalculate_column_min_max(&mut self, source_col: &str, values: &[f64]) {
         if let Some(stats) = self.column_stats.get_mut(source_col) {
             stats.recalculate_min_max(values);
         }
@@ -184,10 +194,10 @@ impl GroupState {
 
 /// A key for grouping rows - vector of column values converted to comparable strings
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GroupKey(Vec<Option<String>>);
+pub(super) struct GroupKey(Vec<Option<String>>);
 
 impl GroupKey {
-    fn from_row(row: &HashMap<String, ColumnValue>, group_by: &[String]) -> Self {
+    pub(super) fn from_row(row: &HashMap<String, ColumnValue>, group_by: &[String]) -> Self {
         let values: Vec<Option<String>> = group_by
             .iter()
             .map(|col| {
@@ -212,7 +222,7 @@ impl GroupKey {
     }
 
     /// Build GroupKey directly from table using column indices (faster than from_row)
-    fn from_indices(table: &Table, row_idx: usize, col_indices: &[usize]) -> Self {
+    pub(super) fn from_indices(table: &Table, row_idx: usize, col_indices: &[usize]) -> Self {
         let values: Vec<Option<String>> = col_indices
             .iter()
             .map(|&col_idx| match table.get_value_by_index(row_idx, col_idx) {
@@ -236,11 +246,11 @@ impl GroupKey {
     }
 
     #[inline]
-    fn from_single_int(value: i32) -> Self {
+    pub(super) fn from_single_int(value: i32) -> Self {
         GroupKey(vec![Some(format!("i{}", value))])
     }
 
-    fn to_column_values(
+    pub(super) fn to_column_values(
         &self,
         group_by: &[String],
         parent: &Table,
