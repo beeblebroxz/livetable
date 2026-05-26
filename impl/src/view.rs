@@ -742,6 +742,17 @@ impl JoinView {
             })
     }
 
+    /// Binary search for the insertion position of a new (None, Some(right_idx))
+    /// orphan entry within the None-left tail. Tail invariant: orphans are
+    /// sorted by right_idx ASC (matching rebuild_index's iteration order).
+    fn find_orphan_insert_position(&self, right_idx: usize) -> usize {
+        self.join_index.partition_point(|(l, r)| match (l, r) {
+            (Some(_), _) => true, // All Some(l) entries precede the None-left tail
+            (None, Some(r_existing)) => *r_existing < right_idx,
+            (None, None) => true, // Defensive; not produced by current code
+        })
+    }
+
     /// Binary search for the insertion position of a new (Some(left_idx), Some(right_idx))
     /// entry. Ordering invariant within same left_idx: matched entries (Some right)
     /// sorted by right_idx ASC, then the unmatched (None right) entry if any.
@@ -918,26 +929,12 @@ impl JoinView {
             return false;
         }
 
-        // For simplicity, if there are any deletes or key updates, do a full rebuild
-        // This is a conservative approach that ensures correctness
-        let left_needs_rebuild = left_changes.iter().any(|c| match c {
-            TableChange::RowDeleted { .. } => true,
-            TableChange::CellUpdated { column, .. } => self.left_keys.contains(column),
-            _ => false,
-        });
-
-        let right_needs_rebuild = right_changes.iter().any(|c| match c {
-            TableChange::RowDeleted { .. } => true,
-            TableChange::CellUpdated { column, .. } => self.right_keys.contains(column),
-            _ => false,
-        });
-
-        let needs_rebuild = left_needs_rebuild || right_needs_rebuild;
-
-        if needs_rebuild {
-            self.rebuild_index();
-            return true;
-        }
+        // All RowInserted, RowDeleted, and key-column CellUpdated changes on
+        // both sides are now handled incrementally below. (Non-key
+        // CellUpdated never required join_index changes — views read live
+        // data via get_row.) The historical rebuild fallback is gone; only
+        // the compaction case above (changes_from returning None) still
+        // requires a full rebuild.
 
         let mut modified = false;
 
@@ -952,7 +949,62 @@ impl JoinView {
         };
 
         for change in &left_changes {
-            if let TableChange::RowInserted { index, data } = change {
+            match change {
+                TableChange::RowDeleted { index: del_idx, .. } => {
+                    // Step 1: capture right indices that were matched by this
+                    // left row — needed for RIGHT/FULL orphan handling below.
+                    let removed_right_indices: Vec<usize> = self
+                        .join_index
+                        .iter()
+                        .filter_map(|(l, r)| {
+                            if *l == Some(*del_idx) {
+                                *r
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // Step 2: remove all join_index entries pointing at the
+                    // deleted left row (matched entries AND LEFT/FULL placeholders).
+                    let before_len = self.join_index.len();
+                    self.join_index.retain(|(l, _)| *l != Some(*del_idx));
+                    if self.join_index.len() != before_len {
+                        modified = true;
+                    }
+
+                    // Step 3: shift remaining left indices > del_idx down by 1.
+                    for (l_opt, _) in self.join_index.iter_mut() {
+                        if let Some(l) = l_opt {
+                            if *l > *del_idx {
+                                *l -= 1;
+                            }
+                        }
+                    }
+
+                    // Step 4: RIGHT/FULL only — any right row that was
+                    // previously matched by the deleted left and is no longer
+                    // matched by ANY remaining left becomes unmatched: insert
+                    // (None, Some(right_idx)) at the sorted position within the
+                    // None-left tail to match rebuild_index's ordering.
+                    if self.join_type == JoinType::Right
+                        || self.join_type == JoinType::Full
+                    {
+                        for r_idx in removed_right_indices {
+                            let still_matched = self
+                                .join_index
+                                .iter()
+                                .any(|(l, r)| l.is_some() && *r == Some(r_idx));
+                            if !still_matched {
+                                let pos = self.find_orphan_insert_position(r_idx);
+                                self.join_index.insert(pos, (None, Some(r_idx)));
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+
+                TableChange::RowInserted { index, data } => {
                 // Tail-insert fast path. join_index is sorted (Some(l) entries
                 // first, ascending by l; None-left entries last). The max
                 // existing left_idx is the last Some(l) before the None-left
@@ -1013,6 +1065,111 @@ impl JoinView {
                         modified = true;
                     }
                 }
+                }
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    ..
+                } if self.left_keys.contains(column) => {
+                    // Key column changed: rematch this left row.
+                    // Reconstruct the pre-update row by swapping in old_value.
+                    let current_row = match self.left_table.borrow().get_row(*row) {
+                        Ok(r) => r,
+                        Err(_) => continue, // unreadable — skip; matches old fallback semantic
+                    };
+                    let mut old_row = current_row.clone();
+                    old_row.insert(column.clone(), old_value.clone());
+
+                    let old_key = Self::build_composite_key(&old_row, &self.left_keys);
+                    let new_key = Self::build_composite_key(&current_row, &self.left_keys);
+
+                    if old_key == new_key {
+                        // The single changed cell didn't move the composite key
+                        // (e.g., a Null↔Null no-op or equivalent typed value).
+                        continue;
+                    }
+
+                    // ---- Remove old matches for this left row ----
+                    let removed_right_indices: Vec<usize> = self
+                        .join_index
+                        .iter()
+                        .filter_map(|(l, r)| {
+                            if *l == Some(*row) {
+                                *r
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    let before_len = self.join_index.len();
+                    self.join_index.retain(|(l, _)| *l != Some(*row));
+                    if self.join_index.len() != before_len {
+                        modified = true;
+                    }
+
+                    // RIGHT/FULL: resurrect any newly orphaned right rows.
+                    if self.join_type == JoinType::Right
+                        || self.join_type == JoinType::Full
+                    {
+                        for r_idx in removed_right_indices {
+                            let still_matched = self
+                                .join_index
+                                .iter()
+                                .any(|(l, r)| l.is_some() && *r == Some(r_idx));
+                            if !still_matched {
+                                let pos = self.find_orphan_insert_position(r_idx);
+                                self.join_index.insert(pos, (None, Some(r_idx)));
+                                modified = true;
+                            }
+                        }
+                    }
+
+                    // ---- Add new matches for the updated row ----
+                    if let Some(new_key_val) = new_key {
+                        let right_lookup = self.build_right_lookup();
+                        if let Some(matching_right) = right_lookup.get(&new_key_val) {
+                            // RIGHT/FULL: any orphan (None, Some(r)) for the
+                            // now-matched right rows must be removed first.
+                            if self.join_type == JoinType::Right
+                                || self.join_type == JoinType::Full
+                            {
+                                for &r_idx in matching_right {
+                                    self.join_index.retain(|(l, r)| {
+                                        !(l.is_none() && *r == Some(r_idx))
+                                    });
+                                }
+                            }
+                            let insert_pos = self.find_left_insert_position(*row);
+                            for (offset, &r_idx) in matching_right.iter().enumerate() {
+                                self.join_index.insert(
+                                    insert_pos + offset,
+                                    (Some(*row), Some(r_idx)),
+                                );
+                                modified = true;
+                            }
+                        } else if self.join_type == JoinType::Left
+                            || self.join_type == JoinType::Full
+                        {
+                            let insert_pos = self.find_left_insert_position(*row);
+                            self.join_index.insert(insert_pos, (Some(*row), None));
+                            modified = true;
+                        }
+                    } else if self.join_type == JoinType::Left
+                        || self.join_type == JoinType::Full
+                    {
+                        // New key is None (NULL or NaN): LEFT/FULL keeps the row
+                        // with a None-right placeholder.
+                        let insert_pos = self.find_left_insert_position(*row);
+                        self.join_index.insert(insert_pos, (Some(*row), None));
+                        modified = true;
+                    }
+                }
+                _ => {
+                    // CellUpdated on a non-key column: no join_index change
+                    // (views read live data on get_row).
+                }
             }
         }
 
@@ -1029,11 +1186,64 @@ impl JoinView {
         };
 
         for change in &right_changes {
-            if let TableChange::RowInserted {
-                index: right_idx,
-                data,
-            } = change
-            {
+            match change {
+                TableChange::RowDeleted { index: del_idx, .. } => {
+                    // Symmetric to the left-delete handler.
+                    // Step 1: capture left indices that were matched by this
+                    // right row — needed for LEFT/FULL orphan handling below.
+                    let removed_left_indices: Vec<usize> = self
+                        .join_index
+                        .iter()
+                        .filter_map(|(l, r)| {
+                            if *r == Some(*del_idx) {
+                                *l
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // Step 2: remove all join_index entries pointing at the
+                    // deleted right row.
+                    let before_len = self.join_index.len();
+                    self.join_index.retain(|(_, r)| *r != Some(*del_idx));
+                    if self.join_index.len() != before_len {
+                        modified = true;
+                    }
+
+                    // Step 3: shift remaining right indices > del_idx down by 1.
+                    for (_, r_opt) in self.join_index.iter_mut() {
+                        if let Some(r) = r_opt {
+                            if *r > *del_idx {
+                                *r -= 1;
+                            }
+                        }
+                    }
+
+                    // Step 4: LEFT/FULL only — any left row that was previously
+                    // matched by the deleted right and is no longer matched by
+                    // ANY remaining right becomes a (Some(left_idx), None)
+                    // placeholder at its sorted position.
+                    if self.join_type == JoinType::Left
+                        || self.join_type == JoinType::Full
+                    {
+                        for l_idx in removed_left_indices {
+                            let still_matched = self
+                                .join_index
+                                .iter()
+                                .any(|(l, r)| *l == Some(l_idx) && r.is_some());
+                            if !still_matched {
+                                let pos = self.find_left_insert_position(l_idx);
+                                self.join_index.insert(pos, (Some(l_idx), None));
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+                TableChange::RowInserted {
+                    index: right_idx,
+                    data,
+                } => {
                 // Adjust existing right indices. Unlike left, right_idx
                 // values are not monotonic in join_index (which is sorted
                 // primarily by left), so we can't shortcut detection in
@@ -1096,6 +1306,109 @@ impl JoinView {
                         self.join_index.push((None, Some(*right_idx)));
                         modified = true;
                     }
+                }
+                }
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    ..
+                } if self.right_keys.contains(column) => {
+                    // Symmetric to the left-key-update handler.
+                    let current_row = match self.right_table.borrow().get_row(*row) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let mut old_row = current_row.clone();
+                    old_row.insert(column.clone(), old_value.clone());
+
+                    let old_key = Self::build_composite_key(&old_row, &self.right_keys);
+                    let new_key = Self::build_composite_key(&current_row, &self.right_keys);
+
+                    if old_key == new_key {
+                        continue;
+                    }
+
+                    // ---- Remove old matches that pointed at this right row ----
+                    let removed_left_indices: Vec<usize> = self
+                        .join_index
+                        .iter()
+                        .filter_map(|(l, r)| {
+                            if *r == Some(*row) {
+                                *l
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    let before_len = self.join_index.len();
+                    self.join_index.retain(|(_, r)| *r != Some(*row));
+                    if self.join_index.len() != before_len {
+                        modified = true;
+                    }
+
+                    // LEFT/FULL: resurrect any newly orphaned left rows.
+                    if self.join_type == JoinType::Left
+                        || self.join_type == JoinType::Full
+                    {
+                        for l_idx in removed_left_indices {
+                            let still_matched = self
+                                .join_index
+                                .iter()
+                                .any(|(l, r)| *l == Some(l_idx) && r.is_some());
+                            if !still_matched {
+                                let pos = self.find_left_insert_position(l_idx);
+                                self.join_index.insert(pos, (Some(l_idx), None));
+                                modified = true;
+                            }
+                        }
+                    }
+
+                    // ---- Add new matches for the updated right row ----
+                    if let Some(new_key_val) = new_key {
+                        let left_lookup = self.build_left_lookup();
+                        if let Some(matching_left) = left_lookup.get(&new_key_val) {
+                            for &l_idx in matching_left {
+                                // LEFT/FULL: a (Some(l_idx), None) placeholder
+                                // for this left is no longer correct (the left
+                                // just gained a match) — replace it in place.
+                                let existing_null = self.join_index.iter().position(
+                                    |(l, r)| *l == Some(l_idx) && r.is_none(),
+                                );
+                                if let Some(pos) = existing_null {
+                                    self.join_index[pos] = (Some(l_idx), Some(*row));
+                                } else {
+                                    let insert_pos =
+                                        self.find_right_insert_position(l_idx, *row);
+                                    self.join_index.insert(
+                                        insert_pos,
+                                        (Some(l_idx), Some(*row)),
+                                    );
+                                }
+                                modified = true;
+                            }
+                        } else if self.join_type == JoinType::Right
+                            || self.join_type == JoinType::Full
+                        {
+                            // No left match: RIGHT/FULL adds an orphan entry.
+                            let pos = self.find_orphan_insert_position(*row);
+                            self.join_index.insert(pos, (None, Some(*row)));
+                            modified = true;
+                        }
+                    } else if self.join_type == JoinType::Right
+                        || self.join_type == JoinType::Full
+                    {
+                        // New key is None (NULL or NaN): RIGHT/FULL keeps the
+                        // row as an unmatched orphan.
+                        let pos = self.find_orphan_insert_position(*row);
+                        self.join_index.insert(pos, (None, Some(*row)));
+                        modified = true;
+                    }
+                }
+                _ => {
+                    // CellUpdated on a non-key column: no join_index change
+                    // (views read live data on get_row).
                 }
             }
         }
@@ -4833,6 +5146,729 @@ mod tests {
         assert_eq!(
             result,
             vec![(Some(1), None), (Some(2), None), (None, Some(3))]
+        );
+    }
+
+    // === Incremental left-delete regression tests (fix #9) ===
+
+    /// INNER join, delete left row with a match. Entry removed; following
+    /// left indices shift down by 1.
+    #[test]
+    fn test_inner_join_incremental_left_delete() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+            l.append_row(left_row(2, "L2")).unwrap();
+            l.append_row(left_row(3, "L3")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+            r.append_row(right_row(2, "R2")).unwrap();
+            r.append_row(right_row(3, "R3")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 3);
+
+        // Delete left row id=2 (parent index 1) — the middle match
+        left.borrow_mut().delete_row(1).unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // After delete: left has id=1, id=3; right unchanged
+        // INNER: id=1 ↔ id=1, id=3 ↔ id=3 (id=2 was shifted down to where id=3 was)
+        assert_eq!(result, vec![(Some(1), Some(1)), (Some(3), Some(3))]);
+    }
+
+    /// LEFT join, delete a left row that had a None-right placeholder.
+    /// Placeholder removed; following left indices shift down.
+    #[test]
+    fn test_left_join_incremental_left_delete_placeholder() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+            l.append_row(left_row(2, "L2")).unwrap(); // no right match
+            l.append_row(left_row(3, "L3")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+            r.append_row(right_row(3, "R3")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Left,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 3); // (1,1), (2,None), (3,3)
+
+        // Delete left row id=2 (parent index 1) — the placeholder
+        left.borrow_mut().delete_row(1).unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // After delete: left has id=1, id=3; right has id=1, id=3
+        // LEFT: id=1 ↔ id=1, id=3 ↔ id=3 (id=3 was parent_idx 2, now 1)
+        assert_eq!(result, vec![(Some(1), Some(1)), (Some(3), Some(3))]);
+    }
+
+    /// LEFT join, delete a left row with one of two matches to the same right
+    /// row. The right row is NOT orphaned because another left still matches.
+    #[test]
+    fn test_right_join_incremental_left_delete_no_orphan_when_other_left_matches() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1a")).unwrap();
+            l.append_row(left_row(1, "L1b")).unwrap(); // both match right id=1
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Right,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 2); // (1, 1), (1, 1) — same right id=1
+
+        // Delete first left row
+        left.borrow_mut().delete_row(0).unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // After delete: left has id=1 (was L1b), right has id=1
+        // RIGHT JOIN: should be (1, 1) — NOT orphaned because the remaining
+        // left row still matches the right.
+        assert_eq!(result, vec![(Some(1), Some(1))]);
+    }
+
+    /// LEFT join, delete a right row that was the only match for a left row.
+    /// The left row should resurrect as (Some(left_idx), None) placeholder
+    /// at its sorted position.
+    #[test]
+    fn test_left_join_incremental_right_delete_resurrects_orphan() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+            l.append_row(left_row(2, "L2")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+            r.append_row(right_row(2, "R2")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Left,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 2); // (1,1), (2,2)
+
+        // Delete right row id=2 (parent index 1) — was the only match for left id=2
+        right.borrow_mut().delete_row(1).unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // Left id=2 must resurrect as (Some(1), None) at its sorted position
+        assert_eq!(result, vec![(Some(1), Some(1)), (Some(2), None)]);
+    }
+
+    // === Incremental left-key-update regression tests (fix #9) ===
+
+    /// INNER join, change a left row's key to one that matches a different
+    /// right row. Old match removed; new match inserted.
+    #[test]
+    fn test_inner_join_incremental_left_key_update_to_new_match() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+            r.append_row(right_row(2, "R2")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 1); // left id=1 ↔ right id=1
+
+        // Change left id from 1 to 2 — should match the OTHER right row
+        left.borrow_mut()
+            .set_value(0, "id", ColumnValue::Int32(2))
+            .unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        assert_eq!(result, vec![(Some(2), Some(2))]);
+    }
+
+    /// LEFT join, change a left key so no right matches. Result becomes
+    /// (Some(left_idx), None) placeholder. RIGHT/FULL would also resurrect
+    /// the previously-matched right row as orphan — covered by next test.
+    #[test]
+    fn test_left_join_incremental_left_key_update_to_no_match() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Left,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 1);
+
+        // Change left id to 99 — no right with id=99
+        left.borrow_mut()
+            .set_value(0, "id", ColumnValue::Int32(99))
+            .unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // LEFT: row appears as (Some(99), None) placeholder
+        assert_eq!(result, vec![(Some(99), None)]);
+    }
+
+    /// FULL join, change a left key. Previous right match becomes orphan;
+    /// new left key matches a different right row.
+    #[test]
+    fn test_full_join_incremental_left_key_update_orphan_and_match() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+            r.append_row(right_row(2, "R2")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+        // Initial: (Some(0), Some(0)) for id=1, (None, Some(1)) for id=2 unmatched
+        assert_eq!(joined.len(), 2);
+
+        // Change left id from 1 to 2
+        left.borrow_mut()
+            .set_value(0, "id", ColumnValue::Int32(2))
+            .unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // Right id=1 (was matched) now orphaned; left now matches right id=2
+        // (which removes the orphan placeholder it had)
+        assert_eq!(result, vec![(Some(2), Some(2)), (None, Some(1))]);
+    }
+
+    // === Incremental right-key-update regression tests (fix #9) ===
+
+    /// INNER join, change a right row's key to match a different left row.
+    /// Old match removed; new match inserted.
+    #[test]
+    fn test_inner_join_incremental_right_key_update_to_new_match() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+            l.append_row(left_row(2, "L2")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 1); // left id=1 ↔ right id=1
+
+        // Change right id from 1 to 2 — should now match left id=2
+        right.borrow_mut()
+            .set_value(0, "id", ColumnValue::Int32(2))
+            .unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        assert_eq!(result, vec![(Some(2), Some(2))]);
+    }
+
+    /// FULL join, change a right key so its previous left match becomes orphan
+    /// (resurrects as Some(l), None placeholder), and the new key matches
+    /// nothing (the right itself appears as a (None, Some) orphan).
+    #[test]
+    fn test_full_join_incremental_right_key_update_creates_two_orphans() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 1); // (1, 1)
+
+        // Change right id from 1 to 99 — no left has id=99
+        right.borrow_mut()
+            .set_value(0, "id", ColumnValue::Int32(99))
+            .unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // FULL: left id=1 resurrects as (Some(1), None); right id=99 becomes (None, Some(99))
+        assert_eq!(result, vec![(Some(1), None), (None, Some(99))]);
+    }
+
+    // === Incremental JoinView edge cases (fix #9 — extended coverage) ===
+
+    /// 1:N delete on RIGHT join: deleting the single left row that matched
+    /// three right rows must orphan all three, preserved in right_idx ASC
+    /// order to match rebuild output.
+    #[test]
+    fn test_right_join_incremental_left_delete_orphans_multiple_rights_ordered() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            l.append_row(left_row(1, "L1")).unwrap();
+        }
+        {
+            let mut r = right.borrow_mut();
+            r.append_row(right_row(1, "R1a")).unwrap();
+            r.append_row(right_row(1, "R1b")).unwrap();
+            r.append_row(right_row(1, "R1c")).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Right,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 3); // left id=1 matches each of 3 right rows
+
+        // Delete left id=1 — all three rights become orphaned
+        left.borrow_mut().delete_row(0).unwrap();
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // Orphans must be ordered by right_idx ASC (matches rebuild order)
+        assert_eq!(
+            result,
+            vec![(None, Some(1)), (None, Some(1)), (None, Some(1))]
+        );
+    }
+
+    /// Bulk delete: delete 3 left rows back-to-back, sync once. Verifies
+    /// cumulative index shifts compose correctly across changeset entries
+    /// processed in a single batch.
+    #[test]
+    fn test_inner_join_incremental_bulk_left_delete_in_one_sync() {
+        let left = make_left_table();
+        let right = make_right_table();
+        {
+            let mut l = left.borrow_mut();
+            for id in 1..=5 {
+                l.append_row(left_row(id, "L")).unwrap();
+            }
+        }
+        {
+            let mut r = right.borrow_mut();
+            for id in 1..=5 {
+                r.append_row(right_row(id, "R")).unwrap();
+            }
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 5);
+
+        // Delete first three left rows in sequence WITHOUT syncing between
+        {
+            let mut l = left.borrow_mut();
+            l.delete_row(0).unwrap(); // id=1 gone, ids 2,3,4,5 now at indices 0..4
+            l.delete_row(0).unwrap(); // id=2 gone, ids 3,4,5 at 0..3
+            l.delete_row(0).unwrap(); // id=3 gone, ids 4,5 at 0..2
+        }
+        assert!(joined.sync());
+
+        let result = collect_join_rows(&joined);
+        // After all deletes: left has id=4, id=5; right unchanged
+        assert_eq!(result, vec![(Some(4), Some(4)), (Some(5), Some(5))]);
+    }
+
+    /// LEFT join, key-update from a NULL key (was a placeholder) to a value
+    /// that matches a right row. The placeholder should be replaced with the
+    /// actual match.
+    #[test]
+    fn test_left_join_incremental_left_key_update_null_to_match() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, true),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("L".to_string(), schema.clone())));
+        let right = Rc::new(RefCell::new(Table::new("R".to_string(), schema)));
+        {
+            // Left starts with NULL id — placeholder in LEFT join
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Null);
+            row.insert("name".to_string(), ColumnValue::String("L_null".to_string()));
+            left.borrow_mut().append_row(row).unwrap();
+        }
+        {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(7));
+            row.insert("name".to_string(), ColumnValue::String("R7".to_string()));
+            right.borrow_mut().append_row(row).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Left,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 1);
+        let initial = joined.get_row(0).unwrap();
+        assert!(initial.get("right_id").unwrap().is_null());
+
+        // Change left id from NULL to 7 — should now match
+        left.borrow_mut()
+            .set_value(0, "id", ColumnValue::Int32(7))
+            .unwrap();
+        assert!(joined.sync());
+
+        let row = joined.get_row(0).unwrap();
+        assert_eq!(row.get("id").unwrap().as_i32(), Some(7));
+        assert_eq!(row.get("right_id").unwrap().as_i32(), Some(7));
+        assert_eq!(row.get("right_name").unwrap().as_string(), Some("R7"));
+    }
+
+    /// LEFT join, key-update from a value (matched) to NULL. The matched
+    /// entry should be replaced with a (Some(left_idx), None) placeholder.
+    #[test]
+    fn test_left_join_incremental_left_key_update_match_to_null() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, true),
+            ("name".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("L".to_string(), schema.clone())));
+        let right = Rc::new(RefCell::new(Table::new("R".to_string(), schema)));
+        {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(5));
+            row.insert("name".to_string(), ColumnValue::String("L5".to_string()));
+            left.borrow_mut().append_row(row).unwrap();
+        }
+        {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(5));
+            row.insert("name".to_string(), ColumnValue::String("R5".to_string()));
+            right.borrow_mut().append_row(row).unwrap();
+        }
+
+        let mut joined = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Left,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 1);
+
+        // Change left id from 5 to NULL — match disappears, placeholder appears
+        left.borrow_mut()
+            .set_value(0, "id", ColumnValue::Null)
+            .unwrap();
+        assert!(joined.sync());
+
+        assert_eq!(joined.len(), 1);
+        let row = joined.get_row(0).unwrap();
+        assert!(row.get("id").unwrap().is_null());
+        assert!(row.get("right_id").unwrap().is_null());
+    }
+
+    /// Multi-column join with a delete on the LEFT side. Exercises the
+    /// composite-key path (Vec<JoinKeyPart> rather than single key).
+    #[test]
+    fn test_inner_join_multi_column_incremental_left_delete() {
+        let schema = Schema::new(vec![
+            ("a".to_string(), ColumnType::Int32, false),
+            ("b".to_string(), ColumnType::String, false),
+            ("payload".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("L".to_string(), schema.clone())));
+        let right = Rc::new(RefCell::new(Table::new("R".to_string(), schema)));
+
+        let mkrow = |a: i32, b: &str, payload: &str| {
+            let mut row = HashMap::new();
+            row.insert("a".to_string(), ColumnValue::Int32(a));
+            row.insert("b".to_string(), ColumnValue::String(b.to_string()));
+            row.insert("payload".to_string(), ColumnValue::String(payload.to_string()));
+            row
+        };
+
+        // Left: (1,"x"), (1,"y"), (2,"x")
+        // Right: (1,"x"), (1,"y")
+        // Expected matches: L0↔R0, L1↔R1 (INNER)
+        left.borrow_mut().append_row(mkrow(1, "x", "L0")).unwrap();
+        left.borrow_mut().append_row(mkrow(1, "y", "L1")).unwrap();
+        left.borrow_mut().append_row(mkrow(2, "x", "L2")).unwrap();
+        right.borrow_mut().append_row(mkrow(1, "x", "R0")).unwrap();
+        right.borrow_mut().append_row(mkrow(1, "y", "R1")).unwrap();
+
+        let mut joined = JoinView::new_multi(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            vec!["a".to_string(), "b".to_string()],
+            vec!["a".to_string(), "b".to_string()],
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 2);
+
+        // Delete left row 0 → only L1↔R1 remains; indices shift
+        left.borrow_mut().delete_row(0).unwrap();
+        assert!(joined.sync());
+
+        assert_eq!(joined.len(), 1);
+        let row = joined.get_row(0).unwrap();
+        assert_eq!(row.get("payload").unwrap().as_string(), Some("L1"));
+        assert_eq!(row.get("right_payload").unwrap().as_string(), Some("R1"));
+    }
+
+    /// Multi-column join with a key-column update. Updating one part of a
+    /// composite key must rebuild the typed JoinKey and match correctly.
+    #[test]
+    fn test_inner_join_multi_column_incremental_key_update() {
+        let schema = Schema::new(vec![
+            ("a".to_string(), ColumnType::Int32, false),
+            ("b".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("L".to_string(), schema.clone())));
+        let right = Rc::new(RefCell::new(Table::new("R".to_string(), schema)));
+
+        let mkrow = |a: i32, b: &str| {
+            let mut row = HashMap::new();
+            row.insert("a".to_string(), ColumnValue::Int32(a));
+            row.insert("b".to_string(), ColumnValue::String(b.to_string()));
+            row
+        };
+
+        left.borrow_mut().append_row(mkrow(1, "x")).unwrap();
+        right.borrow_mut().append_row(mkrow(1, "x")).unwrap();
+        right.borrow_mut().append_row(mkrow(1, "y")).unwrap();
+
+        let mut joined = JoinView::new_multi(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            vec!["a".to_string(), "b".to_string()],
+            vec!["a".to_string(), "b".to_string()],
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 1); // L0 matches R0 (1,x)
+
+        // Update left b from "x" to "y" — should now match R1, not R0
+        left.borrow_mut()
+            .set_value(0, "b", ColumnValue::String("y".to_string()))
+            .unwrap();
+        assert!(joined.sync());
+
+        assert_eq!(joined.len(), 1);
+        let row = joined.get_row(0).unwrap();
+        assert_eq!(row.get("a").unwrap().as_i32(), Some(1));
+        assert_eq!(row.get("b").unwrap().as_string(), Some("y"));
+        assert_eq!(row.get("right_a").unwrap().as_i32(), Some(1));
+        assert_eq!(row.get("right_b").unwrap().as_string(), Some("y"));
+    }
+
+    /// Convergence test: apply a mixed sequence of inserts, deletes, and key
+    /// updates to TWO parallel table pairs; on one pair sync incrementally
+    /// after each change, on the other build a fresh JoinView at the end.
+    /// Both must produce byte-identical result rows.
+    #[test]
+    fn test_full_join_incremental_converges_to_rebuild() {
+        fn build_pair() -> (Rc<RefCell<Table>>, Rc<RefCell<Table>>) {
+            (make_left_table(), make_right_table())
+        }
+
+        let (left_a, right_a) = build_pair();
+        let (left_b, right_b) = build_pair();
+
+        // Seed both pairs identically
+        for &(id, name) in &[(1, "L1"), (2, "L2"), (3, "L3")] {
+            left_a.borrow_mut().append_row(left_row(id, name)).unwrap();
+            left_b.borrow_mut().append_row(left_row(id, name)).unwrap();
+        }
+        for &(id, val) in &[(1, "R1"), (2, "R2a"), (2, "R2b"), (4, "R4")] {
+            right_a.borrow_mut().append_row(right_row(id, val)).unwrap();
+            right_b.borrow_mut().append_row(right_row(id, val)).unwrap();
+        }
+
+        // Build incremental view on pair A; rebuild on pair B at end.
+        let mut joined_a = JoinView::new(
+            "a".to_string(),
+            left_a.clone(),
+            right_a.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // Mixed sequence: insert left, delete right, update left key, insert right,
+        // update right key, delete left, insert at end. Each op is mirrored to
+        // both pairs so the rebuilt JoinView at the end sees the same state.
+
+        left_a.borrow_mut().append_row(left_row(5, "L5")).unwrap();
+        left_b.borrow_mut().append_row(left_row(5, "L5")).unwrap();
+        joined_a.sync();
+
+        right_a.borrow_mut().delete_row(0).unwrap();
+        right_b.borrow_mut().delete_row(0).unwrap();
+        joined_a.sync();
+
+        left_a.borrow_mut().set_value(0, "id", ColumnValue::Int32(99)).unwrap();
+        left_b.borrow_mut().set_value(0, "id", ColumnValue::Int32(99)).unwrap();
+        joined_a.sync();
+
+        right_a.borrow_mut().append_row(right_row(99, "R99")).unwrap();
+        right_b.borrow_mut().append_row(right_row(99, "R99")).unwrap();
+        joined_a.sync();
+
+        right_a.borrow_mut().set_value(0, "id", ColumnValue::Int32(2)).unwrap();
+        right_b.borrow_mut().set_value(0, "id", ColumnValue::Int32(2)).unwrap();
+        joined_a.sync();
+
+        left_a.borrow_mut().delete_row(2).unwrap();
+        left_b.borrow_mut().delete_row(2).unwrap();
+        joined_a.sync();
+
+        left_a.borrow_mut().append_row(left_row(2, "L2_new")).unwrap();
+        left_b.borrow_mut().append_row(left_row(2, "L2_new")).unwrap();
+        joined_a.sync();
+
+        // Fresh rebuild on pair B.
+        let joined_b = JoinView::new(
+            "b".to_string(),
+            left_b.clone(),
+            right_b.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Full,
+        )
+        .unwrap();
+
+        // Compare result rows (same length, same (left_id, right_id) sequence).
+        let a_rows = collect_join_rows(&joined_a);
+        let b_rows = collect_join_rows(&joined_b);
+        assert_eq!(
+            a_rows.len(),
+            b_rows.len(),
+            "incremental row count diverged from rebuild"
+        );
+        assert_eq!(
+            a_rows, b_rows,
+            "incremental result diverged from rebuild after mixed-op sequence"
         );
     }
 
