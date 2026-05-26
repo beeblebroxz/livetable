@@ -18,7 +18,7 @@ pub use sequence::{ArraySequence, Sequence, TieredVectorSequence};
 pub use table::{Schema, StorageHint, Table};
 pub use view::{
     AggregateFunction, AggregateView, ComputedView, FilterView, JoinType, JoinView, ProjectionView,
-    SortKey, SortOrder, SortedView,
+    SortKey, SortOrder, SortedView, TickableTable,
 };
 
 // Python bindings - only when python feature is enabled

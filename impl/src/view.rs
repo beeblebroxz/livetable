@@ -1176,6 +1176,18 @@ impl JoinView {
         // Handle right table inserts — build LEFT lookup once, not per right insert.
         // Mirrors the existing right_lookup pattern used for left-insert handling.
         // Was O(left.len()) per right insert via linear scan; now O(matches) via hash lookup.
+        //
+        // De-duplication: lefts that were also inserted in this same sync batch
+        // already had their match against any new right added by the left-insert
+        // pass above. The right-insert pass must NOT re-add the same pair, so
+        // collect the new-left index set and skip those during matching below.
+        let new_left_indices: std::collections::HashSet<usize> = left_changes
+            .iter()
+            .filter_map(|c| match c {
+                TableChange::RowInserted { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
         let has_right_inserts = right_changes
             .iter()
             .any(|c| matches!(c, TableChange::RowInserted { .. }));
@@ -1260,11 +1272,21 @@ impl JoinView {
                 // Find left rows that match this new right row via the precomputed lookup
                 if let Some(right_key) = Self::build_composite_key(data, &self.right_keys) {
                     let lookup = left_lookup.as_ref().unwrap();
-                    let matching_left = lookup.get(&right_key);
-                    let any_match = matching_left.is_some_and(|v| !v.is_empty());
+                    // Filter out lefts that were inserted in this same sync —
+                    // their match was already added by the left-insert pass.
+                    let candidate_lefts: Vec<usize> = lookup
+                        .get(&right_key)
+                        .map(|v| {
+                            v.iter()
+                                .copied()
+                                .filter(|l| !new_left_indices.contains(l))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let any_match = !candidate_lefts.is_empty();
 
-                    if let Some(left_indices) = matching_left {
-                        for &left_idx in left_indices {
+                    if !candidate_lefts.is_empty() {
+                        for left_idx in candidate_lefts.iter().copied() {
                             // For LEFT/FULL: may need to replace a (Some(left_idx), None)
                             // placeholder rather than insert a new entry.
                             if self.join_type == JoinType::Left
@@ -2574,6 +2596,183 @@ impl AggregateView {
         let mut row = parent.get_row(row_idx)?;
         row.insert(changed_col.to_string(), old_value.clone());
         Ok(row)
+    }
+}
+
+// =============================================================================
+// Rust-side tick() registry (fix #10)
+//
+// PyTable already exposes `tick()` for Python users by maintaining a private
+// registry of view inner-states keyed by view type. Native Rust callers had
+// to invoke `view.sync()` manually for each view they created.
+//
+// `TickableTable` (below) closes that gap WITHOUT adding state to `Table`
+// itself — `Table` stays `Send` so the WebSocket server feature still works
+// (it shares tables across threads via `Arc<Mutex<...>>`). Users who want
+// auto-propagation construct a `TickableTable` wrapping their `Rc<RefCell<Table>>`.
+//
+// Layout:
+//   - `Table` (in table.rs): pure data + mutation API. Send + Sync-friendly.
+//   - `TickableTable` (here): owns a strong handle to the table AND a
+//     registry of view "syncer" closures. NOT Send (holds `Rc` + `RefCell`),
+//     so single-threaded use only. Mirrors what `PyTable` does internally.
+//
+// Why a wrapper rather than methods on `Rc<RefCell<Table>>`?
+//   - The registry has to live somewhere persistent. Storing on `Table`
+//     would force `Rc<RefCell<...>>` into `Table` and break Send.
+//   - The wrapper lets `Table` stay primitive; users who don't need tick
+//     don't pay any cost.
+// =============================================================================
+
+/// Per-view "syncer" closure stored in the registry.
+///
+/// When invoked: upgrades the captured `Weak<RefCell<View>>`, calls
+/// `view.sync()`, and returns the cursor (absolute change index) the view
+/// has now consumed from the parent table's changeset. Returns `None` if
+/// the view has been dropped, letting `TickableTable::tick` prune dead
+/// entries in one pass.
+type SyncerFn = Box<dyn FnMut() -> Option<usize>>;
+
+/// Wrapper that pairs a table with a view registry for auto-tick propagation.
+///
+/// Construct with [`TickableTable::new`] from an existing
+/// `Rc<RefCell<Table>>`. Register views via `register_filter`,
+/// `register_sorted`, `register_aggregate`, `register_join_as_left`, or
+/// `register_join_as_right`. Call [`tick`](TickableTable::tick) after
+/// mutations to sync all registered views and compact the changeset.
+///
+/// Views are held as `Weak` references — dropping the strong `Rc` to a
+/// view de-registers it automatically (entry pruned on next `tick()`).
+pub struct TickableTable {
+    table: Rc<RefCell<Table>>,
+    syncers: RefCell<Vec<SyncerFn>>,
+}
+
+impl TickableTable {
+    /// Wrap an existing table for tick-based view propagation.
+    pub fn new(table: Rc<RefCell<Table>>) -> Self {
+        TickableTable {
+            table,
+            syncers: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Borrow the underlying table handle — useful for mutations or for
+    /// constructing views (which take `Rc<RefCell<Table>>` as parent).
+    pub fn table(&self) -> &Rc<RefCell<Table>> {
+        &self.table
+    }
+
+    /// Register a `FilterView` for auto-sync on `tick()`.
+    pub fn register_filter(&self, view: &Rc<RefCell<FilterView>>) {
+        let weak = Rc::downgrade(view);
+        self.syncers.borrow_mut().push(Box::new(move || {
+            let v = weak.upgrade()?;
+            v.borrow_mut().sync();
+            let cursor = v.borrow().last_processed_change_count();
+            Some(cursor)
+        }));
+    }
+
+    /// Register a `SortedView` for auto-sync on `tick()`.
+    pub fn register_sorted(&self, view: &Rc<RefCell<SortedView>>) {
+        let weak = Rc::downgrade(view);
+        self.syncers.borrow_mut().push(Box::new(move || {
+            let v = weak.upgrade()?;
+            v.borrow_mut().sync();
+            let cursor = v.borrow().last_processed_change_count();
+            Some(cursor)
+        }));
+    }
+
+    /// Register an `AggregateView` for auto-sync on `tick()`.
+    pub fn register_aggregate(&self, view: &Rc<RefCell<AggregateView>>) {
+        let weak = Rc::downgrade(view);
+        self.syncers.borrow_mut().push(Box::new(move || {
+            let v = weak.upgrade()?;
+            v.borrow_mut().sync();
+            let cursor = v.borrow().last_processed_change_count();
+            Some(cursor)
+        }));
+    }
+
+    /// Register a `JoinView` on its LEFT parent table. Both this AND
+    /// `register_join_as_right` on the right parent's TickableTable must
+    /// be called for the join to be fully wired up.
+    pub fn register_join_as_left(&self, view: &Rc<RefCell<JoinView>>) {
+        let weak = Rc::downgrade(view);
+        self.syncers.borrow_mut().push(Box::new(move || {
+            let v = weak.upgrade()?;
+            v.borrow_mut().sync();
+            let (left_cursor, _) = v.borrow().last_processed_change_count();
+            let cursor = left_cursor;
+            Some(cursor)
+        }));
+    }
+
+    /// Register a `JoinView` on its RIGHT parent table. See `register_join_as_left`.
+    pub fn register_join_as_right(&self, view: &Rc<RefCell<JoinView>>) {
+        let weak = Rc::downgrade(view);
+        self.syncers.borrow_mut().push(Box::new(move || {
+            let v = weak.upgrade()?;
+            v.borrow_mut().sync();
+            let (_, right_cursor) = v.borrow().last_processed_change_count();
+            let cursor = right_cursor;
+            Some(cursor)
+        }));
+    }
+
+    /// Returns the number of registered syncers. Dead `Weak` references
+    /// are only pruned by `tick()`, so this can include entries whose
+    /// underlying views have been dropped.
+    pub fn registered_view_count(&self) -> usize {
+        self.syncers.borrow().len()
+    }
+
+    /// Synchronize all registered views with the table's pending changes.
+    ///
+    /// For each live view: invokes its sync closure (which calls
+    /// `view.sync()` internally and reports the view's post-sync cursor).
+    /// Dead `Weak` references (views that have been dropped) are pruned
+    /// in the same pass. After all syncs, compacts the changeset up to
+    /// `min(all reported cursors)` so memory doesn't grow unbounded.
+    ///
+    /// Returns the number of live views synced.
+    pub fn tick(&self) -> usize {
+        if !self.table.borrow().has_pending_changes() {
+            return 0;
+        }
+
+        // Move syncers OUT so calling them does not hold a borrow of
+        // `self.syncers`. The closure bodies call `view.borrow_mut().sync()`,
+        // which in turn does `self.parent.borrow()` on the view — and
+        // `self.parent` is the SAME `Rc<RefCell<Table>>` as `self.table`,
+        // so the only borrow held during the loop is whatever the view's
+        // sync acquires internally (immutable).
+        let mut syncers: Vec<SyncerFn> = std::mem::take(&mut *self.syncers.borrow_mut());
+        let mut min_cursor = self.table.borrow().changeset().total_len();
+        let mut synced = 0usize;
+        let mut alive: Vec<SyncerFn> = Vec::with_capacity(syncers.len());
+
+        for mut syncer in syncers.drain(..) {
+            match syncer() {
+                Some(cursor) => {
+                    min_cursor = min_cursor.min(cursor);
+                    alive.push(syncer);
+                    synced += 1;
+                }
+                None => {
+                    // Weak upgrade failed — view dropped; do not re-add.
+                }
+            }
+        }
+
+        *self.syncers.borrow_mut() = alive;
+        // Compaction in its own borrow_mut scope, AFTER the sync pass —
+        // syncs only need shared borrows of the parent table.
+        self.table.borrow_mut().compact_changeset(min_cursor);
+
+        synced
     }
 }
 
@@ -5498,6 +5697,118 @@ mod tests {
         let result = collect_join_rows(&joined);
         // FULL: left id=1 resurrects as (Some(1), None); right id=99 becomes (None, Some(99))
         assert_eq!(result, vec![(Some(1), None), (None, Some(99))]);
+    }
+
+    // === Rust-side tick() registry tests (fix #10) ===
+
+    /// Native Rust callers can register a FilterView with a TickableTable
+    /// wrapper and have tick() auto-sync it after mutations — no manual
+    /// sync() calls needed. Mirrors what PyTable already does for Python users.
+    #[test]
+    fn test_table_tick_propagates_to_filter_view() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("v".to_string(), ColumnType::Int32, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new("t".to_string(), schema)));
+        let tickable = TickableTable::new(table.clone());
+
+        // Seed 2 rows
+        for &(id, v) in &[(1, 10), (2, 20)] {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(id));
+            row.insert("v".to_string(), ColumnValue::Int32(v));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+
+        let view = Rc::new(RefCell::new(FilterView::new(
+            "f".to_string(),
+            table.clone(),
+            |row| row.get("v").and_then(|v| v.as_i32()).unwrap_or(0) >= 15,
+        )));
+        tickable.register_filter(&view);
+
+        assert_eq!(view.borrow().len(), 1);
+
+        // Append a matching row WITHOUT calling sync() manually.
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), ColumnValue::Int32(3));
+        row.insert("v".to_string(), ColumnValue::Int32(30));
+        table.borrow_mut().append_row(row).unwrap();
+
+        let synced = tickable.tick();
+        assert!(synced >= 1, "tick should have synced at least one view");
+        assert_eq!(view.borrow().len(), 2);
+    }
+
+    /// Registry must drop dead Weak references so dropped views don't leak.
+    #[test]
+    fn test_table_tick_prunes_dropped_views() {
+        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
+        let table = Rc::new(RefCell::new(Table::new("t".to_string(), schema)));
+        let tickable = TickableTable::new(table.clone());
+
+        {
+            let view = Rc::new(RefCell::new(FilterView::new(
+                "f".to_string(),
+                table.clone(),
+                |_| true,
+            )));
+            tickable.register_filter(&view);
+            assert_eq!(tickable.registered_view_count(), 1);
+            // view drops at end of block
+        }
+
+        // Mutate so tick has something to do
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), ColumnValue::Int32(1));
+        table.borrow_mut().append_row(row).unwrap();
+
+        // tick() should prune the dead Weak and return 0 syncs
+        assert_eq!(tickable.tick(), 0);
+        assert_eq!(tickable.registered_view_count(), 0);
+    }
+
+    /// JoinView must be registerable on BOTH parent TickableTables; tick on
+    /// either parent must propagate to the join. Mirrors the JoinLeft/
+    /// JoinRight variants on PyTable.
+    #[test]
+    fn test_table_tick_propagates_to_join_view_from_both_parents() {
+        let left = make_left_table();
+        let right = make_right_table();
+        let left_tickable = TickableTable::new(left.clone());
+        let right_tickable = TickableTable::new(right.clone());
+
+        // Seed initial match: left id=1 ↔ right id=1
+        left.borrow_mut().append_row(left_row(1, "L1")).unwrap();
+        right.borrow_mut().append_row(right_row(1, "R1")).unwrap();
+
+        let join = Rc::new(RefCell::new(
+            JoinView::new(
+                "j".to_string(),
+                left.clone(),
+                right.clone(),
+                "id".to_string(),
+                "id".to_string(),
+                JoinType::Inner,
+            )
+            .unwrap(),
+        ));
+        left_tickable.register_join_as_left(&join);
+        right_tickable.register_join_as_right(&join);
+
+        assert_eq!(join.borrow().len(), 1);
+
+        // Append on BOTH sides; the convergence test mirrors what fix #9's
+        // de-dup ensures: a single tick must add (1, 1) match exactly once.
+        left.borrow_mut().append_row(left_row(2, "L2")).unwrap();
+        right.borrow_mut().append_row(right_row(2, "R2")).unwrap();
+        assert!(left_tickable.tick() >= 1);
+        // Right tick may be a no-op (changes already consumed via left tick)
+        // or sync 1 (if right's changeset still has the pending insert) —
+        // both are fine. The size invariant is what matters.
+        right_tickable.tick();
+        assert_eq!(join.borrow().len(), 2);
     }
 
     // === Incremental JoinView edge cases (fix #9 — extended coverage) ===
