@@ -5769,6 +5769,214 @@ mod tests {
         assert_eq!(tickable.registered_view_count(), 0);
     }
 
+    /// SortedView via TickableTable: register, mutate parent, tick — sorted
+    /// position of the new row must reflect in the view without any manual
+    /// sync() call.
+    #[test]
+    fn test_table_tick_propagates_to_sorted_view() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("score".to_string(), ColumnType::Int32, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new("t".to_string(), schema)));
+        let tickable = TickableTable::new(table.clone());
+
+        for &(id, score) in &[(1, 50), (2, 30), (3, 70)] {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(id));
+            row.insert("score".to_string(), ColumnValue::Int32(score));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+
+        let view = Rc::new(RefCell::new(
+            SortedView::new(
+                "s".to_string(),
+                table.clone(),
+                vec![SortKey::descending("score")],
+            )
+            .unwrap(),
+        ));
+        tickable.register_sorted(&view);
+
+        assert_eq!(view.borrow().len(), 3);
+        // Initial DESC order by score: 70, 50, 30
+        assert_eq!(view.borrow().get_value(0, "score").unwrap().as_i32(), Some(70));
+
+        // Append a row that should sort to the very top
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), ColumnValue::Int32(4));
+        row.insert("score".to_string(), ColumnValue::Int32(100));
+        table.borrow_mut().append_row(row).unwrap();
+
+        let synced = tickable.tick();
+        assert!(synced >= 1);
+        assert_eq!(view.borrow().len(), 4);
+        // New row (score=100) must be at view index 0 after auto-sync.
+        assert_eq!(view.borrow().get_value(0, "score").unwrap().as_i32(), Some(100));
+    }
+
+    /// AggregateView via TickableTable: register, mutate parent, tick —
+    /// aggregate state must reflect the new row.
+    #[test]
+    fn test_table_tick_propagates_to_aggregate_view() {
+        let schema = Schema::new(vec![
+            ("region".to_string(), ColumnType::String, false),
+            ("amount".to_string(), ColumnType::Float64, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new("sales".to_string(), schema)));
+        let tickable = TickableTable::new(table.clone());
+
+        for &(region, amount) in &[("North", 100.0_f64), ("South", 200.0), ("North", 150.0)] {
+            let mut row = HashMap::new();
+            row.insert("region".to_string(), ColumnValue::String(region.to_string()));
+            row.insert("amount".to_string(), ColumnValue::Float64(amount));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+
+        let view = Rc::new(RefCell::new(
+            AggregateView::new(
+                "by_region".to_string(),
+                table.clone(),
+                vec!["region".to_string()],
+                vec![(
+                    "total".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Sum,
+                )],
+            )
+            .unwrap(),
+        ));
+        tickable.register_aggregate(&view);
+
+        assert_eq!(view.borrow().len(), 2); // 2 groups: North, South
+
+        // Append a row in a NEW region — should add a third group on next tick.
+        let mut row = HashMap::new();
+        row.insert("region".to_string(), ColumnValue::String("West".to_string()));
+        row.insert("amount".to_string(), ColumnValue::Float64(99.0));
+        table.borrow_mut().append_row(row).unwrap();
+
+        let synced = tickable.tick();
+        assert!(synced >= 1);
+        assert_eq!(view.borrow().len(), 3); // 3 groups now: North, South, West
+    }
+
+    /// Heterogeneous registry: a Filter, a Sorted, AND an Aggregate on the
+    /// SAME table — one tick() syncs all three. Verifies the
+    /// `Box<dyn FnMut>`-based registry isn't accidentally specialized to
+    /// one view type.
+    #[test]
+    fn test_table_tick_with_mixed_view_types() {
+        let schema = Schema::new(vec![
+            ("region".to_string(), ColumnType::String, false),
+            ("score".to_string(), ColumnType::Int32, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new("t".to_string(), schema)));
+        let tickable = TickableTable::new(table.clone());
+
+        for &(region, score) in &[("A", 10), ("B", 50), ("A", 30)] {
+            let mut row = HashMap::new();
+            row.insert("region".to_string(), ColumnValue::String(region.to_string()));
+            row.insert("score".to_string(), ColumnValue::Int32(score));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+
+        let filter = Rc::new(RefCell::new(FilterView::new(
+            "f".to_string(),
+            table.clone(),
+            |row| row.get("score").and_then(|v| v.as_i32()).unwrap_or(0) >= 20,
+        )));
+        let sorted = Rc::new(RefCell::new(
+            SortedView::new(
+                "s".to_string(),
+                table.clone(),
+                vec![SortKey::descending("score")],
+            )
+            .unwrap(),
+        ));
+        let aggregate = Rc::new(RefCell::new(
+            AggregateView::new(
+                "a".to_string(),
+                table.clone(),
+                vec!["region".to_string()],
+                vec![(
+                    "total".to_string(),
+                    "score".to_string(),
+                    AggregateFunction::Sum,
+                )],
+            )
+            .unwrap(),
+        ));
+
+        tickable.register_filter(&filter);
+        tickable.register_sorted(&sorted);
+        tickable.register_aggregate(&aggregate);
+
+        assert_eq!(tickable.registered_view_count(), 3);
+        assert_eq!(filter.borrow().len(), 2); // scores >= 20: {50, 30}
+        assert_eq!(sorted.borrow().len(), 3);
+        assert_eq!(aggregate.borrow().len(), 2); // groups A, B
+
+        // Single mutation that affects all three views distinctly:
+        // - filter: new row (score=80) matches → len 2 → 3
+        // - sorted: new row joins → len 3 → 4, sorted to top (score=80 highest)
+        // - aggregate: still 2 regions (B), but B's sum changes
+        let mut row = HashMap::new();
+        row.insert("region".to_string(), ColumnValue::String("B".to_string()));
+        row.insert("score".to_string(), ColumnValue::Int32(80));
+        table.borrow_mut().append_row(row).unwrap();
+
+        let synced = tickable.tick();
+        assert_eq!(synced, 3, "all 3 registered views should sync in one tick");
+
+        assert_eq!(filter.borrow().len(), 3);
+        assert_eq!(sorted.borrow().len(), 4);
+        assert_eq!(
+            sorted.borrow().get_value(0, "score").unwrap().as_i32(),
+            Some(80)
+        );
+        assert_eq!(aggregate.borrow().len(), 2);
+    }
+
+    /// tick() must call compact_changeset(min_cursor) so memory does not
+    /// grow unbounded across long-running streams. Verify by reading the
+    /// changeset's base_index and pending length directly.
+    #[test]
+    fn test_table_tick_compacts_changeset() {
+        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
+        let table = Rc::new(RefCell::new(Table::new("t".to_string(), schema)));
+        let tickable = TickableTable::new(table.clone());
+
+        // Register a view so tick has something to advance the cursor for.
+        let view = Rc::new(RefCell::new(FilterView::new(
+            "f".to_string(),
+            table.clone(),
+            |_| true,
+        )));
+        tickable.register_filter(&view);
+
+        for i in 0..5 {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(i));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+
+        // Before tick: 5 pending changes, base_index=0 (none compacted yet).
+        assert_eq!(table.borrow().changeset().len(), 5);
+        assert_eq!(table.borrow().changeset().base_index(), 0);
+        assert_eq!(table.borrow().changeset().total_len(), 5);
+
+        let synced = tickable.tick();
+        assert!(synced >= 1);
+
+        // After tick: changes all processed; compaction must have advanced
+        // base_index to 5, leaving the pending vec empty. total_len is
+        // still 5 (it's monotonic across compactions).
+        assert_eq!(table.borrow().changeset().len(), 0);
+        assert_eq!(table.borrow().changeset().base_index(), 5);
+        assert_eq!(table.borrow().changeset().total_len(), 5);
+    }
+
     /// JoinView must be registerable on BOTH parent TickableTables; tick on
     /// either parent must propagate to the join. Mirrors the JoinLeft/
     /// JoinRight variants on PyTable.
