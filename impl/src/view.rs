@@ -1,4 +1,7 @@
-use crate::changeset::{IncrementalView, IndexAdjuster, TableChange};
+use crate::changeset::{
+    apply_filter_cell_updated, apply_filter_row_deleted, apply_filter_row_inserted,
+    IncrementalView, TableChange,
+};
 /// LiveTable View Implementation
 ///
 /// Views are read-only derived tables that automatically propagate changes from parent tables.
@@ -12,6 +15,65 @@ use std::rc::Rc;
 
 type RowPredicate = dyn Fn(&HashMap<String, ColumnValue>) -> bool;
 type ComputeFunction = dyn Fn(&HashMap<String, ColumnValue>) -> ColumnValue;
+
+/// Typed, hashable composite-key component for joins.
+///
+/// Replaces the previous String-based serialization (which used `format!("{:?}", v)`
+/// for non-Int/String variants — not a stable format — and `\x00` separators,
+/// which collided when string data contained `\x00`).
+///
+/// Float variants store IEEE 754 bit patterns so `Eq`/`Hash` derive cleanly.
+/// Per SQL semantics, NaN never equals anything: builders return `None` for any
+/// NaN-bearing row, which excludes it from joins.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JoinKeyPart {
+    Int32(i32),
+    Int64(i64),
+    Float32Bits(u32),
+    Float64Bits(u64),
+    String(String),
+    Bool(bool),
+    Date(i32),
+    DateTime(i64),
+}
+
+type JoinKey = Vec<JoinKeyPart>;
+
+/// Convert a single ColumnValue into a JoinKeyPart. Returns None if the value
+/// cannot participate in equality-based joins (NULL or NaN floats).
+fn column_value_to_join_key_part(value: &ColumnValue) -> Option<JoinKeyPart> {
+    match value {
+        ColumnValue::Null => None,
+        ColumnValue::Int32(v) => Some(JoinKeyPart::Int32(*v)),
+        ColumnValue::Int64(v) => Some(JoinKeyPart::Int64(*v)),
+        ColumnValue::Float32(v) if v.is_nan() => None,
+        ColumnValue::Float32(v) => Some(JoinKeyPart::Float32Bits(v.to_bits())),
+        ColumnValue::Float64(v) if v.is_nan() => None,
+        ColumnValue::Float64(v) => Some(JoinKeyPart::Float64Bits(v.to_bits())),
+        ColumnValue::String(s) => Some(JoinKeyPart::String(s.clone())),
+        ColumnValue::Bool(b) => Some(JoinKeyPart::Bool(*b)),
+        ColumnValue::Date(d) => Some(JoinKeyPart::Date(*d)),
+        ColumnValue::DateTime(dt) => Some(JoinKeyPart::DateTime(*dt)),
+    }
+}
+
+/// Same as `column_value_to_join_key_part` but consumes an owned value
+/// (saves a String clone on the string fast path).
+fn column_value_into_join_key_part(value: ColumnValue) -> Option<JoinKeyPart> {
+    match value {
+        ColumnValue::Null => None,
+        ColumnValue::Int32(v) => Some(JoinKeyPart::Int32(v)),
+        ColumnValue::Int64(v) => Some(JoinKeyPart::Int64(v)),
+        ColumnValue::Float32(v) if v.is_nan() => None,
+        ColumnValue::Float32(v) => Some(JoinKeyPart::Float32Bits(v.to_bits())),
+        ColumnValue::Float64(v) if v.is_nan() => None,
+        ColumnValue::Float64(v) => Some(JoinKeyPart::Float64Bits(v.to_bits())),
+        ColumnValue::String(s) => Some(JoinKeyPart::String(s)),
+        ColumnValue::Bool(b) => Some(JoinKeyPart::Bool(b)),
+        ColumnValue::Date(d) => Some(JoinKeyPart::Date(d)),
+        ColumnValue::DateTime(dt) => Some(JoinKeyPart::DateTime(dt)),
+    }
+}
 
 /// A FilterView filters rows from the parent table based on a predicate.
 /// Maintains a mapping from view indices to parent indices.
@@ -140,69 +202,27 @@ impl IncrementalView for FilterView {
         for change in changes {
             match change {
                 TableChange::RowInserted { index, data } => {
-                    // First, adjust all existing parent indices >= insert index
-                    IndexAdjuster::adjust_mapping_for_insert(&mut self.view_to_parent, *index);
-
-                    // Check if the new row matches the predicate
-                    if (self.predicate)(data) {
-                        // Find where to insert in view_to_parent to maintain sorted order
-                        let insert_pos = self
-                            .view_to_parent
-                            .iter()
-                            .position(|&parent_idx| parent_idx > *index)
-                            .unwrap_or(self.view_to_parent.len());
-                        self.view_to_parent.insert(insert_pos, *index);
+                    let matched = (self.predicate)(data);
+                    if apply_filter_row_inserted(&mut self.view_to_parent, *index, matched) {
                         modified = true;
                     }
                 }
 
                 TableChange::RowDeleted { index, .. } => {
-                    // Find indices that need to be removed and adjust others
-                    let to_remove =
-                        IndexAdjuster::adjust_mapping_for_delete(&mut self.view_to_parent, *index);
-
-                    // Remove from back to front to maintain valid indices
-                    for view_idx in to_remove.into_iter().rev() {
-                        self.view_to_parent.remove(view_idx);
+                    if apply_filter_row_deleted(&mut self.view_to_parent, *index) {
                         modified = true;
                     }
                 }
 
                 TableChange::CellUpdated { row, .. } => {
-                    // Check if this row is currently in our view
-                    let currently_in_view = self.view_to_parent.contains(row);
-
-                    // Re-evaluate the predicate for this row
                     let now_matches = self
                         .parent
                         .borrow()
                         .get_row(*row)
                         .map(|data| (self.predicate)(&data))
                         .unwrap_or(false);
-
-                    match (currently_in_view, now_matches) {
-                        (false, true) => {
-                            // Row now matches - add it
-                            let insert_pos = self
-                                .view_to_parent
-                                .iter()
-                                .position(|&parent_idx| parent_idx > *row)
-                                .unwrap_or(self.view_to_parent.len());
-                            self.view_to_parent.insert(insert_pos, *row);
-                            modified = true;
-                        }
-                        (true, false) => {
-                            // Row no longer matches - remove it
-                            if let Some(pos) =
-                                self.view_to_parent.iter().position(|&idx| idx == *row)
-                            {
-                                self.view_to_parent.remove(pos);
-                                modified = true;
-                            }
-                        }
-                        _ => {
-                            // No change in membership (still matches or still doesn't)
-                        }
+                    if apply_filter_cell_updated(&mut self.view_to_parent, *row, now_matches) {
+                        modified = true;
                     }
                 }
             }
@@ -417,6 +437,11 @@ pub struct JoinView {
     /// - RIGHT: (Some(left), Some(right)) or (None, Some(right))
     /// - FULL: all three patterns
     join_index: Vec<(Option<usize>, Option<usize>)>,
+    /// Cached column names from parent schemas — captured at construction so
+    /// `get_row` does not clone schemas on every call (schemas are immutable
+    /// after Table construction in this crate).
+    left_column_names: Vec<String>,
+    right_column_names: Vec<String>,
     /// Last synced generation from left table's changeset
     left_last_synced: u64,
     /// Last synced generation from right table's changeset
@@ -521,6 +546,23 @@ impl JoinView {
         let left_change_count = left_table.borrow().changeset().total_len();
         let right_change_count = right_table.borrow().changeset().total_len();
 
+        // Snapshot column names once — schemas are immutable post-construction,
+        // so we never need to re-read them on each get_row call.
+        let left_column_names: Vec<String> = left_table
+            .borrow()
+            .schema()
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let right_column_names: Vec<String> = right_table
+            .borrow()
+            .schema()
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
         let mut view = JoinView {
             name,
             left_table,
@@ -529,6 +571,8 @@ impl JoinView {
             right_keys,
             join_type,
             join_index: Vec::new(),
+            left_column_names,
+            right_column_names,
             left_last_synced: left_gen,
             right_last_synced: right_gen,
             left_last_processed_change_count: left_change_count,
@@ -539,65 +583,29 @@ impl JoinView {
         Ok(view)
     }
 
-    /// Build a composite key string from a HashMap row (for incremental sync).
-    /// Returns None if any key column is missing or contains NULL.
-    /// IMPORTANT: Key format must match build_key_from_indices exactly.
-    fn build_composite_key(row: &HashMap<String, ColumnValue>, keys: &[String]) -> Option<String> {
-        // Fast path for single-column join (most common case)
-        if keys.len() == 1 {
-            return match row.get(&keys[0]) {
-                Some(ColumnValue::Null) | None => None,
-                Some(ColumnValue::Int32(v)) => Some(v.to_string()),
-                Some(ColumnValue::Int64(v)) => Some(v.to_string()),
-                Some(ColumnValue::String(s)) => Some(s.clone()),
-                Some(value) => Some(format!("{:?}", value)),
-            };
-        }
-
-        let mut parts: Vec<String> = Vec::with_capacity(keys.len());
+    /// Build a typed composite key from a HashMap row (used in incremental sync).
+    /// Returns None if any key column is missing, NULL, or contains a NaN float
+    /// (SQL semantics: NaN never equals anything, so NaN keys can't participate).
+    /// IMPORTANT: Output must match build_key_from_indices structurally.
+    fn build_composite_key(row: &HashMap<String, ColumnValue>, keys: &[String]) -> Option<JoinKey> {
+        let mut parts: Vec<JoinKeyPart> = Vec::with_capacity(keys.len());
         for key in keys {
-            match row.get(key) {
-                Some(ColumnValue::Null) => return None,
-                Some(ColumnValue::Int32(v)) => parts.push(v.to_string()),
-                Some(ColumnValue::Int64(v)) => parts.push(v.to_string()),
-                Some(ColumnValue::String(s)) => parts.push(s.clone()),
-                Some(value) => parts.push(format!("{:?}", value)),
-                None => return None,
-            }
+            let value = row.get(key)?;
+            parts.push(column_value_to_join_key_part(value)?);
         }
-        Some(parts.join("\x00"))
+        Some(parts)
     }
 
-    /// Build a composite key string from column values at given indices.
-    /// Returns None if any key column contains NULL (SQL semantics: NULL != NULL)
-    /// This is the fast path - uses pre-computed column indices.
-    /// Optimized to minimize allocations for common types.
-    fn build_key_from_indices(table: &Table, row: usize, col_indices: &[usize]) -> Option<String> {
-        // Fast path for single-column join (most common case)
-        if col_indices.len() == 1 {
-            return match table.get_value_by_index(row, col_indices[0]) {
-                Ok(ColumnValue::Null) => None,
-                Ok(ColumnValue::Int32(v)) => Some(v.to_string()),
-                Ok(ColumnValue::Int64(v)) => Some(v.to_string()),
-                Ok(ColumnValue::String(s)) => Some(s),
-                Ok(value) => Some(format!("{:?}", value)),
-                Err(_) => None,
-            };
-        }
-
-        // Multi-column join path
-        let mut parts: Vec<String> = Vec::with_capacity(col_indices.len());
+    /// Build a typed composite key from column values at given indices.
+    /// Returns None if any key column is NULL or NaN — these rows are excluded
+    /// from joins per SQL semantics.
+    fn build_key_from_indices(table: &Table, row: usize, col_indices: &[usize]) -> Option<JoinKey> {
+        let mut parts: Vec<JoinKeyPart> = Vec::with_capacity(col_indices.len());
         for &col_idx in col_indices {
-            match table.get_value_by_index(row, col_idx) {
-                Ok(ColumnValue::Null) => return None,
-                Ok(ColumnValue::Int32(v)) => parts.push(v.to_string()),
-                Ok(ColumnValue::Int64(v)) => parts.push(v.to_string()),
-                Ok(ColumnValue::String(s)) => parts.push(s),
-                Ok(value) => parts.push(format!("{:?}", value)),
-                Err(_) => return None,
-            }
+            let value = table.get_value_by_index(row, col_idx).ok()?;
+            parts.push(column_value_into_join_key_part(value)?);
         }
-        Some(parts.join("\x00"))
+        Some(parts)
     }
 
     /// Rebuilds the join index by scanning both tables.
@@ -621,11 +629,11 @@ impl JoinView {
             .collect();
 
         // Phase 2: Build a hashmap of right table values for efficient lookup
-        let mut right_index: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut right_index: HashMap<JoinKey, Vec<usize>> = HashMap::new();
 
         for i in 0..right.len() {
-            if let Some(key_str) = Self::build_key_from_indices(&right, i, &right_col_indices) {
-                right_index.entry(key_str).or_default().push(i);
+            if let Some(key) = Self::build_key_from_indices(&right, i, &right_col_indices) {
+                right_index.entry(key).or_default().push(i);
             }
         }
 
@@ -633,8 +641,8 @@ impl JoinView {
         let mut matched_right: HashSet<usize> = HashSet::new();
 
         for i in 0..left.len() {
-            if let Some(key_str) = Self::build_key_from_indices(&left, i, &left_col_indices) {
-                if let Some(matching_indices) = right_index.get(&key_str) {
+            if let Some(key) = Self::build_key_from_indices(&left, i, &left_col_indices) {
+                if let Some(matching_indices) = right_index.get(&key) {
                     // Found matches - add each combination
                     for &right_idx in matching_indices {
                         self.join_index.push((Some(i), Some(right_idx)));
@@ -681,9 +689,9 @@ impl JoinView {
     }
 
     /// Build a lookup map from right table for efficient join operations
-    fn build_right_lookup(&self) -> HashMap<String, Vec<usize>> {
+    fn build_right_lookup(&self) -> HashMap<JoinKey, Vec<usize>> {
         let right = self.right_table.borrow();
-        let mut right_index: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut right_index: HashMap<JoinKey, Vec<usize>> = HashMap::new();
 
         // Pre-compute column indices
         let right_col_indices: Vec<usize> = self
@@ -693,47 +701,65 @@ impl JoinView {
             .collect();
 
         for i in 0..right.len() {
-            if let Some(key_str) = Self::build_key_from_indices(&right, i, &right_col_indices) {
-                right_index.entry(key_str).or_default().push(i);
+            if let Some(key) = Self::build_key_from_indices(&right, i, &right_col_indices) {
+                right_index.entry(key).or_default().push(i);
             }
         }
 
         right_index
     }
 
-    fn find_left_insert_position(&self, left_idx: usize) -> usize {
-        // None left indices always sort after all Some entries
-        self.join_index
+    /// Mirror of `build_right_lookup` for the left table. Used to make
+    /// right-table inserts O(matches) instead of O(left.len()) per insert.
+    fn build_left_lookup(&self) -> HashMap<JoinKey, Vec<usize>> {
+        let left = self.left_table.borrow();
+        let mut left_index: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+
+        let left_col_indices: Vec<usize> = self
+            .left_keys
             .iter()
-            .position(|(existing_left, _)| match existing_left {
-                Some(el) => *el > left_idx,
-                None => true, // None-left entries (unmatched right) are always after
-            })
-            .unwrap_or(self.join_index.len())
+            .filter_map(|k| left.schema().get_column_index(k))
+            .collect();
+
+        for i in 0..left.len() {
+            if let Some(key) = Self::build_key_from_indices(&left, i, &left_col_indices) {
+                left_index.entry(key).or_default().push(i);
+            }
+        }
+
+        left_index
     }
 
+    /// Binary search for the insertion position of a new (Some(left_idx), _) entry.
+    /// `join_index` is partitioned: entries before — Some(el) with el ≤ left_idx;
+    /// entries at-or-after — Some(el) with el > left_idx, or None-left.
+    /// Was a linear `.iter().position(...)` — O(N); now O(log N).
+    fn find_left_insert_position(&self, left_idx: usize) -> usize {
+        self.join_index
+            .partition_point(|(existing_left, _)| match existing_left {
+                Some(el) => *el <= left_idx,
+                None => false, // None-left entries are after; not "before our insert"
+            })
+    }
+
+    /// Binary search for the insertion position of a new (Some(left_idx), Some(right_idx))
+    /// entry. Ordering invariant within same left_idx: matched entries (Some right)
+    /// sorted by right_idx ASC, then the unmatched (None right) entry if any.
+    /// Was a linear scan — O(N); now O(log N).
     fn find_right_insert_position(&self, left_idx: usize, right_idx: usize) -> usize {
         self.join_index
-            .iter()
-            .position(|(existing_left, existing_right)| {
-                match existing_left {
-                    Some(el) => {
-                        if *el > left_idx {
-                            return true;
-                        }
-                        if *el < left_idx {
-                            return false;
-                        }
-                        // Same left index: order by right index
-                        match existing_right {
-                            Some(existing_right_idx) => *existing_right_idx > right_idx,
-                            None => true,
-                        }
+            .partition_point(|(existing_left, existing_right)| match existing_left {
+                Some(el) if *el < left_idx => true,
+                Some(el) if *el > left_idx => false,
+                Some(_) => {
+                    // existing_left == left_idx — order by right_idx; None-right is after.
+                    match existing_right {
+                        Some(existing_right_idx) => *existing_right_idx <= right_idx,
+                        None => false,
                     }
-                    None => true, // None-left entries are always after
                 }
+                None => false, // None-left entries are after
             })
-            .unwrap_or(self.join_index.len())
     }
 
     /// Returns the number of rows in the joined result
@@ -757,31 +783,27 @@ impl JoinView {
 
         let (left_idx_opt, right_idx_opt) = self.join_index[index];
 
-        let left_schema = self.left_table.borrow().schema().clone();
-        let right_schema = self.right_table.borrow().schema().clone();
-        let mut result = HashMap::with_capacity(left_schema.len() + right_schema.len());
+        let mut result =
+            HashMap::with_capacity(self.left_column_names.len() + self.right_column_names.len());
 
         // Add all columns from left table (or nulls if no left match)
         if let Some(left_idx) = left_idx_opt {
             let left_row = self.left_table.borrow().get_row(left_idx)?;
             result.extend(left_row);
         } else {
-            // No left match - add null values for all left columns
-            for col_name in left_schema.get_column_names() {
-                result.insert(col_name.to_string(), ColumnValue::Null);
+            for col_name in &self.left_column_names {
+                result.insert(col_name.clone(), ColumnValue::Null);
             }
         }
 
-        // Add columns from right table (or nulls if no match)
+        // Add columns from right table (or nulls if no match), prefixing with "right_"
         if let Some(right_idx) = right_idx_opt {
             let right_row = self.right_table.borrow().get_row(right_idx)?;
-            // Add right columns, prefixing with "right_" to avoid collisions
             for (col_name, value) in right_row {
                 result.insert(format!("right_{}", col_name), value);
             }
         } else {
-            // No match - add null values for all right columns
-            for col_name in right_schema.get_column_names() {
+            for col_name in &self.right_column_names {
                 result.insert(format!("right_{}", col_name), ColumnValue::Null);
             }
         }
@@ -931,21 +953,31 @@ impl JoinView {
 
         for change in &left_changes {
             if let TableChange::RowInserted { index, data } = change {
-                // Adjust existing left indices
-                for (left_idx_opt, _) in self.join_index.iter_mut() {
-                    if let Some(left_idx) = left_idx_opt {
-                        if *left_idx >= *index {
-                            *left_idx += 1;
+                // Tail-insert fast path. join_index is sorted (Some(l) entries
+                // first, ascending by l; None-left entries last). The max
+                // existing left_idx is the last Some(l) before the None-left
+                // tail — found in O(K) by scanning from the end, where K is
+                // typically 0 (INNER) or small (LEFT/FULL with few unmatched).
+                let max_existing_left =
+                    self.join_index.iter().rev().find_map(|(l, _)| *l);
+                let needs_shift =
+                    max_existing_left.is_some_and(|max_l| max_l >= *index);
+
+                if needs_shift {
+                    for (left_idx_opt, _) in self.join_index.iter_mut() {
+                        if let Some(left_idx) = left_idx_opt {
+                            if *left_idx >= *index {
+                                *left_idx += 1;
+                            }
                         }
                     }
                 }
 
                 // Find matches for the new left row
-                if let Some(key_str) = Self::build_composite_key(data, &self.left_keys) {
+                if let Some(key) = Self::build_composite_key(data, &self.left_keys) {
                     let lookup = right_lookup.as_ref().unwrap();
-                    let insert_pos = self.find_left_insert_position(*index);
 
-                    if let Some(matching_indices) = lookup.get(&key_str) {
+                    if let Some(matching_indices) = lookup.get(&key) {
                         // For RIGHT/FULL joins: matched right rows may currently exist
                         // as unmatched entries (None, Some(right_idx)) in the tail section.
                         // Remove those before inserting the proper matched entries.
@@ -959,7 +991,8 @@ impl JoinView {
                                     self.join_index.remove(pos);
                                 }
                             }
-                            // Recompute insert_pos after removals may have shifted things
+                            // insert_pos is computed *after* removals so it reflects
+                            // the post-removal join_index layout.
                         }
                         let insert_pos = self.find_left_insert_position(*index);
                         for (offset, &right_idx) in matching_indices.iter().enumerate() {
@@ -968,6 +1001,7 @@ impl JoinView {
                             modified = true;
                         }
                     } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
+                        let insert_pos = self.find_left_insert_position(*index);
                         self.join_index.insert(insert_pos, (Some(*index), None));
                         modified = true;
                     }
@@ -982,14 +1016,29 @@ impl JoinView {
             }
         }
 
-        // Handle right table inserts
+        // Handle right table inserts — build LEFT lookup once, not per right insert.
+        // Mirrors the existing right_lookup pattern used for left-insert handling.
+        // Was O(left.len()) per right insert via linear scan; now O(matches) via hash lookup.
+        let has_right_inserts = right_changes
+            .iter()
+            .any(|c| matches!(c, TableChange::RowInserted { .. }));
+        let left_lookup = if has_right_inserts {
+            Some(self.build_left_lookup())
+        } else {
+            None
+        };
+
         for change in &right_changes {
             if let TableChange::RowInserted {
                 index: right_idx,
                 data,
             } = change
             {
-                // Adjust existing right indices
+                // Adjust existing right indices. Unlike left, right_idx
+                // values are not monotonic in join_index (which is sorted
+                // primarily by left), so we can't shortcut detection in
+                // sub-linear time; the existing single-pass conditional
+                // shift is already optimal for this layout.
                 for (_, right_opt) in self.join_index.iter_mut() {
                     if let Some(r_idx) = right_opt {
                         if *r_idx >= *right_idx {
@@ -998,52 +1047,39 @@ impl JoinView {
                     }
                 }
 
-                // Find left rows that match this new right row
-                if let Some(right_key_str) = Self::build_composite_key(data, &self.right_keys) {
-                    let left = self.left_table.borrow();
+                // Find left rows that match this new right row via the precomputed lookup
+                if let Some(right_key) = Self::build_composite_key(data, &self.right_keys) {
+                    let lookup = left_lookup.as_ref().unwrap();
+                    let matching_left = lookup.get(&right_key);
+                    let any_match = matching_left.is_some_and(|v| !v.is_empty());
 
-                    // Pre-compute left column indices for fast access
-                    let left_col_indices: Vec<usize> = self
-                        .left_keys
-                        .iter()
-                        .filter_map(|k| left.schema().get_column_index(k))
-                        .collect();
+                    if let Some(left_indices) = matching_left {
+                        for &left_idx in left_indices {
+                            // For LEFT/FULL: may need to replace a (Some(left_idx), None)
+                            // placeholder rather than insert a new entry.
+                            if self.join_type == JoinType::Left
+                                || self.join_type == JoinType::Full
+                            {
+                                let existing_null = self
+                                    .join_index
+                                    .iter()
+                                    .position(|(l, r)| *l == Some(left_idx) && r.is_none());
 
-                    let mut any_match = false;
-                    for left_idx in 0..left.len() {
-                        // Use fast direct column access instead of get_row()
-                        if let Some(left_key_str) =
-                            Self::build_key_from_indices(&left, left_idx, &left_col_indices)
-                        {
-                            if left_key_str == right_key_str {
-                                any_match = true;
-                                // For left/full joins, we might need to replace a
-                                // (Some(left_idx), None) with (Some(left_idx), Some(right_idx))
-                                if self.join_type == JoinType::Left
-                                    || self.join_type == JoinType::Full
-                                {
-                                    // Check if there's an existing null match to replace
-                                    let existing_null = self
-                                        .join_index
-                                        .iter()
-                                        .position(|(l, r)| *l == Some(left_idx) && r.is_none());
-
-                                    if let Some(pos) = existing_null {
-                                        self.join_index[pos] = (Some(left_idx), Some(*right_idx));
-                                    } else {
-                                        let insert_pos =
-                                            self.find_right_insert_position(left_idx, *right_idx);
-                                        self.join_index
-                                            .insert(insert_pos, (Some(left_idx), Some(*right_idx)));
-                                    }
+                                if let Some(pos) = existing_null {
+                                    self.join_index[pos] = (Some(left_idx), Some(*right_idx));
                                 } else {
                                     let insert_pos =
                                         self.find_right_insert_position(left_idx, *right_idx);
                                     self.join_index
                                         .insert(insert_pos, (Some(left_idx), Some(*right_idx)));
                                 }
-                                modified = true;
+                            } else {
+                                let insert_pos =
+                                    self.find_right_insert_position(left_idx, *right_idx);
+                                self.join_index
+                                    .insert(insert_pos, (Some(left_idx), Some(*right_idx)));
                             }
+                            modified = true;
                         }
                     }
 
@@ -1270,7 +1306,7 @@ impl SortedView {
                 let val_a = &sort_values[key_idx][a];
                 let val_b = &sort_values[key_idx][b];
 
-                let cmp = Self::compare_values_ref(val_a, val_b, key);
+                let cmp = Self::compare_values(val_a, val_b, key);
                 if cmp != Ordering::Equal {
                     return cmp;
                 }
@@ -1282,27 +1318,26 @@ impl SortedView {
         self.last_processed_change_count = table.changeset().total_len();
     }
 
-    /// Compare two column values by reference (avoids cloning)
-    fn compare_values_ref(val_a: &ColumnValue, val_b: &ColumnValue, key: &SortKey) -> Ordering {
-        let a_is_null = val_a.is_null();
-        let b_is_null = val_b.is_null();
-
-        // Handle NULL comparisons
-        match (a_is_null, b_is_null) {
+    /// Compare two ColumnValues by reference under a sort key.
+    ///
+    /// Unified implementation — used by both `rebuild_index` (full sort)
+    /// and `find_insertion_position` (incremental binary search). Previously
+    /// these paths had two divergent impls (`compare_values_ref` returned
+    /// Equal for mixed types; `compare_values` used `format!("{:?}", ...)`
+    /// which is not a stability-guaranteed format).
+    ///
+    /// Mixed types fall back to a fixed `type_rank` ordering — deterministic
+    /// across Rust versions, and the same direction for both call paths so
+    /// rebuild and incremental insert produce identical orderings.
+    fn compare_values(val_a: &ColumnValue, val_b: &ColumnValue, key: &SortKey) -> Ordering {
+        // NULL handling (configurable per SortKey)
+        match (val_a.is_null(), val_b.is_null()) {
             (true, true) => return Ordering::Equal,
             (true, false) => {
-                return if key.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                };
+                return if key.nulls_first { Ordering::Less } else { Ordering::Greater };
             }
             (false, true) => {
-                return if key.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                };
+                return if key.nulls_first { Ordering::Greater } else { Ordering::Less };
             }
             (false, false) => {}
         }
@@ -1320,80 +1355,60 @@ impl SortedView {
             (ColumnValue::Bool(a), ColumnValue::Bool(b)) => a.cmp(b),
             (ColumnValue::Date(a), ColumnValue::Date(b)) => a.cmp(b),
             (ColumnValue::DateTime(a), ColumnValue::DateTime(b)) => a.cmp(b),
-            // Mixed types - compare type ordering for deterministic results
-            _ => Ordering::Equal, // Different types are equal for stability
+            // Mixed types — fixed deterministic ordering by type-rank.
+            // Schema enforcement makes this unreachable through the normal
+            // public API; the fallback exists so all code paths agree.
+            (a, b) => Self::type_rank(a).cmp(&Self::type_rank(b)),
         };
 
-        // Apply sort order
         match key.order {
             SortOrder::Ascending => base_cmp,
             SortOrder::Descending => base_cmp.reverse(),
         }
     }
 
-    /// Compare two column values according to a sort key
-    fn compare_values(
-        val_a: &Option<ColumnValue>,
-        val_b: &Option<ColumnValue>,
-        key: &SortKey,
-    ) -> Ordering {
-        let a_is_null = val_a.is_none() || val_a.as_ref().map(|v| v.is_null()).unwrap_or(true);
-        let b_is_null = val_b.is_none() || val_b.as_ref().map(|v| v.is_null()).unwrap_or(true);
-
-        // Handle NULL comparisons
-        match (a_is_null, b_is_null) {
-            (true, true) => return Ordering::Equal,
-            (true, false) => {
-                return if key.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                };
-            }
-            (false, true) => {
-                return if key.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                };
-            }
-            (false, false) => {}
-        }
-
-        let base_cmp = match (val_a.as_ref().unwrap(), val_b.as_ref().unwrap()) {
-            (ColumnValue::Int32(a), ColumnValue::Int32(b)) => a.cmp(b),
-            (ColumnValue::Int64(a), ColumnValue::Int64(b)) => a.cmp(b),
-            (ColumnValue::Float32(a), ColumnValue::Float32(b)) => {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
-            }
-            (ColumnValue::Float64(a), ColumnValue::Float64(b)) => {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
-            }
-            (ColumnValue::String(a), ColumnValue::String(b)) => a.cmp(b),
-            (ColumnValue::Bool(a), ColumnValue::Bool(b)) => a.cmp(b),
-            (ColumnValue::Date(a), ColumnValue::Date(b)) => a.cmp(b),
-            (ColumnValue::DateTime(a), ColumnValue::DateTime(b)) => a.cmp(b),
-            // Mixed types - compare by type name for deterministic ordering
-            (a, b) => format!("{:?}", a).cmp(&format!("{:?}", b)),
-        };
-
-        // Apply sort order
-        match key.order {
-            SortOrder::Ascending => base_cmp,
-            SortOrder::Descending => base_cmp.reverse(),
+    /// Fixed per-variant rank for the mixed-type comparison fallback.
+    /// Order chosen for stable, debuggable output (NULL first, then numerics
+    /// from narrowest to widest, then dates, then strings).
+    fn type_rank(v: &ColumnValue) -> u8 {
+        match v {
+            ColumnValue::Null => 0,
+            ColumnValue::Bool(_) => 1,
+            ColumnValue::Int32(_) => 2,
+            ColumnValue::Int64(_) => 3,
+            ColumnValue::Float32(_) => 4,
+            ColumnValue::Float64(_) => 5,
+            ColumnValue::Date(_) => 6,
+            ColumnValue::DateTime(_) => 7,
+            ColumnValue::String(_) => 8,
         }
     }
 
-    /// Find the insertion position for a new value using binary search
+    /// Find the insertion position for a new value using binary search.
+    /// The new row's sort-key values are pre-extracted once before the search
+    /// (was previously re-fetched O(log N) times inside the closure).
     fn find_insertion_position(&self, parent_index: usize) -> usize {
         let table = self.parent.borrow();
 
-        let result = self.sorted_index.binary_search_by(|&existing_idx| {
-            for key in &self.sort_keys {
-                let val_existing = table.get_value(existing_idx, &key.column).ok();
-                let val_new = table.get_value(parent_index, &key.column).ok();
+        // Hoist: read new-row values once, not per binary-search step.
+        let new_vals: Vec<ColumnValue> = self
+            .sort_keys
+            .iter()
+            .map(|key| {
+                table
+                    .get_value(parent_index, &key.column)
+                    .unwrap_or(ColumnValue::Null)
+            })
+            .collect();
 
-                let cmp = Self::compare_values(&val_existing, &val_new, key);
+        let result = self.sorted_index.binary_search_by(|&existing_idx| {
+            for (key_idx, key) in self.sort_keys.iter().enumerate() {
+                let val_existing = table
+                    .get_value(existing_idx, &key.column)
+                    .unwrap_or(ColumnValue::Null);
+                let val_new = &new_vals[key_idx];
+
+                let cmp = Self::compare_values(&val_existing, val_new, key);
                 if cmp != Ordering::Equal {
                     return cmp;
                 }
@@ -1497,10 +1512,15 @@ impl IncrementalView for SortedView {
         for change in changes {
             match change {
                 TableChange::RowInserted { index, .. } => {
-                    // First, adjust all existing parent indices >= insert index
-                    for parent_idx in self.sorted_index.iter_mut() {
-                        if *parent_idx >= *index {
-                            *parent_idx += 1;
+                    // Tail-insert fast path: SortedView is 1:1 with parent,
+                    // so `*index == sorted_index.len()` means the new row's
+                    // parent index is past every existing one — no shift.
+                    let is_tail = *index == self.sorted_index.len();
+                    if !is_tail {
+                        for parent_idx in self.sorted_index.iter_mut() {
+                            if *parent_idx >= *index {
+                                *parent_idx += 1;
+                            }
                         }
                     }
 
@@ -4814,5 +4834,223 @@ mod tests {
             result,
             vec![(Some(1), None), (Some(2), None), (None, Some(3))]
         );
+    }
+
+    // === Tail-insert fast-path regression tests (fix #12) ===
+
+    /// Bulk-append 50 rows after creating a FilterView and sync; verify all
+    /// matching rows appear in correct order. Exercises the no-shift path.
+    #[test]
+    fn test_filter_view_bulk_tail_insert_ordering() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("v".to_string(), ColumnType::Int32, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new("t".to_string(), schema)));
+
+        // Seed: ids 0..5 with v=id*2 — predicate v >= 4 selects ids 2..5
+        for i in 0..5 {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(i));
+            row.insert("v".to_string(), ColumnValue::Int32(i * 2));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+
+        let mut view = FilterView::new(
+            "f".to_string(),
+            table.clone(),
+            |row| row.get("v").and_then(|v| v.as_i32()).unwrap_or(0) >= 4,
+        );
+        assert_eq!(view.len(), 3); // ids 2, 3, 4
+
+        // Bulk append 50 more rows at the tail. Predicate matches all (v >= 4).
+        for i in 5..55 {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(i));
+            row.insert("v".to_string(), ColumnValue::Int32(i * 2));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+        assert!(view.sync());
+
+        // View should contain ids 2..55 (53 rows), parent indices in order.
+        assert_eq!(view.len(), 53);
+        for (view_idx, expected_parent_idx) in (2..55).enumerate() {
+            let row = view.get_row(view_idx).unwrap();
+            assert_eq!(row.get("id").unwrap().as_i32(), Some(expected_parent_idx));
+        }
+    }
+
+    /// Bulk-append 20 rows to a SortedView (sorted DESC). Verify sort
+    /// invariant holds after the no-shift tail-insert fast path.
+    #[test]
+    fn test_sorted_view_bulk_tail_insert_ordering() {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int32, false),
+            ("score".to_string(), ColumnType::Int32, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new("t".to_string(), schema)));
+
+        // Seed 5 rows
+        for i in 0..5 {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(i));
+            row.insert("score".to_string(), ColumnValue::Int32(i * 10));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+
+        let mut view = SortedView::new(
+            "s".to_string(),
+            table.clone(),
+            vec![SortKey::descending("score")],
+        )
+        .unwrap();
+        assert_eq!(view.len(), 5);
+
+        // Bulk-append 20 more, intentionally with varying scores
+        for i in 0..20 {
+            let mut row = HashMap::new();
+            row.insert("id".to_string(), ColumnValue::Int32(100 + i));
+            // Scores in a pattern that interleaves with existing
+            row.insert("score".to_string(), ColumnValue::Int32((i * 7) % 50));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+        assert!(view.sync());
+
+        assert_eq!(view.len(), 25);
+
+        // Verify sort invariant: scores are monotonically non-increasing
+        let mut prev: Option<i32> = None;
+        for i in 0..view.len() {
+            let s = view.get_value(i, "score").unwrap().as_i32().unwrap();
+            if let Some(p) = prev {
+                assert!(p >= s, "Sort invariant violated at view index {}: {} < {}", i, p, s);
+            }
+            prev = Some(s);
+        }
+    }
+
+    // === Typed join key tests (fix #1: replace string serialization) ===
+
+    /// Two rows whose String parts contain `\x00` must not collide via
+    /// composite-key serialization. With the old String-based scheme,
+    /// keys (\"a\\x00b\", \"c\") and (\"a\", \"b\\x00c\") both produced
+    /// \"a\\x00b\\x00c\". Typed keys ([\"a\\x00b\", \"c\"]) vs ([\"a\", \"b\\x00c\"])
+    /// are structurally distinct.
+    #[test]
+    fn test_join_composite_key_null_byte_collision() {
+        let schema = Schema::new(vec![
+            ("k1".to_string(), ColumnType::String, false),
+            ("k2".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("L".to_string(), schema.clone())));
+        let right = Rc::new(RefCell::new(Table::new("R".to_string(), schema)));
+
+        // Left: (k1="a\x00b", k2="c")
+        let mut lrow = HashMap::new();
+        lrow.insert("k1".to_string(), ColumnValue::String("a\x00b".to_string()));
+        lrow.insert("k2".to_string(), ColumnValue::String("c".to_string()));
+        left.borrow_mut().append_row(lrow).unwrap();
+
+        // Right: (k1="a", k2="b\x00c") - DIFFERENT row, but old code thought they match
+        let mut rrow = HashMap::new();
+        rrow.insert("k1".to_string(), ColumnValue::String("a".to_string()));
+        rrow.insert("k2".to_string(), ColumnValue::String("b\x00c".to_string()));
+        right.borrow_mut().append_row(rrow).unwrap();
+
+        let joined = JoinView::new_multi(
+            "j".to_string(),
+            left,
+            right,
+            vec!["k1".to_string(), "k2".to_string()],
+            vec!["k1".to_string(), "k2".to_string()],
+            JoinType::Inner,
+        )
+        .unwrap();
+
+        // INNER join: must be empty (keys differ structurally)
+        assert_eq!(joined.len(), 0,
+            "Composite key collision: rows with \\x00-containing parts incorrectly matched");
+    }
+
+    /// Float64 join keys must work without relying on format!("{:?}", value),
+    /// which is not a stability-guaranteed format. Same f64 bit patterns join;
+    /// NaN never joins (SQL semantics).
+    #[test]
+    fn test_join_float64_keys() {
+        let schema = Schema::new(vec![
+            ("k".to_string(), ColumnType::Float64, false),
+            ("label".to_string(), ColumnType::String, false),
+        ]);
+        let left = Rc::new(RefCell::new(Table::new("L".to_string(), schema.clone())));
+        let right = Rc::new(RefCell::new(Table::new("R".to_string(), schema)));
+
+        // Left: 1.5, 2.5, NaN
+        for (k, label) in [(1.5_f64, "L_one"), (2.5, "L_two"), (f64::NAN, "L_nan")] {
+            let mut row = HashMap::new();
+            row.insert("k".to_string(), ColumnValue::Float64(k));
+            row.insert("label".to_string(), ColumnValue::String(label.to_string()));
+            left.borrow_mut().append_row(row).unwrap();
+        }
+        // Right: 1.5, NaN
+        for (k, label) in [(1.5_f64, "R_one"), (f64::NAN, "R_nan")] {
+            let mut row = HashMap::new();
+            row.insert("k".to_string(), ColumnValue::Float64(k));
+            row.insert("label".to_string(), ColumnValue::String(label.to_string()));
+            right.borrow_mut().append_row(row).unwrap();
+        }
+
+        let joined = JoinView::new(
+            "j".to_string(),
+            left,
+            right,
+            "k".to_string(),
+            "k".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+
+        // Only 1.5 matches; NaN must NEVER match (SQL semantics)
+        assert_eq!(joined.len(), 1,
+            "Expected exactly one Float64 match (1.5↔1.5); NaN must not match itself");
+        let row = joined.get_row(0).unwrap();
+        assert_eq!(row.get("label").unwrap().as_string(), Some("L_one"));
+        assert_eq!(row.get("right_label").unwrap().as_string(), Some("R_one"));
+    }
+
+    // === Regression coverage for hot-path optimizations in JoinView left-insert ===
+
+    /// Covers the LEFT "no-match incremental insert" branch where a new left
+    /// row arrives with no corresponding right row. The new row must appear
+    /// in join_index in left-index order, paired with `None` on the right.
+    /// Exercises view.rs:970 (else-if branch) — the consumer of the outer
+    /// `insert_pos` computation we are about to move into the branch.
+    #[test]
+    fn test_left_join_incremental_insert_no_right_match() {
+        let left = make_left_table();
+        let right = make_right_table();
+
+        // Right has only id=1
+        right.borrow_mut().append_row(right_row(1, "R1")).unwrap();
+        // Left starts with id=1 (matches)
+        left.borrow_mut().append_row(left_row(1, "L1")).unwrap();
+
+        let mut joined = JoinView::new(
+            "test".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Left,
+        )
+        .unwrap();
+        assert_eq!(joined.len(), 1);
+
+        // Incremental: add a left row with NO match in right
+        left.borrow_mut().append_row(left_row(2, "L2")).unwrap();
+        assert!(joined.sync());
+
+        // Expected: (left.id=1, right.id=1), (left.id=2, right=None)
+        let result = collect_join_rows(&joined);
+        assert_eq!(result, vec![(Some(1), Some(1)), (Some(2), None)]);
     }
 }

@@ -203,6 +203,111 @@ pub trait IncrementalView {
     fn rebuild(&mut self);
 }
 
+// =============================================================================
+// FilterView-style bookkeeping helpers
+//
+// Both the Rust-native FilterView (in view.rs) and the Python-bound
+// PyFilterViewInner (in python_bindings.rs) maintain a sorted
+// `Vec<usize>` of matching parent-row indices and run the same algorithm
+// to keep that vec consistent across changeset entries. The two impls
+// differ ONLY in the predicate-evaluation call mechanism (Rust closure vs
+// PyObject under the GIL); the bookkeeping itself is identical and is
+// extracted here so a fix applies to both sides.
+//
+// Callers compute `predicate_matched` / `now_matches` themselves and pass
+// the result in. This keeps these helpers independent of `Table` and the
+// Python runtime.
+// =============================================================================
+
+/// Apply a `RowInserted { index }` to a filter-style sorted index.
+///
+/// Pre-condition: `view_to_parent` is sorted strictly ascending.
+/// Post-condition: parent indices >= `index` are shifted by +1 (existing rows
+/// moved down by one) AND if `predicate_matched`, `index` is inserted in the
+/// correct sorted position.
+///
+/// Tail-insert fast path: when `index` is past every entry already in the
+/// view, no shift is performed and a matching row appends in O(1) amortized.
+///
+/// Returns whether `view_to_parent` was modified.
+pub fn apply_filter_row_inserted(
+    view_to_parent: &mut Vec<usize>,
+    index: usize,
+    predicate_matched: bool,
+) -> bool {
+    let is_tail = view_to_parent
+        .last()
+        .is_none_or(|&last_p| last_p < index);
+
+    if !is_tail {
+        IndexAdjuster::adjust_mapping_for_insert(view_to_parent, index);
+    }
+
+    if predicate_matched {
+        if is_tail {
+            view_to_parent.push(index);
+        } else {
+            let insert_pos = view_to_parent.partition_point(|&p| p <= index);
+            view_to_parent.insert(insert_pos, index);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Apply a `RowDeleted { index }` to a filter-style sorted index.
+///
+/// Indices > `index` are shifted by -1; an entry exactly equal to `index`
+/// (if present) is removed. Returns whether `view_to_parent` was modified.
+pub fn apply_filter_row_deleted(
+    view_to_parent: &mut Vec<usize>,
+    index: usize,
+) -> bool {
+    let to_remove = IndexAdjuster::adjust_mapping_for_delete(view_to_parent, index);
+    if to_remove.is_empty() {
+        return false;
+    }
+    for view_idx in to_remove.into_iter().rev() {
+        view_to_parent.remove(view_idx);
+    }
+    true
+}
+
+/// Apply a `CellUpdated { row }` to a filter-style sorted index, given the
+/// row's post-update predicate-match status.
+///
+/// - If the row is currently in the view and no longer matches: remove it.
+/// - If the row is currently NOT in the view and now matches: insert it
+///   at the correct sorted position.
+/// - Otherwise: no change.
+///
+/// Returns whether `view_to_parent` was modified.
+pub fn apply_filter_cell_updated(
+    view_to_parent: &mut Vec<usize>,
+    row: usize,
+    now_matches: bool,
+) -> bool {
+    match view_to_parent.binary_search(&row) {
+        Ok(pos) => {
+            if !now_matches {
+                view_to_parent.remove(pos);
+                true
+            } else {
+                false
+            }
+        }
+        Err(pos) => {
+            if now_matches {
+                view_to_parent.insert(pos, row);
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 /// Helper to adjust indices after an insert or delete
 ///
 /// When a row is inserted at index I, all view indices >= I need to be incremented.
@@ -482,6 +587,106 @@ mod tests {
         assert_eq!(cs.base_index(), 2);
         assert!(cs.is_empty());
         assert_eq!(cs.total_len(), 2);
+    }
+
+    // === apply_filter_* helper tests ===
+
+    #[test]
+    fn test_apply_filter_row_inserted_tail_fast_path_matching() {
+        let mut idx = vec![1, 3, 5];
+        // Tail insert (index=10 > all entries), predicate matches → push
+        let modified = apply_filter_row_inserted(&mut idx, 10, true);
+        assert!(modified);
+        assert_eq!(idx, vec![1, 3, 5, 10]);
+    }
+
+    #[test]
+    fn test_apply_filter_row_inserted_tail_fast_path_no_match() {
+        let mut idx = vec![1, 3, 5];
+        // Tail insert, predicate does NOT match → no change
+        let modified = apply_filter_row_inserted(&mut idx, 10, false);
+        assert!(!modified);
+        assert_eq!(idx, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_apply_filter_row_inserted_middle_shift_no_match() {
+        let mut idx = vec![1, 3, 5];
+        // Insert at parent index 2, no match → existing 3, 5 shift to 4, 6
+        let modified = apply_filter_row_inserted(&mut idx, 2, false);
+        assert!(!modified);
+        assert_eq!(idx, vec![1, 4, 6]);
+    }
+
+    #[test]
+    fn test_apply_filter_row_inserted_middle_shift_with_match() {
+        let mut idx = vec![1, 3, 5];
+        // Insert at parent index 2, matches → existing 3, 5 → 4, 6; then 2 inserted
+        let modified = apply_filter_row_inserted(&mut idx, 2, true);
+        assert!(modified);
+        assert_eq!(idx, vec![1, 2, 4, 6]);
+    }
+
+    #[test]
+    fn test_apply_filter_row_inserted_empty_view() {
+        let mut idx: Vec<usize> = Vec::new();
+        // Tail-detect when view is empty
+        let modified = apply_filter_row_inserted(&mut idx, 0, true);
+        assert!(modified);
+        assert_eq!(idx, vec![0]);
+    }
+
+    #[test]
+    fn test_apply_filter_row_deleted_present() {
+        let mut idx = vec![1, 3, 5];
+        let modified = apply_filter_row_deleted(&mut idx, 3);
+        assert!(modified);
+        assert_eq!(idx, vec![1, 4]); // 5 shifted down to 4
+    }
+
+    #[test]
+    fn test_apply_filter_row_deleted_absent() {
+        let mut idx = vec![1, 3, 5];
+        // Deleting parent index 2 (not in view) just shifts later entries
+        let modified = apply_filter_row_deleted(&mut idx, 2);
+        assert!(!modified);
+        assert_eq!(idx, vec![1, 2, 4]); // 3, 5 → 2, 4
+    }
+
+    #[test]
+    fn test_apply_filter_cell_updated_now_matches() {
+        let mut idx = vec![1, 5];
+        // Row 3 not in view, now matches → insert at correct position
+        let modified = apply_filter_cell_updated(&mut idx, 3, true);
+        assert!(modified);
+        assert_eq!(idx, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_apply_filter_cell_updated_no_longer_matches() {
+        let mut idx = vec![1, 3, 5];
+        // Row 3 in view, no longer matches → remove
+        let modified = apply_filter_cell_updated(&mut idx, 3, false);
+        assert!(modified);
+        assert_eq!(idx, vec![1, 5]);
+    }
+
+    #[test]
+    fn test_apply_filter_cell_updated_still_matches_in_view() {
+        let mut idx = vec![1, 3, 5];
+        // Row 3 in view, still matches → no change
+        let modified = apply_filter_cell_updated(&mut idx, 3, true);
+        assert!(!modified);
+        assert_eq!(idx, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_apply_filter_cell_updated_still_excluded() {
+        let mut idx = vec![1, 5];
+        // Row 3 not in view, still doesn't match → no change
+        let modified = apply_filter_cell_updated(&mut idx, 3, false);
+        assert!(!modified);
+        assert_eq!(idx, vec![1, 5]);
     }
 
     #[test]

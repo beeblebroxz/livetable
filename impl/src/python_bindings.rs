@@ -200,7 +200,10 @@ impl PyFilterViewInner {
     }
 
     fn sync(&mut self, py: Python) -> PyResult<bool> {
-        use crate::changeset::TableChange;
+        use crate::changeset::{
+            apply_filter_cell_updated, apply_filter_row_deleted, apply_filter_row_inserted,
+            TableChange,
+        };
 
         let table_ref = self.table_inner.borrow();
         let changes = match table_ref
@@ -226,46 +229,27 @@ impl PyFilterViewInner {
         for change in changes {
             match change {
                 TableChange::RowInserted { index, data } => {
-                    for idx in self.indices.iter_mut() {
-                        if *idx >= index {
-                            *idx += 1;
-                        }
-                    }
-
+                    // Evaluate the Python predicate first; bookkeeping (shift +
+                    // tail-insert fast path + sorted insert) is delegated to the
+                    // shared helper so the algorithm matches the native Rust
+                    // FilterView byte-for-byte.
                     let dict = PyDict::new_bound(py);
                     for (key, value) in data.iter() {
                         dict.set_item(key, column_value_to_py(py, value)?)?;
                     }
-
-                    if call_predicate_bool(&self.predicate, py, dict)? {
-                        let insert_pos = self
-                            .indices
-                            .iter()
-                            .position(|&i| i > index)
-                            .unwrap_or(self.indices.len());
-                        self.indices.insert(insert_pos, index);
+                    let matched = call_predicate_bool(&self.predicate, py, dict)?;
+                    if apply_filter_row_inserted(&mut self.indices, index, matched) {
                         modified = true;
                     }
                 }
 
                 TableChange::RowDeleted { index, .. } => {
-                    let mut to_remove = None;
-                    for (view_idx, parent_idx) in self.indices.iter_mut().enumerate() {
-                        if *parent_idx == index {
-                            to_remove = Some(view_idx);
-                        } else if *parent_idx > index {
-                            *parent_idx -= 1;
-                        }
-                    }
-
-                    if let Some(view_idx) = to_remove {
-                        self.indices.remove(view_idx);
+                    if apply_filter_row_deleted(&mut self.indices, index) {
                         modified = true;
                     }
                 }
 
                 TableChange::CellUpdated { row, .. } => {
-                    let currently_in_view = self.indices.contains(&row);
                     // Snapshot the row and drop the borrow before any Python call.
                     let row_data = self.table_inner.borrow().get_row(row).ok();
                     let now_matches = if let Some(row_data) = row_data {
@@ -277,24 +261,8 @@ impl PyFilterViewInner {
                     } else {
                         false
                     };
-
-                    match (currently_in_view, now_matches) {
-                        (false, true) => {
-                            let insert_pos = self
-                                .indices
-                                .iter()
-                                .position(|&i| i > row)
-                                .unwrap_or(self.indices.len());
-                            self.indices.insert(insert_pos, row);
-                            modified = true;
-                        }
-                        (true, false) => {
-                            if let Some(pos) = self.indices.iter().position(|&i| i == row) {
-                                self.indices.remove(pos);
-                                modified = true;
-                            }
-                        }
-                        _ => {}
+                    if apply_filter_cell_updated(&mut self.indices, row, now_matches) {
+                        modified = true;
                     }
                 }
             }
