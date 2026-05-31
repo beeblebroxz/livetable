@@ -8,6 +8,11 @@ import type {
   WireTableRecord,
 } from '../types';
 
+type DeltaMessage = Extract<
+  ServerMessage,
+  { type: 'RowInserted' | 'CellUpdated' | 'RowDeleted' }
+>;
+
 const isDev = import.meta.env.DEV;
 const configuredWsUrl = import.meta.env.VITE_LIVETABLE_WS_URL;
 
@@ -39,6 +44,9 @@ const isScalarValue = (value: unknown): value is ScalarValue =>
   typeof value === 'string' ||
   typeof value === 'number' ||
   typeof value === 'boolean';
+
+const isSeq = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0;
 
 const isTableRow = (value: unknown): value is TableRow =>
   isObject(value) && Object.values(value).every(isScalarValue);
@@ -76,6 +84,7 @@ const parseServerMessage = (payload: unknown): ServerMessage | null => {
       return typeof parsed.table_name === 'string' ? parsed as ServerMessage : null;
     case 'TableData':
       return typeof parsed.table_name === 'string' &&
+        isSeq(parsed.seq) &&
         Array.isArray(parsed.columns) &&
         parsed.columns.every((column) => typeof column === 'string') &&
         Array.isArray(parsed.rows) &&
@@ -84,6 +93,7 @@ const parseServerMessage = (payload: unknown): ServerMessage | null => {
         : null;
     case 'RowInserted':
       return typeof parsed.table_name === 'string' &&
+        isSeq(parsed.seq) &&
         typeof parsed.index === 'number' &&
         Number.isInteger(parsed.index) &&
         parsed.index >= 0 &&
@@ -95,6 +105,7 @@ const parseServerMessage = (payload: unknown): ServerMessage | null => {
         : null;
     case 'CellUpdated':
       return typeof parsed.table_name === 'string' &&
+        isSeq(parsed.seq) &&
         typeof parsed.row_id === 'number' &&
         Number.isInteger(parsed.row_id) &&
         parsed.row_id >= 0 &&
@@ -104,6 +115,7 @@ const parseServerMessage = (payload: unknown): ServerMessage | null => {
         : null;
     case 'RowDeleted':
       return typeof parsed.table_name === 'string' &&
+        isSeq(parsed.seq) &&
         typeof parsed.row_id === 'number' &&
         Number.isInteger(parsed.row_id) &&
         parsed.row_id >= 0
@@ -173,6 +185,10 @@ export function useTableWebSocket(
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  // Seq of the snapshot we are currently merging against (null until the first
+  // TableData on this connection), plus deltas that arrived before it.
+  const snapshotSeqRef = useRef<number | null>(null);
+  const pendingDeltasRef = useRef<DeltaMessage[]>([]);
 
   useEffect(() => {
     let disposed = false;
@@ -199,6 +215,11 @@ export function useTableWebSocket(
         reconnectAttempts = 0;
         setConnected(true);
 
+        // A fresh connection means a fresh snapshot is on the way; discard the
+        // seq cutoff and any buffered deltas from the previous connection.
+        snapshotSeqRef.current = null;
+        pendingDeltasRef.current = [];
+
         sendSocketMessage(socket, { type: 'Subscribe', table_name: tableName });
         sendSocketMessage(socket, { type: 'Query', table_name: tableName });
       };
@@ -213,15 +234,38 @@ export function useTableWebSocket(
         logDebug('Received:', message);
 
         switch (message.type) {
-          case 'TableData':
+          case 'TableData': {
             setColumns(message.columns);
-            setData((previousRows) => applyServerMessage(previousRows, message));
+            const snapshotSeq = message.seq;
+            snapshotSeqRef.current = snapshotSeq;
+            // Replay deltas that raced ahead of the snapshot, keeping only those
+            // newer than it — older ones are already reflected in the snapshot.
+            const buffered = pendingDeltasRef.current;
+            pendingDeltasRef.current = [];
+            setData(() => {
+              let rows = message.rows.map(toTableRecord);
+              for (const delta of buffered) {
+                if (delta.seq > snapshotSeq) {
+                  rows = applyServerMessage(rows, delta);
+                }
+              }
+              return rows;
+            });
             break;
+          }
           case 'RowInserted':
           case 'CellUpdated':
-          case 'RowDeleted':
-            setData((previousRows) => applyServerMessage(previousRows, message));
+          case 'RowDeleted': {
+            const snapshotSeq = snapshotSeqRef.current;
+            if (snapshotSeq === null) {
+              // No baseline yet — buffer until the snapshot defines the cutoff.
+              pendingDeltasRef.current.push(message);
+            } else if (message.seq > snapshotSeq) {
+              setData((previousRows) => applyServerMessage(previousRows, message));
+            }
+            // else: already reflected in the snapshot — drop it.
             break;
+          }
           case 'Subscribed':
             logDebug('Subscribed to', message.table_name);
             break;

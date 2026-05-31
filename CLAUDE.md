@@ -100,6 +100,7 @@ cd frontend && npm install && npm run dev
 - Python lambdas are converted to Rust closures for filter/computed operations
 - Join operations use O(N+M) algorithm
 - WebSocket protocol: `UpdateCell`, `AddRow`, `DeleteRow` messages with broadcast to all clients
+- WebSocket reconciliation: every `TableData` and delta carries a monotonic `seq` (the table's `Changeset::total_len`, read under the same lock as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. This closes a snapshot/delta race where a concurrent insert during subscribe could otherwise be applied twice. Keep `seq` populated when adding new server→client messages.
 - JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
 - String columns use `NULL_STRING_ID` (u32::MAX) as null sentinel in `string_ids` — never use 0
 - `Column::check_value_type(&value)` validates without consuming — use before batch mutations

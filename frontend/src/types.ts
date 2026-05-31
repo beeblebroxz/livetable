@@ -26,10 +26,14 @@ export type ClientMessage =
   | { type: 'UpdateCell'; table_name: string; row_id: number; column: string; value: ScalarValue }
   | { type: 'DeleteRow'; table_name: string; row_id: number };
 
+// `seq` is the server's monotonic change count. `TableData` reports the count
+// its snapshot was taken at; each delta reports the count after it was applied.
+// Clients drop any delta whose `seq` is <= the snapshot's `seq` (already
+// reflected) and apply the rest. See ServerMessage in impl/src/messages.rs.
 export type ServerMessage =
   | { type: 'Subscribed'; table_name: string }
-  | { type: 'TableData'; table_name: string; columns: string[]; rows: WireTableRecord[] }
-  | { type: 'RowInserted'; table_name: string; index: number; row_id: number; row: TableRow }
-  | { type: 'CellUpdated'; table_name: string; row_id: number; column: string; value: ScalarValue }
-  | { type: 'RowDeleted'; table_name: string; row_id: number }
+  | { type: 'TableData'; table_name: string; seq: number; columns: string[]; rows: WireTableRecord[] }
+  | { type: 'RowInserted'; table_name: string; seq: number; index: number; row_id: number; row: TableRow }
+  | { type: 'CellUpdated'; table_name: string; seq: number; row_id: number; column: string; value: ScalarValue }
+  | { type: 'RowDeleted'; table_name: string; seq: number; row_id: number }
   | { type: 'Error'; message: string };

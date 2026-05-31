@@ -51,6 +51,7 @@ describe('useTableWebSocket', () => {
     const initialTable = {
       type: 'TableData' as const,
       table_name: 'demo',
+      seq: 5,
       columns: ['id', 'name', 'value'],
       rows: [
         { row_id: 11, row: { id: 4, name: 'Alice', value: 100 } },
@@ -67,11 +68,13 @@ describe('useTableWebSocket', () => {
     const deletedRow = {
       type: 'RowDeleted' as const,
       table_name: 'demo',
+      seq: 6,
       row_id: 11,
     };
     const updatedRow = {
       type: 'CellUpdated' as const,
       table_name: 'demo',
+      seq: 7,
       row_id: 42,
       column: 'value',
       value: 250,
@@ -123,5 +126,120 @@ describe('useTableWebSocket', () => {
       { type: 'Subscribe', table_name: 'demo' },
       { type: 'Query', table_name: 'demo' },
     ]);
+  });
+
+  // Reproduction: snapshot/delta consistency hazard.
+  //
+  // On (re)connect the client subscribes BEFORE it queries (see `onopen`). That
+  // correctly avoids missing updates, but it opens an overlap window: a row
+  // inserted by another client AFTER we subscribe but BEFORE the server takes
+  // our snapshot appears in BOTH the broadcast `RowInserted` (already queued to
+  // us) AND the `TableData` snapshot. The wire protocol carries no
+  // sequence/generation tag, so the client cannot tell the delta is already
+  // reflected in the snapshot.
+  //
+  // Actix does not guarantee FIFO ordering between a stream frame (our Query ->
+  // TableData) and a mailbox message (the broadcast RowInserted). When the
+  // snapshot is delivered first, the client double-applies the insert.
+  //
+  // This pins the client merge invariant: a row_id must appear at most once.
+  it('does not duplicate a row already reflected in the snapshot', async () => {
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+    });
+
+    // A concurrent writer inserted row_id 99 after we subscribed but before our
+    // snapshot was taken, so the snapshot already contains it...
+    const snapshotIncludingInsert = {
+      type: 'TableData' as const,
+      table_name: 'demo',
+      seq: 7,
+      columns: ['id', 'name', 'value'],
+      rows: [
+        { row_id: 11, row: { id: 4, name: 'Alice', value: 100 } },
+        { row_id: 42, row: { id: 9, name: 'Bob', value: 200 } },
+        { row_id: 99, row: { id: 7, name: 'Carol', value: 300 } },
+      ],
+    };
+    // ...and the broadcast for that same insert (its seq is <= the snapshot's,
+    // so it is already reflected) is still in flight, delivered AFTER the
+    // snapshot because of stream-vs-mailbox ordering.
+    const concurrentInsert = {
+      type: 'RowInserted' as const,
+      table_name: 'demo',
+      seq: 7,
+      index: 2,
+      row_id: 99,
+      row: { id: 7, name: 'Carol', value: 300 },
+    };
+
+    await act(async () => {
+      socket.receive(snapshotIncludingInsert);
+      socket.receive(concurrentInsert);
+    });
+
+    const rendered = screen.getByTestId('client-rows').textContent ?? '[]';
+    const rows = JSON.parse(rendered) as { rowId: number }[];
+    const duplicatesOf99 = rows.filter((row) => row.rowId === 99);
+
+    expect(duplicatesOf99).toHaveLength(1);
+  });
+
+  // Deltas can also win the race and arrive BEFORE the snapshot. They are
+  // buffered until the snapshot defines the seq cutoff, then replayed: those
+  // already reflected in the snapshot are dropped, newer ones are applied.
+  it('buffers pre-snapshot deltas and replays only newer ones', async () => {
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+    });
+
+    // Two inserts arrive before our snapshot: row 55 (seq 5, will be reflected
+    // in the snapshot) and row 77 (seq 8, newer than the snapshot).
+    await act(async () => {
+      socket.receive({
+        type: 'RowInserted',
+        table_name: 'demo',
+        seq: 5,
+        index: 2,
+        row_id: 55,
+        row: { id: 5, name: 'Dave', value: 500 },
+      });
+      socket.receive({
+        type: 'RowInserted',
+        table_name: 'demo',
+        seq: 8,
+        index: 3,
+        row_id: 77,
+        row: { id: 7, name: 'Erin', value: 700 },
+      });
+    });
+
+    // Snapshot at seq 7 already contains row 55 but predates row 77.
+    await act(async () => {
+      socket.receive({
+        type: 'TableData',
+        table_name: 'demo',
+        seq: 7,
+        columns: ['id', 'name', 'value'],
+        rows: [
+          { row_id: 11, row: { id: 4, name: 'Alice', value: 100 } },
+          { row_id: 42, row: { id: 9, name: 'Bob', value: 200 } },
+          { row_id: 55, row: { id: 5, name: 'Dave', value: 500 } },
+        ],
+      });
+    });
+
+    const rendered = screen.getByTestId('client-rows').textContent ?? '[]';
+    const rows = JSON.parse(rendered) as { rowId: number }[];
+
+    expect(rows.filter((row) => row.rowId === 55)).toHaveLength(1); // reflected, dropped
+    expect(rows.filter((row) => row.rowId === 77)).toHaveLength(1); // newer, replayed
+    expect(rows).toHaveLength(4);
   });
 });

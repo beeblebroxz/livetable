@@ -23,6 +23,7 @@ describe('LiveTable', () => {
       socket.receive({
         type: 'TableData',
         table_name: 'demo',
+        seq: 2,
         columns: ['id', 'name', 'value'],
         rows: [
           { row_id: 100, row: { id: 1, name: 'Alice', value: 100 } },
@@ -57,6 +58,7 @@ describe('LiveTable', () => {
       socket.receive({
         type: 'TableData',
         table_name: 'demo',
+        seq: 1,
         columns: ['id', 'name', 'value'],
         rows: [
           { row_id: 900, row: { id: 12, name: 'Alice', value: 100 } },

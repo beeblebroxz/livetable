@@ -205,8 +205,13 @@ impl AppState {
             .get(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         let (columns, rows) = table_to_json(table_state)?;
+        // Captured under the same lock as the snapshot above, so any later
+        // mutation gets a strictly greater seq and any earlier one is already
+        // reflected here.
+        let seq = table_state.table.changeset().total_len() as u64;
         Ok(ServerMessage::TableData {
             table_name: table_name.to_string(),
+            seq,
             columns,
             rows,
         })
@@ -223,9 +228,11 @@ impl AppState {
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         let converted_row = convert_row_for_schema(table_state.table.schema(), &row)?;
         let (index, row_id, json_row) = table_state.insert_row(converted_row)?;
+        let seq = table_state.table.changeset().total_len() as u64;
 
         Ok(ServerMessage::RowInserted {
             table_name: table_name.to_string(),
+            seq,
             index,
             row_id,
             row: json_row,
@@ -256,9 +263,11 @@ impl AppState {
         let col_value = json_to_column_value_typed(value, col_type, nullable)
             .map_err(|e| format!("Column '{}': {}", column, e))?;
         let json_value = table_state.update_cell(row_id, column, col_value)?;
+        let seq = table_state.table.changeset().total_len() as u64;
 
         Ok(ServerMessage::CellUpdated {
             table_name: table_name.to_string(),
+            seq,
             row_id,
             column: column.to_string(),
             value: json_value,
@@ -271,9 +280,11 @@ impl AppState {
             .get_mut(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         table_state.delete_row(row_id)?;
+        let seq = table_state.table.changeset().total_len() as u64;
 
         Ok(ServerMessage::RowDeleted {
             table_name: table_name.to_string(),
+            seq,
             row_id,
         })
     }
@@ -912,6 +923,57 @@ mod tests {
             ServerMessage::Error {
                 message: "test".to_string(),
             },
+        );
+    }
+
+    #[test]
+    fn test_inserted_row_id_also_appears_in_subsequent_snapshot() {
+        // Precondition for the snapshot/delta consistency hazard.
+        //
+        // `insert_row` returns the `RowInserted` that is broadcast to every
+        // subscriber. If a client subscribes, then this insert commits, then the
+        // client's `Query` snapshot is taken, the SAME row_id is present in BOTH
+        // the broadcast `RowInserted` AND the `TableData` snapshot.
+        //
+        // The wire protocol carries no sequence number to reconcile the overlap,
+        // so whether the client ends up with a duplicate row depends solely on
+        // actix's (unspecified) stream-vs-mailbox delivery order. This documents
+        // that the dual-channel overlap is real at the server boundary.
+        let state = AppState::new();
+
+        let broadcast = state
+            .insert_row(
+                "demo",
+                HashMap::from([
+                    ("region".to_string(), json!("North")),
+                    ("product".to_string(), json!("Premium")),
+                    ("amount".to_string(), json!(300.25)),
+                ]),
+            )
+            .expect("insert should succeed");
+
+        let broadcast_row_id = match broadcast {
+            ServerMessage::RowInserted { row_id, .. } => row_id,
+            other => panic!("expected RowInserted, got {:?}", other),
+        };
+
+        let snapshot = state.query_table("demo").expect("query should succeed");
+        let ServerMessage::TableData { rows, .. } = snapshot else {
+            panic!("expected TableData");
+        };
+
+        let occurrences = rows
+            .iter()
+            .filter(|r| r.row_id == broadcast_row_id)
+            .count();
+
+        // The broadcast row_id appears in the snapshot. In the live system the
+        // client ALSO receives the broadcast `RowInserted` for this same row_id:
+        // two channels carry the same row, with no sequence tag to dedupe them.
+        assert_eq!(
+            occurrences, 1,
+            "row {} from the RowInserted broadcast is also present in the snapshot",
+            broadcast_row_id
         );
     }
 }
