@@ -119,8 +119,7 @@ class TestBulkInsertErrors:
             {"id": "not an int", "name": "Alice", "score": 95.5},
         ]
 
-        # Type mismatches cause a PanicException (BaseException subclass)
-        with pytest.raises(BaseException):
+        with pytest.raises(ValueError, match="Expected INT32"):
             empty_table.append_rows(rows)
 
 

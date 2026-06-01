@@ -176,6 +176,36 @@ const applyServerMessage = (
   }
 };
 
+const applyBufferedDeltasInSequence = (
+  previousRows: TableRecord[],
+  deltas: DeltaMessage[],
+  lastAppliedSeq: number
+): {
+  rows: TableRecord[];
+  pendingDeltas: DeltaMessage[];
+  lastAppliedSeq: number;
+} => {
+  let rows = previousRows;
+  let appliedSeq = lastAppliedSeq;
+  const pendingDeltas: DeltaMessage[] = [];
+
+  const sortedDeltas = [...deltas].sort((a, b) => a.seq - b.seq);
+  for (const delta of sortedDeltas) {
+    if (delta.seq <= appliedSeq) {
+      continue;
+    }
+
+    if (delta.seq === appliedSeq + 1) {
+      rows = applyServerMessage(rows, delta);
+      appliedSeq = delta.seq;
+    } else {
+      pendingDeltas.push(delta);
+    }
+  }
+
+  return { rows, pendingDeltas, lastAppliedSeq: appliedSeq };
+};
+
 export function useTableWebSocket(
   tableName: string,
   wsUrl: string = getDefaultWebSocketUrl()
@@ -185,9 +215,10 @@ export function useTableWebSocket(
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
-  // Seq of the snapshot we are currently merging against (null until the first
-  // TableData on this connection), plus deltas that arrived before it.
-  const snapshotSeqRef = useRef<number | null>(null);
+  const dataRef = useRef<TableRecord[]>([]);
+  // Last server sequence reflected in `data` (null until first TableData on
+  // this connection), plus deltas that arrived before a contiguous baseline.
+  const lastAppliedSeqRef = useRef<number | null>(null);
   const pendingDeltasRef = useRef<DeltaMessage[]>([]);
 
   useEffect(() => {
@@ -217,7 +248,7 @@ export function useTableWebSocket(
 
         // A fresh connection means a fresh snapshot is on the way; discard the
         // seq cutoff and any buffered deltas from the previous connection.
-        snapshotSeqRef.current = null;
+        lastAppliedSeqRef.current = null;
         pendingDeltasRef.current = [];
 
         sendSocketMessage(socket, { type: 'Subscribe', table_name: tableName });
@@ -236,34 +267,41 @@ export function useTableWebSocket(
         switch (message.type) {
           case 'TableData': {
             setColumns(message.columns);
-            const snapshotSeq = message.seq;
-            snapshotSeqRef.current = snapshotSeq;
-            // Replay deltas that raced ahead of the snapshot, keeping only those
-            // newer than it — older ones are already reflected in the snapshot.
+            // Replay deltas that raced ahead of the snapshot, keeping only a
+            // contiguous sequence newer than it. Older/duplicate deltas are
+            // already reflected in the snapshot and are dropped.
             const buffered = pendingDeltasRef.current;
             pendingDeltasRef.current = [];
-            setData(() => {
-              let rows = message.rows.map(toTableRecord);
-              for (const delta of buffered) {
-                if (delta.seq > snapshotSeq) {
-                  rows = applyServerMessage(rows, delta);
-                }
-              }
-              return rows;
-            });
+            const replay = applyBufferedDeltasInSequence(
+              message.rows.map(toTableRecord),
+              buffered,
+              message.seq
+            );
+            pendingDeltasRef.current = replay.pendingDeltas;
+            lastAppliedSeqRef.current = replay.lastAppliedSeq;
+            dataRef.current = replay.rows;
+            setData(replay.rows);
             break;
           }
           case 'RowInserted':
           case 'CellUpdated':
           case 'RowDeleted': {
-            const snapshotSeq = snapshotSeqRef.current;
-            if (snapshotSeq === null) {
+            const lastAppliedSeq = lastAppliedSeqRef.current;
+            if (lastAppliedSeq === null) {
               // No baseline yet — buffer until the snapshot defines the cutoff.
               pendingDeltasRef.current.push(message);
-            } else if (message.seq > snapshotSeq) {
-              setData((previousRows) => applyServerMessage(previousRows, message));
+            } else {
+              pendingDeltasRef.current.push(message);
+              const replay = applyBufferedDeltasInSequence(
+                dataRef.current,
+                pendingDeltasRef.current,
+                lastAppliedSeq
+              );
+              pendingDeltasRef.current = replay.pendingDeltas;
+              lastAppliedSeqRef.current = replay.lastAppliedSeq;
+              dataRef.current = replay.rows;
+              setData(replay.rows);
             }
-            // else: already reflected in the snapshot — drop it.
             break;
           }
           case 'Subscribed':

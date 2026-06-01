@@ -95,7 +95,7 @@ npm run build
 - FilterView (basic filters, null handling)
 - ProjectionView (column selection)
 - ComputedView (dynamic columns)
-- JoinView (LEFT and INNER joins)
+- JoinView (LEFT, INNER, RIGHT, and FULL joins)
 - View chaining (filter + project, filter + compute)
 
 **test_bindings.py** - Legacy comprehensive test
@@ -132,16 +132,18 @@ Located in Rust source files with `#[cfg(test)]` modules:
 ✅ FilterView with Python lambdas
 ✅ ProjectionView (column selection)
 ✅ ComputedView (dynamic columns)
-✅ JoinView (LEFT and INNER joins)
+✅ JoinView (LEFT, INNER, RIGHT, FULL, composite keys, incremental sync)
+✅ SortedView and AggregateView incremental propagation
+✅ `tick()` view registration and changeset compaction
 ✅ View chaining
-✅ WebSocket row mutation semantics
+✅ WebSocket row mutation semantics and snapshot/delta sequencing
 ✅ Real-world workflows
 ✅ Performance with 1000+ rows
 
 ### What's NOT Tested (Yet)
 
 ⚠️ Full browser E2E coverage across real sockets and tabs
-⚠️ Multi-client race conditions at browser level
+⚠️ Multi-client race conditions in a real browser/runtime, beyond hook-level fake socket tests
 ⚠️ Memory stress tests
 ⚠️ Performance regression thresholds in CI
 

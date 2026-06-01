@@ -242,4 +242,90 @@ describe('useTableWebSocket', () => {
     expect(rows.filter((row) => row.rowId === 77)).toHaveLength(1); // newer, replayed
     expect(rows).toHaveLength(4);
   });
+
+  it('drops duplicate deltas after a snapshot', async () => {
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+      socket.receive({
+        type: 'TableData',
+        table_name: 'demo',
+        seq: 10,
+        columns: ['id', 'name', 'value'],
+        rows: [
+          { row_id: 11, row: { id: 1, name: 'Alice', value: 100 } },
+        ],
+      });
+    });
+
+    const insert = {
+      type: 'RowInserted' as const,
+      table_name: 'demo',
+      seq: 11,
+      index: 1,
+      row_id: 22,
+      row: { id: 2, name: 'Bob', value: 200 },
+    };
+
+    await act(async () => {
+      socket.receive(insert);
+      socket.receive(insert);
+    });
+
+    const rendered = screen.getByTestId('client-rows').textContent ?? '[]';
+    const rows = JSON.parse(rendered) as { rowId: number }[];
+
+    expect(rows.filter((row) => row.rowId === 22)).toHaveLength(1);
+    expect(rows).toHaveLength(2);
+  });
+
+  it('buffers out-of-order post-snapshot deltas until contiguous', async () => {
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+      socket.receive({
+        type: 'TableData',
+        table_name: 'demo',
+        seq: 20,
+        columns: ['id', 'name', 'value'],
+        rows: [
+          { row_id: 11, row: { id: 1, name: 'Alice', value: 100 } },
+        ],
+      });
+    });
+
+    await act(async () => {
+      socket.receive({
+        type: 'RowInserted',
+        table_name: 'demo',
+        seq: 22,
+        index: 2,
+        row_id: 33,
+        row: { id: 3, name: 'Carol', value: 300 },
+      });
+    });
+
+    let rendered = screen.getByTestId('client-rows').textContent ?? '[]';
+    let rows = JSON.parse(rendered) as { rowId: number }[];
+    expect(rows.map((row) => row.rowId)).toEqual([11]);
+
+    await act(async () => {
+      socket.receive({
+        type: 'RowInserted',
+        table_name: 'demo',
+        seq: 21,
+        index: 1,
+        row_id: 22,
+        row: { id: 2, name: 'Bob', value: 200 },
+      });
+    });
+
+    rendered = screen.getByTestId('client-rows').textContent ?? '[]';
+    rows = JSON.parse(rendered) as { rowId: number }[];
+    expect(rows.map((row) => row.rowId)).toEqual([11, 22, 33]);
+  });
 });

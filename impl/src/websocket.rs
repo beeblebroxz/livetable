@@ -229,6 +229,7 @@ impl AppState {
         let converted_row = convert_row_for_schema(table_state.table.schema(), &row)?;
         let (index, row_id, json_row) = table_state.insert_row(converted_row)?;
         let seq = table_state.table.changeset().total_len() as u64;
+        table_state.table.clear_changeset();
 
         Ok(ServerMessage::RowInserted {
             table_name: table_name.to_string(),
@@ -264,6 +265,7 @@ impl AppState {
             .map_err(|e| format!("Column '{}': {}", column, e))?;
         let json_value = table_state.update_cell(row_id, column, col_value)?;
         let seq = table_state.table.changeset().total_len() as u64;
+        table_state.table.clear_changeset();
 
         Ok(ServerMessage::CellUpdated {
             table_name: table_name.to_string(),
@@ -281,6 +283,7 @@ impl AppState {
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         table_state.delete_row(row_id)?;
         let seq = table_state.table.changeset().total_len() as u64;
+        table_state.table.clear_changeset();
 
         Ok(ServerMessage::RowDeleted {
             table_name: table_name.to_string(),
@@ -797,33 +800,39 @@ mod tests {
                 ]),
             )
             .expect("insert should succeed");
-        let inserted_row_id = match insert_response {
-            ServerMessage::RowInserted { index, row_id, .. } => {
+        let (insert_seq, inserted_row_id) = match insert_response {
+            ServerMessage::RowInserted {
+                seq, index, row_id, ..
+            } => {
                 assert_eq!(index, 2);
-                row_id
+                (seq, row_id)
             }
             _ => panic!("expected row inserted response"),
         };
+        assert_eq!(insert_seq, 3);
         assert_eq!(inserted_row_id, 3);
 
         let update_response = state
             .update_cell("demo", 2, "amount", &json!(250.5))
             .expect("update should succeed");
-        assert!(matches!(
-            update_response,
-            ServerMessage::CellUpdated { row_id: 2, .. }
-        ));
+        let update_seq = match update_response {
+            ServerMessage::CellUpdated { seq, row_id: 2, .. } => seq,
+            _ => panic!("expected row updated response"),
+        };
+        assert_eq!(update_seq, 4);
 
         let delete_response = state.delete_row("demo", 1).expect("delete should succeed");
-        assert!(matches!(
-            delete_response,
-            ServerMessage::RowDeleted { row_id: 1, .. }
-        ));
+        let delete_seq = match delete_response {
+            ServerMessage::RowDeleted { seq, row_id: 1, .. } => seq,
+            _ => panic!("expected row deleted response"),
+        };
+        assert_eq!(delete_seq, 5);
 
         let tables = state.tables.lock().unwrap();
         let demo = tables.get("demo").expect("demo table should exist");
         assert_eq!(demo.table.len(), 2);
-        assert_eq!(demo.table.changeset().len(), 3);
+        assert_eq!(demo.table.changeset().len(), 0);
+        assert_eq!(demo.table.changeset().total_len(), delete_seq as usize);
         assert_eq!(demo.row_ids, vec![2, 3]);
         assert_eq!(
             demo.table.get_value(0, "region").unwrap(),
@@ -935,10 +944,10 @@ mod tests {
         // client's `Query` snapshot is taken, the SAME row_id is present in BOTH
         // the broadcast `RowInserted` AND the `TableData` snapshot.
         //
-        // The wire protocol carries no sequence number to reconcile the overlap,
-        // so whether the client ends up with a duplicate row depends solely on
-        // actix's (unspecified) stream-vs-mailbox delivery order. This documents
-        // that the dual-channel overlap is real at the server boundary.
+        // The wire protocol carries `seq` to reconcile this overlap. This test
+        // documents that the dual-channel overlap is real at the server
+        // boundary, so clients must use `seq` rather than row_id guesses or
+        // delivery order to merge snapshot and delta streams.
         let state = AppState::new();
 
         let broadcast = state
@@ -962,18 +971,72 @@ mod tests {
             panic!("expected TableData");
         };
 
-        let occurrences = rows
-            .iter()
-            .filter(|r| r.row_id == broadcast_row_id)
-            .count();
+        let occurrences = rows.iter().filter(|r| r.row_id == broadcast_row_id).count();
 
         // The broadcast row_id appears in the snapshot. In the live system the
         // client ALSO receives the broadcast `RowInserted` for this same row_id:
-        // two channels carry the same row, with no sequence tag to dedupe them.
+        // two channels carry the same row, reconciled by `seq`.
         assert_eq!(
             occurrences, 1,
             "row {} from the RowInserted broadcast is also present in the snapshot",
             broadcast_row_id
         );
+    }
+
+    #[test]
+    fn test_app_state_clears_retained_changes_but_preserves_seq() {
+        let state = AppState::new();
+
+        let insert = state
+            .insert_row(
+                "demo",
+                HashMap::from([
+                    ("region".to_string(), json!("North")),
+                    ("product".to_string(), json!("Premium")),
+                    ("amount".to_string(), json!(300.25)),
+                ]),
+            )
+            .expect("insert should succeed");
+
+        let (insert_seq, row_id) = match insert {
+            ServerMessage::RowInserted { seq, row_id, .. } => (seq, row_id),
+            other => panic!("expected RowInserted, got {:?}", other),
+        };
+
+        {
+            let tables = lock_unpoisoned(&state.tables);
+            let demo = tables.get("demo").expect("demo table should exist");
+            assert_eq!(demo.table.changeset().len(), 0);
+            assert_eq!(demo.table.changeset().total_len(), insert_seq as usize);
+        }
+
+        let update = state
+            .update_cell("demo", row_id, "amount", &json!(450.0))
+            .expect("update should succeed");
+        let update_seq = match update {
+            ServerMessage::CellUpdated { seq, .. } => seq,
+            other => panic!("expected CellUpdated, got {:?}", other),
+        };
+
+        assert_eq!(update_seq, insert_seq + 1);
+        let snapshot = state.query_table("demo").expect("query should succeed");
+        let ServerMessage::TableData { seq, .. } = snapshot else {
+            panic!("expected TableData");
+        };
+        assert_eq!(seq, update_seq);
+
+        let delete = state
+            .delete_row("demo", row_id)
+            .expect("delete should succeed");
+        let delete_seq = match delete {
+            ServerMessage::RowDeleted { seq, .. } => seq,
+            other => panic!("expected RowDeleted, got {:?}", other),
+        };
+
+        assert_eq!(delete_seq, update_seq + 1);
+        let tables = lock_unpoisoned(&state.tables);
+        let demo = tables.get("demo").expect("demo table should exist");
+        assert_eq!(demo.table.changeset().len(), 0);
+        assert_eq!(demo.table.changeset().total_len(), delete_seq as usize);
     }
 }
