@@ -235,9 +235,7 @@ pub fn apply_filter_row_inserted(
     index: usize,
     predicate_matched: bool,
 ) -> bool {
-    let is_tail = view_to_parent
-        .last()
-        .is_none_or(|&last_p| last_p < index);
+    let is_tail = view_to_parent.last().is_none_or(|&last_p| last_p < index);
 
     if !is_tail {
         IndexAdjuster::adjust_mapping_for_insert(view_to_parent, index);
@@ -260,10 +258,7 @@ pub fn apply_filter_row_inserted(
 ///
 /// Indices > `index` are shifted by -1; an entry exactly equal to `index`
 /// (if present) is removed. Returns whether `view_to_parent` was modified.
-pub fn apply_filter_row_deleted(
-    view_to_parent: &mut Vec<usize>,
-    index: usize,
-) -> bool {
+pub fn apply_filter_row_deleted(view_to_parent: &mut Vec<usize>, index: usize) -> bool {
     let to_remove = IndexAdjuster::adjust_mapping_for_delete(view_to_parent, index);
     if to_remove.is_empty() {
         return false;

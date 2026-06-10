@@ -633,11 +633,15 @@ mod tests {
         );
 
         // Add some repeated strings
-        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap();
         col.append(ColumnValue::String("Bob".to_string())).unwrap();
-        col.append(ColumnValue::String("Alice".to_string())).unwrap(); // Duplicate
-        col.append(ColumnValue::String("Charlie".to_string())).unwrap();
-        col.append(ColumnValue::String("Alice".to_string())).unwrap(); // Another duplicate
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap(); // Duplicate
+        col.append(ColumnValue::String("Charlie".to_string()))
+            .unwrap();
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap(); // Another duplicate
 
         // Verify we can read values back
         assert_eq!(col.get(0).unwrap().as_string(), Some("Alice"));
@@ -668,8 +672,10 @@ mod tests {
             Some(interner.clone()),
         );
 
-        col.append(ColumnValue::String("Alice".to_string())).unwrap();
-        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap();
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap();
 
         // Update one "Alice" to "Bob"
         col.set(1, ColumnValue::String("Bob".to_string())).unwrap();
@@ -694,9 +700,11 @@ mod tests {
             Some(interner.clone()),
         );
 
-        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap();
         col.append(ColumnValue::String("Bob".to_string())).unwrap();
-        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap();
 
         // Delete the only "Bob"
         let deleted = col.delete(1).unwrap();
@@ -721,8 +729,10 @@ mod tests {
             Some(interner.clone()),
         );
 
-        col.append(ColumnValue::String("Alice".to_string())).unwrap();
-        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap();
+        col.append(ColumnValue::String("Alice".to_string()))
+            .unwrap();
         col.append(ColumnValue::String("Bob".to_string())).unwrap();
         assert_eq!(interner.lock().unwrap().len(), 2);
 
