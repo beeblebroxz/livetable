@@ -7,6 +7,7 @@ pub mod interner;
 /// A high-performance columnar table system with reactive views and incremental updates.
 /// This implementation demonstrates high-performance tabular data structures with
 /// strong type safety and zero-cost abstractions.
+pub mod readable;
 pub mod sequence;
 pub mod table;
 pub mod view;
@@ -14,6 +15,7 @@ pub mod view;
 pub use changeset::{Changeset, IncrementalView, IndexAdjuster, TableChange};
 pub use column::{Column, ColumnType, ColumnValue};
 pub use interner::{InternerStats, StringId, StringInterner};
+pub use readable::ReadableTable;
 pub use sequence::{ArraySequence, Sequence, TieredVectorSequence};
 pub use table::{Schema, StorageHint, Table};
 pub use view::{

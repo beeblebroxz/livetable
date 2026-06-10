@@ -390,6 +390,42 @@ print(sorted_view[0]["amount"])  # 1500 (new top seller)
 
 **Note:** Views created with explicit constructors (e.g., `FilterView(table, predicate)`) are NOT auto-registered. Use the simplified API methods on the table for automatic registration.
 
+### ✅ View Composition (Views over Views)
+
+Views can derive from other views, forming a DAG over root tables. A
+`FilterView` exposes `sort()` and `group_by()` that chain on the filtered
+rows; chained views are auto-registered on the root table, so one `tick()`
+propagates the whole chain (parents sync before children):
+
+```python
+table = livetable.Table("sales", schema)
+table.append_rows([
+    {"region": "N", "amount": 50.0},
+    {"region": "S", "amount": 150.0},
+    {"region": "N", "amount": 300.0},
+])
+
+big = table.filter(lambda row: row["amount"] >= 100)
+ranked = big.sort("amount", descending=True)   # SortedView over the filter
+by_region = big.group_by("region", agg=[("total", "amount", "sum")])
+
+table.append_row({"region": "S", "amount": 900.0})
+table.tick()
+
+print([row["amount"] for row in ranked])       # [900.0, 300.0, 150.0]
+print({row["region"]: row["total"] for row in by_region})  # {'S': 1050.0, 'N': 300.0}
+```
+
+`sort()` accepts the same arguments as `table.sort()` (single column or list,
+`descending=` bool or list); `group_by()` accepts the same aggregation specs
+as `table.group_by()`.
+
+At the Rust level composition is fully general: every view type implements
+the `ReadableTable` trait and can parent any other view (e.g., a `JoinView`
+whose left side is a `FilterView`). Children of root tables update
+incrementally from the changeset; children of views refresh via cheap
+version checks when their parent has changed.
+
 ### ✅ Serialization (CSV/JSON)
 
 Export and import tables in CSV and JSON formats:

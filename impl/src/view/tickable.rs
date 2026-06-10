@@ -1,4 +1,13 @@
 //! TickableTable — pairs a table with a view registry for auto-tick propagation.
+//!
+//! `TickableTable` adds the registry WITHOUT adding state to `Table` itself —
+//! `Table` stays `Send` so the WebSocket server feature still works (it
+//! shares tables across threads via `Arc<Mutex<...>>`). Views are registered
+//! in creation order, which is topological for view-over-view chains: a
+//! chained view registered after its parent always syncs after it.
+//!
+//! Chained views (view parents, no changeset) report `usize::MAX` as their
+//! cursor — neutral in the min-cursor compaction fold below.
 
 use crate::table::Table;
 use std::cell::RefCell;

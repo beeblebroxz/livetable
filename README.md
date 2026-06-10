@@ -129,6 +129,22 @@ for row in table:     # Iteration
 
 Views created with simplified API are auto-registered. Call `table.tick()` to propagate changes to all registered views at once.
 
+### View Composition (Views over Views)
+Views can derive from other views, forming a DAG over root tables:
+
+```python
+big = table.filter(lambda row: row["amount"] >= 100)
+ranked = big.sort("amount", descending=True)          # sort the filtered rows
+by_region = big.group_by("region", agg=[("total", "amount", "sum")])
+
+table.append_row({"region": "S", "amount": 900.0})
+table.tick()   # root -> filter -> sorted/grouped, all updated in one call
+```
+
+In Rust, any view can parent any other view — every view implements the
+`ReadableTable` trait (`FilterView`, `SortedView`, `AggregateView`, `JoinView`,
+`ProjectionView`, `ComputedView`, and `Table` itself).
+
 ### Filtering
 ```python
 # Lambda filter
@@ -319,8 +335,9 @@ livetable/
 │   │   ├── table.rs            # Table, Schema, storage hints
 │   │   ├── column.rs           # Column types and values
 │   │   ├── sequence.rs         # Storage backends (Array / TieredVector)
-│   │   ├── view.rs             # FilterView, JoinView, SortedView, etc.
-│   │   ├── view/               # AggregateView support types
+│   │   ├── readable.rs         # ReadableTable trait (view composition)
+│   │   ├── view.rs             # View module root + shared join-key types
+│   │   ├── view/               # One file per view type + tests
 │   │   ├── changeset.rs        # Incremental change tracking
 │   │   ├── expr.rs             # Expression parser for filter_expr()
 │   │   ├── interner.rs         # String interning engine

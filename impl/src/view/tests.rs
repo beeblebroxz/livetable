@@ -1,4 +1,3 @@
-
 use super::aggregate_support::ColumnAggState;
 use super::*;
 use crate::column::ColumnType;
@@ -4178,4 +4177,264 @@ fn test_aggregate_group_key_nan_single_group_distinct_from_null() {
     }
     assert!((nan_total.unwrap() - 3.0).abs() < 1e-9);
     assert!((null_total.unwrap() - 5.0).abs() < 1e-9);
+}
+
+// === ReadableTable composition: views over views ===
+
+fn make_sales() -> Rc<RefCell<Table>> {
+    let schema = Schema::new(vec![
+        ("region".to_string(), ColumnType::String, false),
+        ("amount".to_string(), ColumnType::Float64, false),
+    ]);
+    let t = Rc::new(RefCell::new(Table::new("sales".to_string(), schema)));
+    for (r, a) in [
+        ("N", 50.0),
+        ("S", 150.0),
+        ("N", 300.0),
+        ("S", 80.0),
+        ("N", 120.0),
+    ] {
+        t.borrow_mut().append_row(sales_row(r, a)).unwrap();
+    }
+    t
+}
+
+fn sales_row(region: &str, amount: f64) -> HashMap<String, ColumnValue> {
+    HashMap::from([
+        (
+            "region".to_string(),
+            ColumnValue::String(region.to_string()),
+        ),
+        ("amount".to_string(), ColumnValue::Float64(amount)),
+    ])
+}
+
+fn big_amount(row: &HashMap<String, ColumnValue>) -> bool {
+    matches!(row.get("amount"), Some(ColumnValue::Float64(a)) if *a >= 100.0)
+}
+
+#[test]
+fn test_filter_then_sort_composition() {
+    let table = make_sales();
+    let filter = Rc::new(RefCell::new(FilterView::new(
+        "big".to_string(),
+        table.clone(),
+        big_amount,
+    )));
+    let mut sorted = SortedView::new(
+        "big_sorted".to_string(),
+        filter.clone(),
+        vec![SortKey::descending("amount")],
+    )
+    .unwrap();
+
+    let amounts = |s: &SortedView| -> Vec<f64> {
+        (0..s.len())
+            .map(|i| s.get_value(i, "amount").unwrap().as_f64().unwrap())
+            .collect()
+    };
+    assert_eq!(amounts(&sorted), vec![300.0, 150.0, 120.0]);
+
+    // Mutate the ROOT: one qualifying row, one not.
+    table
+        .borrow_mut()
+        .append_row(sales_row("S", 500.0))
+        .unwrap();
+    table.borrow_mut().append_row(sales_row("N", 10.0)).unwrap();
+    filter.borrow_mut().sync();
+    assert!(sorted.sync());
+    assert_eq!(amounts(&sorted), vec![500.0, 300.0, 150.0, 120.0]);
+
+    // Nothing new: child sync must be a no-op.
+    assert!(!sorted.sync());
+}
+
+#[test]
+fn test_sort_then_filter_composition() {
+    let table = make_sales();
+    let sorted = Rc::new(RefCell::new(
+        SortedView::new(
+            "by_amount".to_string(),
+            table.clone(),
+            vec![SortKey::ascending("amount")],
+        )
+        .unwrap(),
+    ));
+    let mut filter = FilterView::new(
+        "cheap".to_string(),
+        sorted.clone(),
+        |row| matches!(row.get("amount"), Some(ColumnValue::Float64(a)) if *a < 200.0),
+    );
+
+    let amounts = |f: &FilterView| -> Vec<f64> {
+        (0..f.len())
+            .map(|i| f.get_value(i, "amount").unwrap().as_f64().unwrap())
+            .collect()
+    };
+    // Ascending [50, 80, 120, 150, 300] filtered <200 keeps sorted order.
+    assert_eq!(amounts(&filter), vec![50.0, 80.0, 120.0, 150.0]);
+
+    table.borrow_mut().append_row(sales_row("N", 60.0)).unwrap();
+    sorted.borrow_mut().sync();
+    assert!(filter.sync());
+    assert_eq!(amounts(&filter), vec![50.0, 60.0, 80.0, 120.0, 150.0]);
+}
+
+#[test]
+fn test_filter_then_group_by_composition() {
+    let table = make_sales();
+    let filter = Rc::new(RefCell::new(FilterView::new(
+        "big".to_string(),
+        table.clone(),
+        big_amount,
+    )));
+    let mut agg = AggregateView::new(
+        "by_region".to_string(),
+        filter.clone(),
+        vec!["region".to_string()],
+        vec![(
+            "total".to_string(),
+            "amount".to_string(),
+            AggregateFunction::Sum,
+        )],
+    )
+    .unwrap();
+
+    let totals = |a: &AggregateView| -> HashMap<String, f64> {
+        (0..a.len())
+            .map(|i| {
+                let row = a.get_row(i).unwrap();
+                (
+                    row.get("region").unwrap().as_string().unwrap().to_string(),
+                    row.get("total").unwrap().as_f64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    // Filtered (>=100): S 150, N 300, N 120.
+    let t = totals(&agg);
+    assert_eq!(t["N"], 420.0);
+    assert_eq!(t["S"], 150.0);
+
+    table
+        .borrow_mut()
+        .append_row(sales_row("S", 200.0))
+        .unwrap();
+    filter.borrow_mut().sync();
+    assert!(agg.sync());
+    let t = totals(&agg);
+    assert_eq!(t["N"], 420.0);
+    assert_eq!(t["S"], 350.0);
+}
+
+#[test]
+fn test_filter_then_filter_composition() {
+    let table = make_sales();
+    let big = Rc::new(RefCell::new(FilterView::new(
+        "big".to_string(),
+        table.clone(),
+        big_amount,
+    )));
+    let mut north_big = FilterView::new(
+        "north_big".to_string(),
+        big.clone(),
+        |row| matches!(row.get("region"), Some(ColumnValue::String(r)) if r == "N"),
+    );
+
+    // big: [S 150, N 300, N 120] -> north: [300, 120]
+    assert_eq!(north_big.len(), 2);
+
+    table
+        .borrow_mut()
+        .append_row(sales_row("N", 700.0))
+        .unwrap();
+    big.borrow_mut().sync();
+    assert!(north_big.sync());
+    assert_eq!(north_big.len(), 3);
+    assert_eq!(
+        north_big.get_value(2, "amount").unwrap().as_f64().unwrap(),
+        700.0
+    );
+}
+
+#[test]
+fn test_join_with_view_parent() {
+    let table = make_sales();
+    let filter = Rc::new(RefCell::new(FilterView::new(
+        "big".to_string(),
+        table.clone(),
+        big_amount,
+    )));
+
+    let target_schema = Schema::new(vec![
+        ("region".to_string(), ColumnType::String, false),
+        ("target".to_string(), ColumnType::Float64, false),
+    ]);
+    let targets = Rc::new(RefCell::new(Table::new(
+        "targets".to_string(),
+        target_schema,
+    )));
+    targets
+        .borrow_mut()
+        .append_row(HashMap::from([
+            ("region".to_string(), ColumnValue::String("N".to_string())),
+            ("target".to_string(), ColumnValue::Float64(1000.0)),
+        ]))
+        .unwrap();
+
+    let mut join = JoinView::new(
+        "j".to_string(),
+        filter.clone(),
+        targets.clone(),
+        "region".to_string(),
+        "region".to_string(),
+        JoinType::Inner,
+    )
+    .unwrap();
+
+    // Filtered big rows in N: 300 and 120 -> 2 join rows.
+    assert_eq!(join.len(), 2);
+
+    table
+        .borrow_mut()
+        .append_row(sales_row("N", 800.0))
+        .unwrap();
+    filter.borrow_mut().sync();
+    assert!(join.sync());
+    assert_eq!(join.len(), 3);
+    assert!(!join.sync());
+}
+
+#[test]
+fn test_tickable_propagates_through_view_chain() {
+    let table = make_sales();
+    let tickable = TickableTable::new(table.clone());
+
+    let filter = Rc::new(RefCell::new(FilterView::new(
+        "big".to_string(),
+        table.clone(),
+        big_amount,
+    )));
+    let sorted = Rc::new(RefCell::new(
+        SortedView::new(
+            "big_sorted".to_string(),
+            filter.clone(),
+            vec![SortKey::descending("amount")],
+        )
+        .unwrap(),
+    ));
+    // Registration order is creation order = topological order.
+    tickable.register_filter(&filter);
+    tickable.register_sorted(&sorted);
+
+    table
+        .borrow_mut()
+        .append_row(sales_row("S", 900.0))
+        .unwrap();
+    assert!(tickable.tick() >= 1);
+
+    assert_eq!(filter.borrow().len(), 4);
+    let s = sorted.borrow();
+    assert_eq!(s.len(), 4);
+    assert_eq!(s.get_value(0, "amount").unwrap().as_f64().unwrap(), 900.0);
 }

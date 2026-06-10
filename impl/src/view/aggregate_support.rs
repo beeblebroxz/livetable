@@ -6,7 +6,7 @@
 
 use super::JoinKeyPart;
 use crate::column::ColumnValue;
-use crate::table::Table;
+use crate::readable::ReadableTable;
 use std::collections::{HashMap, HashSet};
 
 /// Supported aggregation functions
@@ -242,7 +242,11 @@ impl GroupKey {
     }
 
     /// Build GroupKey directly from table using column indices (faster than from_row)
-    pub(super) fn from_indices(table: &Table, row_idx: usize, col_indices: &[usize]) -> Self {
+    pub(super) fn from_indices(
+        table: &dyn ReadableTable,
+        row_idx: usize,
+        col_indices: &[usize],
+    ) -> Self {
         GroupKey(
             col_indices
                 .iter()

@@ -1,8 +1,8 @@
 //! SortedView — multi-key sorted view with incremental re-sort.
 
 use crate::changeset::{IncrementalView, TableChange};
-use crate::column::ColumnValue;
-use crate::table::Table;
+use crate::column::{ColumnType, ColumnValue};
+use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -110,17 +110,33 @@ impl SortKey {
 /// // First row should be Alice (score 92)
 /// assert_eq!(sorted.get_value(0, "name").unwrap().as_string(), Some("Alice"));
 /// ```
-#[derive(Debug)]
+// Manual Debug: the dyn ReadableTable parent prevents derive.
+impl std::fmt::Debug for SortedView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SortedView")
+            .field("name", &self.name)
+            .field("sort_keys", &self.sort_keys)
+            .field("len", &self.sorted_index.len())
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct SortedView {
     name: String,
-    parent: Rc<RefCell<Table>>,
+    parent: Rc<RefCell<dyn ReadableTable>>,
     sort_keys: Vec<SortKey>,
     /// Sorted index: sorted_index[view_pos] = parent_row_index
     sorted_index: Vec<usize>,
-    /// Last synced generation from parent's changeset
+    /// Last synced generation from parent's changeset (root-table parents)
     last_synced_generation: u64,
-    /// Number of changes already processed (absolute index)
+    /// Number of changes already processed (absolute index). `usize::MAX`
+    /// when the parent is a view (no changeset) — a "not cursor-tracked"
+    /// sentinel that keeps tick()'s min-cursor compaction folds correct.
     last_processed_change_count: usize,
+    /// Own sync counter; the visible version() adds the parent's version.
+    sync_count: u64,
+    /// Parent version() observed at the last sync/rebuild.
+    last_parent_version: u64,
 }
 
 impl SortedView {
@@ -137,14 +153,14 @@ impl SortedView {
     /// Result containing the SortedView or an error if columns don't exist
     pub fn new(
         name: String,
-        parent: Rc<RefCell<Table>>,
+        parent: Rc<RefCell<dyn ReadableTable>>,
         sort_keys: Vec<SortKey>,
     ) -> Result<Self, String> {
         // Validate sort keys exist
         {
             let table = parent.borrow();
             for key in &sort_keys {
-                if table.schema().get_column_index(&key.column).is_none() {
+                if table.column_index(&key.column).is_none() {
                     return Err(format!("Sort column '{}' not found in table", key.column));
                 }
             }
@@ -154,8 +170,14 @@ impl SortedView {
             return Err("At least one sort key is required".to_string());
         }
 
-        let generation = parent.borrow().changeset_generation();
-        let change_count = parent.borrow().changeset().total_len();
+        let (generation, change_count, parent_version) = {
+            let p = parent.borrow();
+            let (g, c) = match p.changeset() {
+                Some(cs) => (cs.generation(), cs.total_len()),
+                None => (0, usize::MAX),
+            };
+            (g, c, p.version())
+        };
         let mut view = SortedView {
             name,
             parent,
@@ -163,6 +185,8 @@ impl SortedView {
             sorted_index: Vec::new(),
             last_synced_generation: generation,
             last_processed_change_count: change_count,
+            sync_count: 0,
+            last_parent_version: parent_version,
         };
         view.rebuild_index();
         Ok(view)
@@ -180,7 +204,7 @@ impl SortedView {
         let sort_keys = self.sort_keys.clone();
         let sort_col_indices: Vec<usize> = sort_keys
             .iter()
-            .filter_map(|key| table.schema().get_column_index(&key.column))
+            .filter_map(|key| table.column_index(&key.column))
             .collect();
 
         // Pre-extract values for each sort key column
@@ -211,8 +235,15 @@ impl SortedView {
             Ordering::Equal
         });
 
-        self.last_synced_generation = table.changeset_generation();
-        self.last_processed_change_count = table.changeset().total_len();
+        if let Some(cs) = table.changeset() {
+            self.last_synced_generation = cs.generation();
+            self.last_processed_change_count = cs.total_len();
+        } else {
+            self.last_processed_change_count = usize::MAX;
+        }
+        self.last_parent_version = table.version();
+        drop(table);
+        self.sync_count += 1;
     }
 
     /// Compare two ColumnValues by reference under a sort key.
@@ -370,10 +401,17 @@ impl SortedView {
     /// Returns true if any changes were applied
     pub fn sync(&mut self) -> bool {
         let parent = self.parent.borrow();
-        let changes = match parent
-            .changeset()
-            .changes_from(self.last_processed_change_count)
-        {
+        let Some(changeset) = parent.changeset() else {
+            // View parent: version-checked refresh fallback.
+            let stale = parent.version() != self.last_parent_version;
+            drop(parent);
+            if !stale {
+                return false;
+            }
+            self.rebuild_index();
+            return true;
+        };
+        let changes = match changeset.changes_from(self.last_processed_change_count) {
             Some(changes) => changes,
             None => {
                 drop(parent);
@@ -390,8 +428,13 @@ impl SortedView {
         drop(parent);
         let modified = self.apply_changes(&changes);
         let parent = self.parent.borrow();
-        self.last_processed_change_count = parent.changeset().total_len();
-        self.last_synced_generation = parent.changeset_generation();
+        if let Some(cs) = parent.changeset() {
+            self.last_processed_change_count = cs.total_len();
+            self.last_synced_generation = cs.generation();
+        }
+        self.last_parent_version = parent.version();
+        drop(parent);
+        self.sync_count += 1;
         modified
     }
 
@@ -481,5 +524,45 @@ impl IncrementalView for SortedView {
 
     fn rebuild(&mut self) {
         self.rebuild_index();
+    }
+}
+
+impl ReadableTable for SortedView {
+    fn len(&self) -> usize {
+        self.sorted_index.len()
+    }
+
+    fn column_names(&self) -> Vec<String> {
+        self.parent.borrow().column_names()
+    }
+
+    fn column_index(&self, name: &str) -> Option<usize> {
+        self.parent.borrow().column_index(name)
+    }
+
+    fn column_type(&self, col_idx: usize) -> Option<ColumnType> {
+        self.parent.borrow().column_type(col_idx)
+    }
+
+    fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String> {
+        SortedView::get_row(self, index)
+    }
+
+    fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
+        SortedView::get_value(self, row, column)
+    }
+
+    fn get_value_by_index(&self, row: usize, col_idx: usize) -> Result<ColumnValue, String> {
+        let parent_index = *self
+            .sorted_index
+            .get(row)
+            .ok_or_else(|| format!("Row {} out of range [0, {})", row, self.sorted_index.len()))?;
+        self.parent
+            .borrow()
+            .get_value_by_index(parent_index, col_idx)
+    }
+
+    fn version(&self) -> u64 {
+        self.sync_count.wrapping_add(self.parent.borrow().version())
     }
 }

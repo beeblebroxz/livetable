@@ -1,8 +1,8 @@
 //! AggregateView — GROUP BY with incrementally maintained aggregates.
 
 use crate::changeset::{IncrementalView, TableChange};
-use crate::column::ColumnValue;
-use crate::table::Table;
+use crate::column::{ColumnType, ColumnValue};
+use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -26,7 +26,7 @@ use super::aggregate_support::{AggregateFunction, GroupKey, GroupState};
 /// ```
 pub struct AggregateView {
     name: String,
-    parent: Rc<RefCell<Table>>,
+    parent: Rc<RefCell<dyn ReadableTable>>,
     group_by_columns: Vec<String>,
     /// (result_column_name, source_column_name, function)
     aggregations: Vec<(String, String, AggregateFunction)>,
@@ -38,16 +38,22 @@ pub struct AggregateView {
     row_to_group: HashMap<usize, GroupKey>,
     /// Whether row_to_group is populated (deferred for fast initial build)
     row_to_group_built: bool,
-    /// Last synced generation from parent's changeset
+    /// Last synced generation from parent's changeset (root-table parents)
     last_synced_generation: u64,
-    /// Number of changes already processed (to skip old changes on sync)
+    /// Number of changes already processed. `usize::MAX` when the parent is
+    /// a view (no changeset) — a "not cursor-tracked" sentinel that keeps
+    /// tick()'s min-cursor compaction folds correct.
     last_processed_change_count: usize,
+    /// Own sync counter; the visible version() adds the parent's version.
+    sync_count: u64,
+    /// Parent version() observed at the last sync/rebuild.
+    last_parent_version: u64,
 }
 
 impl AggregateView {
     pub fn new(
         name: String,
-        parent: Rc<RefCell<Table>>,
+        parent: Rc<RefCell<dyn ReadableTable>>,
         group_by_columns: Vec<String>,
         aggregations: Vec<(String, String, AggregateFunction)>,
     ) -> Result<Self, String> {
@@ -55,13 +61,13 @@ impl AggregateView {
         {
             let p = parent.borrow();
             for col in &group_by_columns {
-                if p.schema().get_column_index(col).is_none() {
+                if p.column_index(col).is_none() {
                     return Err(format!("Group-by column '{}' not found in table", col));
                 }
             }
             // Validate aggregation source columns exist
             for (_, source_col, _) in &aggregations {
-                if p.schema().get_column_index(source_col).is_none() {
+                if p.column_index(source_col).is_none() {
                     return Err(format!(
                         "Aggregation source column '{}' not found in table",
                         source_col
@@ -74,9 +80,13 @@ impl AggregateView {
             return Err("At least one aggregation is required".to_string());
         }
 
-        let (generation, change_count) = {
+        let (generation, change_count, parent_version) = {
             let p = parent.borrow();
-            (p.changeset_generation(), p.changeset().total_len())
+            let (g, c) = match p.changeset() {
+                Some(cs) => (cs.generation(), cs.total_len()),
+                None => (0, usize::MAX),
+            };
+            (g, c, p.version())
         };
         let mut view = AggregateView {
             name,
@@ -89,6 +99,8 @@ impl AggregateView {
             row_to_group_built: false,
             last_synced_generation: generation,
             last_processed_change_count: change_count,
+            sync_count: 0,
+            last_parent_version: parent_version,
         };
         view.rebuild_index();
         Ok(view)
@@ -107,28 +119,26 @@ impl AggregateView {
         let group_col_indices: Vec<usize> = self
             .group_by_columns
             .iter()
-            .filter_map(|name| parent.schema().get_column_index(name))
+            .filter_map(|name| parent.column_index(name))
             .collect();
 
         // Get unique source columns and their indices
         let source_col_info: Vec<(usize, String)> = self
             .unique_source_columns()
             .into_iter()
-            .filter_map(|col| parent.schema().get_column_index(&col).map(|idx| (idx, col)))
+            .filter_map(|col| parent.column_index(&col).map(|idx| (idx, col)))
             .collect();
 
         let num_rows = parent.len();
-        let generation = parent.changeset_generation();
-        let change_count = parent.changeset().total_len();
+        let (generation, change_count) = match parent.changeset() {
+            Some(cs) => (cs.generation(), cs.total_len()),
+            None => (self.last_synced_generation, usize::MAX),
+        };
+        let parent_version = parent.version();
 
         // Check for single-column integer group-by fast path
-        let is_single_int_group = group_col_indices.len() == 1 && {
-            let col_idx = group_col_indices[0];
-            matches!(
-                parent.schema().get_column_info(col_idx),
-                Some((_, crate::column::ColumnType::Int32, _))
-            )
-        };
+        let is_single_int_group = group_col_indices.len() == 1
+            && parent.column_type(group_col_indices[0]) == Some(ColumnType::Int32);
 
         // Check for single-column aggregation on a numeric column
         let single_source_col_idx = if source_col_info.len() == 1 {
@@ -208,7 +218,7 @@ impl AggregateView {
         } else {
             // General case - multi-column or non-int group by
             for row_idx in 0..num_rows {
-                let key = GroupKey::from_indices(&parent, row_idx, &group_col_indices);
+                let key = GroupKey::from_indices(&*parent, row_idx, &group_col_indices);
                 self.row_to_group.insert(row_idx, key.clone());
 
                 let col_values: Vec<(String, f64)> = source_col_info
@@ -244,6 +254,8 @@ impl AggregateView {
 
         self.last_synced_generation = generation;
         self.last_processed_change_count = change_count;
+        self.last_parent_version = parent_version;
+        self.sync_count += 1;
     }
 
     /// Build row_to_group mapping if not already built (lazy initialization)
@@ -388,7 +400,7 @@ impl AggregateView {
         let values: Vec<f64> = {
             let parent = self.parent.borrow();
             // Get column index once for direct access
-            if let Some(col_idx) = parent.schema().get_column_index(source_col) {
+            if let Some(col_idx) = parent.column_index(source_col) {
                 row_indices
                     .iter()
                     .filter_map(|&row_idx| {
@@ -504,10 +516,17 @@ impl AggregateView {
     /// Incrementally sync with parent table's changes
     pub fn sync(&mut self) -> bool {
         let parent = self.parent.borrow();
-        let changes = match parent
-            .changeset()
-            .changes_from(self.last_processed_change_count)
-        {
+        let Some(changeset) = parent.changeset() else {
+            // View parent: version-checked refresh fallback.
+            let stale = parent.version() != self.last_parent_version;
+            drop(parent);
+            if !stale {
+                return false;
+            }
+            self.rebuild_index();
+            return true;
+        };
+        let changes = match changeset.changes_from(self.last_processed_change_count) {
             Some(changes) => changes,
             None => {
                 drop(parent);
@@ -521,7 +540,9 @@ impl AggregateView {
         }
 
         let new_changes: Vec<TableChange> = changes.to_vec();
-        let new_count = parent.changeset().total_len();
+        let new_count = changeset.total_len();
+        let new_generation = changeset.generation();
+        let parent_version = parent.version();
         drop(parent);
 
         // Ensure row_to_group is built before processing changes
@@ -529,7 +550,9 @@ impl AggregateView {
 
         let modified = self.apply_changes(&new_changes);
         self.last_processed_change_count = new_count;
-        self.last_synced_generation = self.parent.borrow().changeset_generation();
+        self.last_synced_generation = new_generation;
+        self.last_parent_version = parent_version;
+        self.sync_count += 1;
         modified
     }
 }
@@ -691,27 +714,24 @@ impl AggregateView {
     }
 }
 
-// =============================================================================
-// Rust-side tick() registry (fix #10)
-//
-// PyTable already exposes `tick()` for Python users by maintaining a private
-// registry of view inner-states keyed by view type. Native Rust callers had
-// to invoke `view.sync()` manually for each view they created.
-//
-// `TickableTable` (below) closes that gap WITHOUT adding state to `Table`
-// itself — `Table` stays `Send` so the WebSocket server feature still works
-// (it shares tables across threads via `Arc<Mutex<...>>`). Users who want
-// auto-propagation construct a `TickableTable` wrapping their `Rc<RefCell<Table>>`.
-//
-// Layout:
-//   - `Table` (in table.rs): pure data + mutation API. Send + Sync-friendly.
-//   - `TickableTable` (here): owns a strong handle to the table AND a
-//     registry of view "syncer" closures. NOT Send (holds `Rc` + `RefCell`),
-//     so single-threaded use only. Mirrors what `PyTable` does internally.
-//
-// Why a wrapper rather than methods on `Rc<RefCell<Table>>`?
-//   - The registry has to live somewhere persistent. Storing on `Table`
-//     would force `Rc<RefCell<...>>` into `Table` and break Send.
-//   - The wrapper lets `Table` stay primitive; users who don't need tick
-//     don't pay any cost.
-// =============================================================================
+impl ReadableTable for AggregateView {
+    fn len(&self) -> usize {
+        self.group_order.len()
+    }
+
+    fn column_names(&self) -> Vec<String> {
+        AggregateView::column_names(self)
+    }
+
+    fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String> {
+        AggregateView::get_row(self, index)
+    }
+
+    fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
+        AggregateView::get_value(self, row, column)
+    }
+
+    fn version(&self) -> u64 {
+        self.sync_count.wrapping_add(self.parent.borrow().version())
+    }
+}

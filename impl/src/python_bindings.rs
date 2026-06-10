@@ -138,6 +138,9 @@ struct PyFilterViewInner {
     indices: Vec<usize>,
     last_synced_generation: u64,
     last_processed_change_count: usize,
+    /// Own sync counter; the visible ReadableTable::version() adds the
+    /// parent table's version (see crate::readable for the protocol).
+    sync_count: u64,
 }
 
 /// Call the user's predicate and translate the cryptic "Already borrowed"
@@ -196,6 +199,7 @@ impl PyFilterViewInner {
 
         self.last_synced_generation = generation;
         self.last_processed_change_count = change_count;
+        self.sync_count += 1;
         Ok(())
     }
 
@@ -271,8 +275,166 @@ impl PyFilterViewInner {
         let table_ref = self.table_inner.borrow();
         self.last_processed_change_count = table_ref.changeset().total_len();
         self.last_synced_generation = table_ref.changeset_generation();
+        drop(table_ref);
+        self.sync_count += 1;
         Ok(modified)
     }
+}
+
+/// Lets chained Rust views (SortedView, AggregateView) read through the
+/// Python-side filter. Reads never call the Python predicate (only sync
+/// does), so no GIL is needed here.
+impl crate::readable::ReadableTable for PyFilterViewInner {
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn column_names(&self) -> Vec<String> {
+        crate::readable::ReadableTable::column_names(&*self.table_inner.borrow())
+    }
+
+    fn column_index(&self, name: &str) -> Option<usize> {
+        self.table_inner.borrow().schema().get_column_index(name)
+    }
+
+    fn column_type(&self, col_idx: usize) -> Option<crate::column::ColumnType> {
+        self.table_inner
+            .borrow()
+            .schema()
+            .get_column_info(col_idx)
+            .map(|(_, t, _)| t)
+    }
+
+    fn get_row(
+        &self,
+        index: usize,
+    ) -> Result<std::collections::HashMap<String, RustColumnValue>, String> {
+        let parent_index = *self
+            .indices
+            .get(index)
+            .ok_or_else(|| format!("Index {} out of range [0, {})", index, self.indices.len()))?;
+        self.table_inner.borrow().get_row(parent_index)
+    }
+
+    fn get_value(&self, row: usize, column: &str) -> Result<RustColumnValue, String> {
+        let parent_index = *self
+            .indices
+            .get(row)
+            .ok_or_else(|| format!("Row {} out of range [0, {})", row, self.indices.len()))?;
+        self.table_inner.borrow().get_value(parent_index, column)
+    }
+
+    fn get_value_by_index(&self, row: usize, col_idx: usize) -> Result<RustColumnValue, String> {
+        let parent_index = *self
+            .indices
+            .get(row)
+            .ok_or_else(|| format!("Row {} out of range [0, {})", row, self.indices.len()))?;
+        self.table_inner
+            .borrow()
+            .get_value_by_index(parent_index, col_idx)
+    }
+
+    fn version(&self) -> u64 {
+        self.sync_count
+            .wrapping_add(self.table_inner.borrow().version())
+    }
+}
+
+/// Build Rust sort keys from the Python `by` / `descending` arguments.
+/// Shared by PyTable::sort and the chained PyFilterView::sort.
+fn build_sort_keys(
+    by: &Bound<'_, PyAny>,
+    descending: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Vec<RustSortKey>> {
+    let columns = extract_string_or_list(by)?;
+
+    let desc_flags: Vec<bool> = match descending {
+        None => vec![false; columns.len()],
+        Some(desc) => {
+            if let Ok(single) = desc.extract::<bool>() {
+                vec![single; columns.len()]
+            } else if let Ok(list) = desc.extract::<Vec<bool>>() {
+                if list.len() != columns.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "descending list length ({}) must match columns length ({})",
+                        list.len(),
+                        columns.len()
+                    )));
+                }
+                list
+            } else {
+                return Err(PyTypeError::new_err(
+                    "descending must be a bool or list of bools",
+                ));
+            }
+        }
+    };
+
+    // Build sort keys (nulls_first=true matches SQL standard)
+    Ok(columns
+        .iter()
+        .zip(desc_flags.iter())
+        .map(|(col, desc)| {
+            let order = if *desc {
+                RustSortOrder::Descending
+            } else {
+                RustSortOrder::Ascending
+            };
+            RustSortKey::new(col.clone(), order, true)
+        })
+        .collect())
+}
+
+/// Parse string aggregation specs into Rust aggregate functions.
+/// Shared by PyTable::group_by and the chained PyFilterView::group_by.
+fn parse_agg_specs(
+    agg: &[(String, String, String)],
+) -> PyResult<Vec<(String, String, RustAggregateFunction)>> {
+    agg.iter()
+        .map(|(result_name, source_col, func_str)| {
+            let func = match func_str.to_lowercase().as_str() {
+                "sum" => RustAggregateFunction::Sum,
+                "avg" | "average" | "mean" => RustAggregateFunction::Avg,
+                "min" | "minimum" => RustAggregateFunction::Min,
+                "max" | "maximum" => RustAggregateFunction::Max,
+                "count" => RustAggregateFunction::Count,
+                "median" | "med" => RustAggregateFunction::Median,
+                "p25" => RustAggregateFunction::Percentile(0.25),
+                "p50" => RustAggregateFunction::Percentile(0.50),
+                "p75" => RustAggregateFunction::Percentile(0.75),
+                "p90" => RustAggregateFunction::Percentile(0.90),
+                "p95" => RustAggregateFunction::Percentile(0.95),
+                "p99" => RustAggregateFunction::Percentile(0.99),
+                other => {
+                    // Try to parse "percentile(X.XX)" format
+                    if let Some(inner) = other
+                        .strip_prefix("percentile(")
+                        .and_then(|s| s.strip_suffix(")"))
+                    {
+                        let p: f64 = inner.parse().map_err(|_| {
+                            PyValueError::new_err(format!(
+                                "Invalid percentile value '{}' in '{}'",
+                                inner, func_str
+                            ))
+                        })?;
+                        if !(0.0..=1.0).contains(&p) {
+                            return Err(PyValueError::new_err(format!(
+                                "Percentile value must be between 0.0 and 1.0, got {}",
+                                p
+                            )));
+                        }
+                        RustAggregateFunction::Percentile(p)
+                    } else {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown aggregation function '{}'. Use: sum, avg, min, max, count, median, p25, p50, p75, p90, p95, p99, or percentile(0.XX)",
+                            func_str
+                        )));
+                    }
+                }
+            };
+            Ok((result_name.clone(), source_col.clone(), func))
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -740,45 +902,7 @@ impl PyTable {
         by: &Bound<'_, PyAny>,
         descending: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PySortedView> {
-        // Extract column name(s)
-        let columns = extract_string_or_list(by)?;
-
-        // Extract descending flag(s)
-        let desc_flags: Vec<bool> = match descending {
-            None => vec![false; columns.len()],
-            Some(desc) => {
-                if let Ok(single) = desc.extract::<bool>() {
-                    vec![single; columns.len()]
-                } else if let Ok(list) = desc.extract::<Vec<bool>>() {
-                    if list.len() != columns.len() {
-                        return Err(PyValueError::new_err(format!(
-                            "descending list length ({}) must match columns length ({})",
-                            list.len(),
-                            columns.len()
-                        )));
-                    }
-                    list
-                } else {
-                    return Err(PyTypeError::new_err(
-                        "descending must be a bool or list of bools",
-                    ));
-                }
-            }
-        };
-
-        // Build sort keys (nulls_first=true matches SQL standard)
-        let sort_keys: Vec<RustSortKey> = columns
-            .iter()
-            .zip(desc_flags.iter())
-            .map(|(col, desc)| {
-                let order = if *desc {
-                    RustSortOrder::Descending
-                } else {
-                    RustSortOrder::Ascending
-                };
-                RustSortKey::new(col.clone(), order, true)
-            })
-            .collect();
+        let sort_keys = build_sort_keys(by, descending)?;
 
         // Auto-generate name
         let name = format!("{}_sorted", self.inner.borrow().name());
@@ -929,46 +1053,7 @@ impl PyTable {
         let group_cols = extract_string_or_list(by)?;
 
         // Convert string function names to RustAggregateFunction
-        let aggregations: Vec<(String, String, RustAggregateFunction)> = agg.iter()
-            .map(|(result_name, source_col, func_str)| {
-                let func = match func_str.to_lowercase().as_str() {
-                    "sum" => RustAggregateFunction::Sum,
-                    "avg" | "average" | "mean" => RustAggregateFunction::Avg,
-                    "min" | "minimum" => RustAggregateFunction::Min,
-                    "max" | "maximum" => RustAggregateFunction::Max,
-                    "count" => RustAggregateFunction::Count,
-                    "median" | "med" => RustAggregateFunction::Median,
-                    "p25" => RustAggregateFunction::Percentile(0.25),
-                    "p50" => RustAggregateFunction::Percentile(0.50),
-                    "p75" => RustAggregateFunction::Percentile(0.75),
-                    "p90" => RustAggregateFunction::Percentile(0.90),
-                    "p95" => RustAggregateFunction::Percentile(0.95),
-                    "p99" => RustAggregateFunction::Percentile(0.99),
-                    other => {
-                        // Try to parse "percentile(X.XX)" format
-                        if let Some(inner) = other.strip_prefix("percentile(")
-                            .and_then(|s| s.strip_suffix(")"))
-                        {
-                            let p: f64 = inner.parse().map_err(|_| PyValueError::new_err(
-                                format!("Invalid percentile value '{}' in '{}'", inner, func_str)
-                            ))?;
-                            if !(0.0..=1.0).contains(&p) {
-                                return Err(PyValueError::new_err(
-                                    format!("Percentile value must be between 0.0 and 1.0, got {}", p)
-                                ));
-                            }
-                            RustAggregateFunction::Percentile(p)
-                        } else {
-                            return Err(PyValueError::new_err(format!(
-                                "Unknown aggregation function '{}'. Use: sum, avg, min, max, count, median, p25, p50, p75, p90, p95, p99, or percentile(0.XX)",
-                                func_str
-                            )));
-                        }
-                    }
-                };
-                Ok((result_name.clone(), source_col.clone(), func))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let aggregations = parse_agg_specs(&agg)?;
 
         // Auto-generate name
         let name = format!("{}_grouped", self.inner.borrow().name());
@@ -1402,6 +1487,7 @@ impl PyFilterView {
             indices: Vec::new(),
             last_synced_generation: generation,
             last_processed_change_count: change_count,
+            sync_count: 0,
         }));
 
         // Initial refresh
@@ -1515,6 +1601,54 @@ impl PyFilterView {
             length,
             start_version,
         })
+    }
+
+    /// Sort the filtered rows — returns a SortedView chained on this filter.
+    /// Auto-registered on the root table for tick() propagation (after the
+    /// filter itself, so tick syncs parent-before-child).
+    #[pyo3(signature = (by, descending=None))]
+    fn sort(
+        &self,
+        by: &Bound<'_, PyAny>,
+        descending: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PySortedView> {
+        let sort_keys = build_sort_keys(by, descending)?;
+        let name = format!("{}_filtered_sorted", self.table.inner.borrow().name());
+
+        let parent: Rc<RefCell<dyn crate::readable::ReadableTable>> = self.inner.clone();
+        let view = RustSortedView::new(name, parent, sort_keys).map_err(PyValueError::new_err)?;
+        let inner = Rc::new(RefCell::new(view));
+
+        self.table
+            .registered_views
+            .borrow_mut()
+            .push(RegisteredView::Sorted(Rc::downgrade(&inner)));
+
+        Ok(PySortedView { inner })
+    }
+
+    /// Group the filtered rows — returns an AggregateView chained on this
+    /// filter. Auto-registered on the root table for tick() propagation.
+    fn group_by(
+        &self,
+        by: &Bound<'_, PyAny>,
+        agg: Vec<(String, String, String)>,
+    ) -> PyResult<PyAggregateView> {
+        let group_cols = extract_string_or_list(by)?;
+        let aggregations = parse_agg_specs(&agg)?;
+        let name = format!("{}_filtered_grouped", self.table.inner.borrow().name());
+
+        let parent: Rc<RefCell<dyn crate::readable::ReadableTable>> = self.inner.clone();
+        let view = RustAggregateView::new(name, parent, group_cols, aggregations)
+            .map_err(PyValueError::new_err)?;
+        let inner = Rc::new(RefCell::new(view));
+
+        self.table
+            .registered_views
+            .borrow_mut()
+            .push(RegisteredView::Aggregate(Rc::downgrade(&inner)));
+
+        Ok(PyAggregateView { inner })
     }
 }
 

@@ -2,7 +2,7 @@
 
 use crate::changeset::TableChange;
 use crate::column::ColumnValue;
-use crate::table::Table;
+use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -65,8 +65,8 @@ pub enum JoinType {
 /// ```
 pub struct JoinView {
     name: String,
-    left_table: Rc<RefCell<Table>>,
-    right_table: Rc<RefCell<Table>>,
+    left_table: Rc<RefCell<dyn ReadableTable>>,
+    right_table: Rc<RefCell<dyn ReadableTable>>,
     /// Column names in left table to join on (supports multi-column joins)
     left_keys: Vec<String>,
     /// Column names in right table to join on (supports multi-column joins)
@@ -83,10 +83,17 @@ pub struct JoinView {
     /// after Table construction in this crate).
     left_column_names: Vec<String>,
     right_column_names: Vec<String>,
-    /// Number of changes already processed from left table (absolute index)
+    /// Number of changes already processed from left table (absolute index).
+    /// `usize::MAX` when that parent is a view (no changeset) — a "not
+    /// cursor-tracked" sentinel, neutral in tick()'s min-cursor folds.
     left_last_processed_change_count: usize,
     /// Number of changes already processed from right table (absolute index)
     right_last_processed_change_count: usize,
+    /// Own sync counter; the visible version() adds both parents' versions.
+    sync_count: u64,
+    /// Parent versions observed at the last sync/rebuild.
+    last_left_parent_version: u64,
+    last_right_parent_version: u64,
 }
 
 impl JoinView {
@@ -106,8 +113,8 @@ impl JoinView {
     /// Result containing the JoinView or an error if columns don't exist
     pub fn new(
         name: String,
-        left_table: Rc<RefCell<Table>>,
-        right_table: Rc<RefCell<Table>>,
+        left_table: Rc<RefCell<dyn ReadableTable>>,
+        right_table: Rc<RefCell<dyn ReadableTable>>,
         left_key: String,
         right_key: String,
         join_type: JoinType,
@@ -139,8 +146,8 @@ impl JoinView {
     /// or key counts don't match
     pub fn new_multi(
         name: String,
-        left_table: Rc<RefCell<Table>>,
-        right_table: Rc<RefCell<Table>>,
+        left_table: Rc<RefCell<dyn ReadableTable>>,
+        right_table: Rc<RefCell<dyn ReadableTable>>,
         left_keys: Vec<String>,
         right_keys: Vec<String>,
         join_type: JoinType,
@@ -162,7 +169,7 @@ impl JoinView {
         {
             let left = left_table.borrow();
             for key in &left_keys {
-                if left.schema().get_column_index(key).is_none() {
+                if left.column_index(key).is_none() {
                     return Err(format!("Left table missing column '{}'", key));
                 }
             }
@@ -172,31 +179,27 @@ impl JoinView {
         {
             let right = right_table.borrow();
             for key in &right_keys {
-                if right.schema().get_column_index(key).is_none() {
+                if right.column_index(key).is_none() {
                     return Err(format!("Right table missing column '{}'", key));
                 }
             }
         }
 
-        let left_change_count = left_table.borrow().changeset().total_len();
-        let right_change_count = right_table.borrow().changeset().total_len();
+        let left_change_count = left_table
+            .borrow()
+            .changeset()
+            .map_or(usize::MAX, |cs| cs.total_len());
+        let right_change_count = right_table
+            .borrow()
+            .changeset()
+            .map_or(usize::MAX, |cs| cs.total_len());
+        let left_version = left_table.borrow().version();
+        let right_version = right_table.borrow().version();
 
         // Snapshot column names once — schemas are immutable post-construction,
         // so we never need to re-read them on each get_row call.
-        let left_column_names: Vec<String> = left_table
-            .borrow()
-            .schema()
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let right_column_names: Vec<String> = right_table
-            .borrow()
-            .schema()
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let left_column_names: Vec<String> = left_table.borrow().column_names();
+        let right_column_names: Vec<String> = right_table.borrow().column_names();
 
         let mut view = JoinView {
             name,
@@ -210,6 +213,9 @@ impl JoinView {
             right_column_names,
             left_last_processed_change_count: left_change_count,
             right_last_processed_change_count: right_change_count,
+            sync_count: 0,
+            last_left_parent_version: left_version,
+            last_right_parent_version: right_version,
         };
 
         view.rebuild_index();
@@ -232,7 +238,11 @@ impl JoinView {
     /// Build a typed composite key from column values at given indices.
     /// Returns None if any key column is NULL or NaN — these rows are excluded
     /// from joins per SQL semantics.
-    fn build_key_from_indices(table: &Table, row: usize, col_indices: &[usize]) -> Option<JoinKey> {
+    fn build_key_from_indices(
+        table: &dyn ReadableTable,
+        row: usize,
+        col_indices: &[usize],
+    ) -> Option<JoinKey> {
         let mut parts: Vec<JoinKeyPart> = Vec::with_capacity(col_indices.len());
         for &col_idx in col_indices {
             let value = table.get_value_by_index(row, col_idx).ok()?;
@@ -253,19 +263,19 @@ impl JoinView {
         let left_col_indices: Vec<usize> = self
             .left_keys
             .iter()
-            .filter_map(|k| left.schema().get_column_index(k))
+            .filter_map(|k| left.column_index(k))
             .collect();
         let right_col_indices: Vec<usize> = self
             .right_keys
             .iter()
-            .filter_map(|k| right.schema().get_column_index(k))
+            .filter_map(|k| right.column_index(k))
             .collect();
 
         // Phase 2: Build a hashmap of right table values for efficient lookup
         let mut right_index: HashMap<JoinKey, Vec<usize>> = HashMap::new();
 
         for i in 0..right.len() {
-            if let Some(key) = Self::build_key_from_indices(&right, i, &right_col_indices) {
+            if let Some(key) = Self::build_key_from_indices(&*right, i, &right_col_indices) {
                 right_index.entry(key).or_default().push(i);
             }
         }
@@ -274,7 +284,7 @@ impl JoinView {
         let mut matched_right: HashSet<usize> = HashSet::new();
 
         for i in 0..left.len() {
-            if let Some(key) = Self::build_key_from_indices(&left, i, &left_col_indices) {
+            if let Some(key) = Self::build_key_from_indices(&*left, i, &left_col_indices) {
                 if let Some(matching_indices) = right_index.get(&key) {
                     // Found matches - add each combination
                     for &right_idx in matching_indices {
@@ -314,9 +324,16 @@ impl JoinView {
             }
         }
 
-        // Update cursor trackers (one per parent)
-        self.left_last_processed_change_count = left.changeset().total_len();
-        self.right_last_processed_change_count = right.changeset().total_len();
+        // Update cursor trackers (one per parent); MAX = view parent, no cursor
+        self.left_last_processed_change_count =
+            left.changeset().map_or(usize::MAX, |cs| cs.total_len());
+        self.right_last_processed_change_count =
+            right.changeset().map_or(usize::MAX, |cs| cs.total_len());
+        self.last_left_parent_version = left.version();
+        self.last_right_parent_version = right.version();
+        drop(left);
+        drop(right);
+        self.sync_count += 1;
     }
 
     /// Build a lookup map from right table for efficient join operations
@@ -328,11 +345,11 @@ impl JoinView {
         let right_col_indices: Vec<usize> = self
             .right_keys
             .iter()
-            .filter_map(|k| right.schema().get_column_index(k))
+            .filter_map(|k| right.column_index(k))
             .collect();
 
         for i in 0..right.len() {
-            if let Some(key) = Self::build_key_from_indices(&right, i, &right_col_indices) {
+            if let Some(key) = Self::build_key_from_indices(&*right, i, &right_col_indices) {
                 right_index.entry(key).or_default().push(i);
             }
         }
@@ -349,11 +366,11 @@ impl JoinView {
         let left_col_indices: Vec<usize> = self
             .left_keys
             .iter()
-            .filter_map(|k| left.schema().get_column_index(k))
+            .filter_map(|k| left.column_index(k))
             .collect();
 
         for i in 0..left.len() {
-            if let Some(key) = Self::build_key_from_indices(&left, i, &left_col_indices) {
+            if let Some(key) = Self::build_key_from_indices(&*left, i, &left_col_indices) {
                 left_index.entry(key).or_default().push(i);
             }
         }
@@ -464,8 +481,7 @@ impl JoinView {
             if self
                 .right_table
                 .borrow()
-                .schema()
-                .get_column_index(right_column)
+                .column_index(right_column)
                 .is_none()
             {
                 return Err(format!("Column '{}' not found in joined view", column));
@@ -482,13 +498,7 @@ impl JoinView {
             Some(left_idx) => self.left_table.borrow().get_value(left_idx, column),
             None => {
                 // Verify the column exists in left schema
-                if self
-                    .left_table
-                    .borrow()
-                    .schema()
-                    .get_column_index(column)
-                    .is_none()
-                {
+                if self.left_table.borrow().column_index(column).is_none() {
                     return Err(format!("Column '{}' not found in joined view", column));
                 }
                 Ok(ColumnValue::Null)
@@ -559,9 +569,24 @@ impl JoinView {
     pub fn sync(&mut self) -> bool {
         let left_table = self.left_table.borrow();
         let right_table = self.right_table.borrow();
-        let left_changes = match left_table
-            .changeset()
-            .changes_from(self.left_last_processed_change_count)
+
+        // View parent(s): no changeset to consume — fall back to a
+        // version-checked rebuild covering both sides at once.
+        let (Some(left_changeset), Some(right_changeset)) =
+            (left_table.changeset(), right_table.changeset())
+        else {
+            let stale = left_table.version() != self.last_left_parent_version
+                || right_table.version() != self.last_right_parent_version;
+            drop(left_table);
+            drop(right_table);
+            if !stale {
+                return false;
+            }
+            self.rebuild_index();
+            return true;
+        };
+
+        let left_changes = match left_changeset.changes_from(self.left_last_processed_change_count)
         {
             Some(changes) => changes,
             None => {
@@ -571,18 +596,16 @@ impl JoinView {
                 return true;
             }
         };
-        let right_changes = match right_table
-            .changeset()
-            .changes_from(self.right_last_processed_change_count)
-        {
-            Some(changes) => changes,
-            None => {
-                drop(left_table);
-                drop(right_table);
-                self.rebuild_index();
-                return true;
-            }
-        };
+        let right_changes =
+            match right_changeset.changes_from(self.right_last_processed_change_count) {
+                Some(changes) => changes,
+                None => {
+                    drop(left_table);
+                    drop(right_table);
+                    self.rebuild_index();
+                    return true;
+                }
+            };
 
         let left_changes: Vec<TableChange> = left_changes.to_vec();
         let right_changes: Vec<TableChange> = right_changes.to_vec();
@@ -1074,9 +1097,46 @@ impl JoinView {
 
         let left_table = self.left_table.borrow();
         let right_table = self.right_table.borrow();
-        self.left_last_processed_change_count = left_table.changeset().total_len();
-        self.right_last_processed_change_count = right_table.changeset().total_len();
+        self.left_last_processed_change_count = left_table
+            .changeset()
+            .map_or(usize::MAX, |cs| cs.total_len());
+        self.right_last_processed_change_count = right_table
+            .changeset()
+            .map_or(usize::MAX, |cs| cs.total_len());
+        self.last_left_parent_version = left_table.version();
+        self.last_right_parent_version = right_table.version();
+        drop(left_table);
+        drop(right_table);
+        self.sync_count += 1;
 
         modified
+    }
+}
+
+impl ReadableTable for JoinView {
+    fn len(&self) -> usize {
+        self.join_index.len()
+    }
+
+    fn column_names(&self) -> Vec<String> {
+        let mut names = self.left_column_names.clone();
+        for col in &self.right_column_names {
+            names.push(format!("right_{}", col));
+        }
+        names
+    }
+
+    fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String> {
+        JoinView::get_row(self, index)
+    }
+
+    fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
+        JoinView::get_value(self, row, column)
+    }
+
+    fn version(&self) -> u64 {
+        self.sync_count
+            .wrapping_add(self.left_table.borrow().version())
+            .wrapping_add(self.right_table.borrow().version())
     }
 }

@@ -91,12 +91,15 @@ cd frontend && npm install && npm run dev
 - **sequence.rs** - Storage backends: `ArraySequence` (contiguous, default), `TieredVectorSequence` (O(√N) inserts, backed by [tiered-vector](https://crates.io/crates/tiered-vector) crate)
 - **column.rs** - Strongly-typed column values with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
 - **table.rs** - Row-level CRUD operations on column collections
-- **view.rs** - Zero-copy views: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`
+- **readable.rs** - `ReadableTable` trait: the read surface shared by `Table` and every view, enabling views-over-views (DAG composition)
+- **view.rs** + **view/** - Zero-copy views, one file per type: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`, `AggregateView`, `TickableTable`; view.rs holds shared typed join-key machinery; tests in view/tests.rs
 - **python_bindings.rs** - PyO3 bindings exposing Rust types as Python classes
 - **websocket.rs** + **messages.rs** - Real-time sync via Actix-web WebSocket server
 
 ### Key Patterns
 - Views use `Rc<RefCell<>>` for shared table access without data duplication
+- View parents are `Rc<RefCell<dyn ReadableTable>>` — an `Rc<RefCell<Table>>` coerces implicitly, and any view can parent another view. Children of root tables sync incrementally via the parent's changeset; children of views (`changeset()` returns None) use version-checked full refresh. A view's `version()` = own sync counter + parent version, so staleness propagates through chains. Sync parents before children (tick registration order = creation order = topological).
+- Chained views set `last_processed_change_count = usize::MAX` (no root-changeset cursor) — neutral in tick()'s min-cursor compaction folds. Keep that sentinel when adding cursor consumers.
 - Python lambdas are converted to Rust closures for filter/computed operations
 - Join operations use O(N+M) algorithm
 - WebSocket protocol: `UpdateCell`, `AddRow`, `DeleteRow` messages with broadcast to all clients
@@ -253,6 +256,13 @@ table.tick()  # All registered views are now updated
 
 # Check how many views are registered
 count = table.registered_view_count()  # Returns 3
+
+# View composition - chain views on filtered results (views over views)
+big = table.filter(lambda row: row["amount"] >= 100)
+ranked = big.sort("amount", descending=True)     # SortedView over the filter
+by_region = big.group_by("region", agg=[("total", "amount", "sum")])
+table.append_row({"region": "South", "amount": 900})
+table.tick()  # Propagates root -> filter -> sorted/grouped in one call
 
 # Serialization - export
 csv_string = table.to_csv()
