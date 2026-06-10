@@ -880,11 +880,44 @@ impl JoinView {
         )
     }
 
+    /// True if the batch contains changes that can alter join_index
+    /// membership or row positions: inserts, deletes, or updates to a
+    /// join-key column. Non-key cell updates are positionally inert.
+    fn has_structural_changes(changes: &[TableChange], keys: &[String]) -> bool {
+        changes.iter().any(|c| match c {
+            TableChange::RowInserted { .. } | TableChange::RowDeleted { .. } => true,
+            TableChange::CellUpdated { column, .. } => keys.contains(column),
+        })
+    }
+
+    /// True if a join-key update is recorded BEFORE an insert/delete in the
+    /// same batch. The key-update handler reads the row's current data from
+    /// the live parent by its recorded index — which the later insert/delete
+    /// has already shifted, so it would read the wrong row.
+    fn key_update_precedes_row_shift(changes: &[TableChange], keys: &[String]) -> bool {
+        let mut seen_key_update = false;
+        for c in changes {
+            match c {
+                TableChange::CellUpdated { column, .. } if keys.contains(column) => {
+                    seen_key_update = true;
+                }
+                TableChange::RowInserted { .. } | TableChange::RowDeleted { .. }
+                    if seen_key_update =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Incrementally sync with both parent tables' changes
     /// Returns true if any changes were applied
     ///
-    /// Note: For complex changes (deletes, updates to join keys), this falls back
-    /// to a full rebuild. Only appends are handled incrementally.
+    /// Single-side batches (all structural changes on one parent) are handled
+    /// incrementally. Batches that mix reference frames fall back to a full
+    /// rebuild — see the guard below for the two cases.
     pub fn sync(&mut self) -> bool {
         let left_table = self.left_table.borrow();
         let right_table = self.right_table.borrow();
@@ -922,12 +955,34 @@ impl JoinView {
             return false;
         }
 
-        // All RowInserted, RowDeleted, and key-column CellUpdated changes on
-        // both sides are now handled incrementally below. (Non-key
-        // CellUpdated never required join_index changes — views read live
-        // data via get_row.) The historical rebuild fallback is gone; only
-        // the compaction case above (changes_from returning None) still
-        // requires a full rebuild.
+        // Frame-mixing guard. The insert/key-update handlers below match new
+        // rows against LIVE parent lookups (post-batch indices), while the
+        // per-change shift loops treat existing join_index entries as
+        // pre-batch. Two batch shapes mix those frames irreparably:
+        //   1. Structural changes on BOTH sides in one batch — pairs added by
+        //      the left pass carry live right indices, which the right-insert
+        //      pass then re-shifts (and the de-dup against raw changeset
+        //      indices misses shifted new lefts).
+        //   2. A key update recorded BEFORE an insert/delete on the same side
+        //      — the handler reads live row data at the recorded index, which
+        //      the later change has already shifted.
+        // Both are rare under tick()-driven usage (each side's queue is
+        // consumed promptly); a full rebuild is correct by construction and
+        // advances both cursors.
+        let left_structural = Self::has_structural_changes(&left_changes, &self.left_keys);
+        let right_structural = Self::has_structural_changes(&right_changes, &self.right_keys);
+        if (left_structural && right_structural)
+            || Self::key_update_precedes_row_shift(&left_changes, &self.left_keys)
+            || Self::key_update_precedes_row_shift(&right_changes, &self.right_keys)
+        {
+            self.rebuild_index();
+            return true;
+        }
+
+        // Single-side batches: all RowInserted, RowDeleted, and key-column
+        // CellUpdated changes are handled incrementally below. (Non-key
+        // CellUpdated never requires join_index changes — views read live
+        // data via get_row.)
 
         let mut modified = false;
 
@@ -1170,17 +1225,10 @@ impl JoinView {
         // Mirrors the existing right_lookup pattern used for left-insert handling.
         // Was O(left.len()) per right insert via linear scan; now O(matches) via hash lookup.
         //
-        // De-duplication: lefts that were also inserted in this same sync batch
-        // already had their match against any new right added by the left-insert
-        // pass above. The right-insert pass must NOT re-add the same pair, so
-        // collect the new-left index set and skip those during matching below.
-        let new_left_indices: std::collections::HashSet<usize> = left_changes
-            .iter()
-            .filter_map(|c| match c {
-                TableChange::RowInserted { index, .. } => Some(*index),
-                _ => None,
-            })
-            .collect();
+        // No de-duplication against same-batch new lefts is needed: the
+        // frame-mixing guard above rebuilds whenever both sides have
+        // structural changes, so right inserts here never coexist with left
+        // inserts.
         let has_right_inserts = right_changes
             .iter()
             .any(|c| matches!(c, TableChange::RowInserted { .. }));
@@ -1265,17 +1313,8 @@ impl JoinView {
                 // Find left rows that match this new right row via the precomputed lookup
                 if let Some(right_key) = Self::build_composite_key(data, &self.right_keys) {
                     let lookup = left_lookup.as_ref().unwrap();
-                    // Filter out lefts that were inserted in this same sync —
-                    // their match was already added by the left-insert pass.
-                    let candidate_lefts: Vec<usize> = lookup
-                        .get(&right_key)
-                        .map(|v| {
-                            v.iter()
-                                .copied()
-                                .filter(|l| !new_left_indices.contains(l))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let candidate_lefts: Vec<usize> =
+                        lookup.get(&right_key).cloned().unwrap_or_default();
                     let any_match = !candidate_lefts.is_empty();
 
                     if !candidate_lefts.is_empty() {
@@ -6010,8 +6049,8 @@ mod tests {
 
         assert_eq!(join.borrow().len(), 1);
 
-        // Append on BOTH sides; the convergence test mirrors what fix #9's
-        // de-dup ensures: a single tick must add (1, 1) match exactly once.
+        // Append on BOTH sides; the frame-mixing guard in sync() handles this
+        // batch via rebuild — a single tick must add the new match exactly once.
         left.borrow_mut().append_row(left_row(2, "L2")).unwrap();
         right.borrow_mut().append_row(right_row(2, "R2")).unwrap();
         assert!(left_tickable.tick() >= 1);
@@ -6610,6 +6649,100 @@ mod tests {
         // Expected: (left.id=1, right.id=1), (left.id=2, right=None)
         let result = collect_join_rows(&joined);
         assert_eq!(result, vec![(Some(1), Some(1)), (Some(2), None)]);
+    }
+
+    // === Cross-side and same-side frame mixing in JoinView::sync ===
+
+    /// Both parents mutated, then ONE sync handles both changesets (exactly
+    /// what TickableTable::tick produces). The pair added for the new left
+    /// row must reference the new right row at its real index — not get
+    /// re-shifted by the right-insert pass.
+    #[test]
+    fn test_inner_join_sync_both_side_appends_same_batch() {
+        let left = make_left_table();
+        let right = make_right_table();
+        left.borrow_mut().append_row(left_row(1, "L1")).unwrap();
+        right.borrow_mut().append_row(right_row(1, "R1")).unwrap();
+
+        let mut join = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(collect_join_rows(&join), vec![(Some(1), Some(1))]);
+
+        left.borrow_mut().append_row(left_row(2, "L2")).unwrap();
+        right.borrow_mut().append_row(right_row(2, "R2")).unwrap();
+        join.sync();
+
+        assert_eq!(
+            collect_join_rows(&join),
+            vec![(Some(1), Some(1)), (Some(2), Some(2))]
+        );
+    }
+
+    /// The original double-count repro: two non-tail left inserts (the second
+    /// shifts the first) plus a matching right insert in the same batch. The
+    /// match for the shifted new left row must appear exactly once.
+    #[test]
+    fn test_inner_join_sync_shifted_new_left_not_double_counted() {
+        let left = make_left_table();
+        let right = make_right_table();
+
+        let mut join = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(join.len(), 0);
+
+        // id=10 lands at index 0, then id=20 inserts at 0 shifting id=10 to 1
+        left.borrow_mut().insert_row(0, left_row(10, "A")).unwrap();
+        left.borrow_mut().insert_row(0, left_row(20, "B")).unwrap();
+        right.borrow_mut().append_row(right_row(10, "R")).unwrap();
+        join.sync();
+
+        assert_eq!(collect_join_rows(&join), vec![(Some(10), Some(10))]);
+    }
+
+    /// Same-side frame mixing: a key update recorded BEFORE an insert in the
+    /// same batch. The update handler reads the row by its recorded index from
+    /// the live table — where the later insert has already shifted it.
+    #[test]
+    fn test_inner_join_sync_key_update_then_insert_same_batch() {
+        let left = make_left_table();
+        let right = make_right_table();
+        left.borrow_mut().append_row(left_row(1, "X")).unwrap();
+        right.borrow_mut().append_row(right_row(5, "R5")).unwrap();
+
+        let mut join = JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(join.len(), 0); // id=1 has no right match
+
+        // Update row 0's key to 5 (now matches right), THEN insert a new row
+        // at index 0 — the updated row's live index becomes 1.
+        left.borrow_mut()
+            .set_value(0, "id", ColumnValue::Int32(5))
+            .unwrap();
+        left.borrow_mut().insert_row(0, left_row(7, "new")).unwrap();
+        join.sync();
+
+        assert_eq!(collect_join_rows(&join), vec![(Some(5), Some(5))]);
     }
 
     // === NaN handling in aggregates ===
