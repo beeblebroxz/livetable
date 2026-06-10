@@ -1,6 +1,6 @@
 import { act, render, screen } from '@testing-library/react';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { useTableWebSocket } from './useTableWebSocket';
+import { useTableWebSocket, SEQ_GAP_REQUERY_MS } from './useTableWebSocket';
 import { FakeWebSocket } from '../test/fakeWebSocket';
 
 function HookHarness({ label, wsUrl = 'ws://localhost:8080/ws' }: { label: string; wsUrl?: string }) {
@@ -326,6 +326,123 @@ describe('useTableWebSocket', () => {
 
     rendered = screen.getByTestId('client-rows').textContent ?? '[]';
     rows = JSON.parse(rendered) as { rowId: number }[];
+    expect(rows.map((row) => row.rowId)).toEqual([11, 22, 33]);
+  });
+
+  // A delta lost in transit leaves a permanent seq gap: later deltas buffer
+  // forever and the table silently freezes. The client must recover by
+  // re-querying for a fresh snapshot after a timeout.
+  it('re-queries for a fresh snapshot when a seq gap is not filled in time', async () => {
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+      socket.receive({
+        type: 'TableData',
+        table_name: 'demo',
+        seq: 20,
+        columns: ['id', 'name', 'value'],
+        rows: [
+          { row_id: 11, row: { id: 1, name: 'Alice', value: 100 } },
+        ],
+      });
+    });
+
+    // seq 21 is lost; seq 22 arrives and buffers.
+    await act(async () => {
+      socket.receive({
+        type: 'RowInserted',
+        table_name: 'demo',
+        seq: 22,
+        index: 2,
+        row_id: 33,
+        row: { id: 3, name: 'Carol', value: 300 },
+      });
+    });
+
+    const queriesBefore = socket.sentMessages.filter(
+      (message) => message.type === 'Query'
+    );
+    expect(queriesBefore).toHaveLength(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(SEQ_GAP_REQUERY_MS);
+    });
+
+    const queriesAfter = socket.sentMessages.filter(
+      (message) => message.type === 'Query'
+    );
+    expect(queriesAfter).toHaveLength(2);
+
+    // The fresh snapshot heals the gap; the stale buffered delta is dropped.
+    await act(async () => {
+      socket.receive({
+        type: 'TableData',
+        table_name: 'demo',
+        seq: 22,
+        columns: ['id', 'name', 'value'],
+        rows: [
+          { row_id: 11, row: { id: 1, name: 'Alice', value: 100 } },
+          { row_id: 22, row: { id: 2, name: 'Bob', value: 200 } },
+          { row_id: 33, row: { id: 3, name: 'Carol', value: 300 } },
+        ],
+      });
+    });
+
+    const rendered = screen.getByTestId('client-rows').textContent ?? '[]';
+    const rows = JSON.parse(rendered) as { rowId: number }[];
+    expect(rows.map((row) => row.rowId)).toEqual([11, 22, 33]);
+  });
+
+  it('does not re-query when the seq gap fills in time', async () => {
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+      socket.receive({
+        type: 'TableData',
+        table_name: 'demo',
+        seq: 20,
+        columns: ['id', 'name', 'value'],
+        rows: [
+          { row_id: 11, row: { id: 1, name: 'Alice', value: 100 } },
+        ],
+      });
+    });
+
+    // seq 22 arrives first, then the "missing" seq 21 shows up in time.
+    await act(async () => {
+      socket.receive({
+        type: 'RowInserted',
+        table_name: 'demo',
+        seq: 22,
+        index: 2,
+        row_id: 33,
+        row: { id: 3, name: 'Carol', value: 300 },
+      });
+      socket.receive({
+        type: 'RowInserted',
+        table_name: 'demo',
+        seq: 21,
+        index: 1,
+        row_id: 22,
+        row: { id: 2, name: 'Bob', value: 200 },
+      });
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(SEQ_GAP_REQUERY_MS);
+    });
+
+    const queries = socket.sentMessages.filter(
+      (message) => message.type === 'Query'
+    );
+    expect(queries).toHaveLength(1);
+
+    const rendered = screen.getByTestId('client-rows').textContent ?? '[]';
+    const rows = JSON.parse(rendered) as { rowId: number }[];
     expect(rows.map((row) => row.rowId)).toEqual([11, 22, 33]);
   });
 });

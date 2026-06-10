@@ -1003,13 +1003,19 @@ impl Table {
     /// Create a table from a JSON string (array of objects).
     ///
     /// Expects a JSON array where each element is an object representing a row.
-    /// Column types are inferred from the first object:
-    /// - JSON numbers → FLOAT64 (for safety with decimals) or INT64 (if integer)
-    /// - JSON strings → STRING
+    /// Column names come from the first object; types are inferred by scanning
+    /// every row and unifying what's found:
+    /// - JSON integers → INT32, widened to INT64 (or FLOAT64 if any value has
+    ///   a fractional part) when later rows require it
+    /// - JSON strings → STRING, or DATE/DATETIME when *all* values in the
+    ///   column parse as dates (a DATE column widens to DATETIME if any value
+    ///   carries a time component)
     /// - JSON booleans → BOOL
-    /// - JSON null → nullable column
+    /// - JSON null → skipped for inference; a column of only nulls is STRING
     ///
-    /// All columns are created as nullable.
+    /// Columns whose non-null values mix incompatible types (e.g. a number
+    /// and a string) are rejected with an error. All columns are created as
+    /// nullable.
     ///
     /// # Example
     ///
@@ -1028,16 +1034,13 @@ impl Table {
             return Err("JSON array is empty".to_string());
         }
 
-        // Infer schema from first object
-        let first = parsed[0].as_object().ok_or("Expected array of objects")?;
-
-        let schema = infer_schema_from_json(first)?;
+        let schema = infer_schema_from_json(&parsed)?;
         let mut table = Table::new(name.to_string(), schema);
 
-        // Populate rows
+        // Populate rows, converting each value against the inferred schema
         for item in &parsed {
             let obj = item.as_object().ok_or("Expected object in array")?;
-            let row_map = json_object_to_row_map(obj)?;
+            let row_map = json_object_to_row_map(obj, table.schema())?;
             table.append_row(row_map)?;
         }
 
@@ -1442,87 +1445,148 @@ fn parse_csv_value(value: &str, col_type: ColumnType) -> Result<ColumnValue, Str
     }
 }
 
-/// Infer schema from a JSON object
-fn infer_schema_from_json(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Schema, String> {
+/// The type a single non-null JSON value would have on its own.
+fn json_value_natural_type(key: &str, value: &serde_json::Value) -> Result<ColumnType, String> {
+    match value {
+        serde_json::Value::Number(n) => {
+            if n.is_i64() {
+                let val = n.as_i64().unwrap();
+                if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+                    Ok(ColumnType::Int32)
+                } else {
+                    Ok(ColumnType::Int64)
+                }
+            } else {
+                Ok(ColumnType::Float64)
+            }
+        }
+        serde_json::Value::String(s) => {
+            // Try to detect date/datetime strings
+            if (s.contains('T') || (s.contains(' ') && s.contains(':')))
+                && parse_datetime(s).is_some()
+            {
+                Ok(ColumnType::DateTime)
+            } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some() {
+                Ok(ColumnType::Date)
+            } else {
+                Ok(ColumnType::String)
+            }
+        }
+        serde_json::Value::Bool(_) => Ok(ColumnType::Bool),
+        _ => Err(format!("Unsupported JSON value type for column '{}'", key)),
+    }
+}
+
+/// Combine the types of two values seen in the same column, widening within
+/// the numeric (INT32 → INT64 → FLOAT64) and temporal (DATE → DATETIME)
+/// families. A date-looking string mixed with a plain string is just STRING.
+fn unify_json_column_types(key: &str, a: ColumnType, b: ColumnType) -> Result<ColumnType, String> {
+    use ColumnType::*;
+    if a == b {
+        return Ok(a);
+    }
+    match (a, b) {
+        (Int32, Int64) | (Int64, Int32) => Ok(Int64),
+        (Int32 | Int64, Float64) | (Float64, Int32 | Int64) => Ok(Float64),
+        (Date, DateTime) | (DateTime, Date) => Ok(DateTime),
+        (Date | DateTime, String) | (String, Date | DateTime) => Ok(String),
+        _ => Err(format!(
+            "Column '{}' has mixed incompatible types: {:?} and {:?}",
+            key, a, b
+        )),
+    }
+}
+
+/// Infer a schema from all rows of a JSON array: column names come from the
+/// first object, each column's type from unifying every non-null value.
+fn infer_schema_from_json(rows: &[serde_json::Value]) -> Result<Schema, String> {
+    let first = rows[0].as_object().ok_or("Expected array of objects")?;
     let mut columns = Vec::new();
 
-    for (key, value) in obj {
-        let col_type = match value {
-            serde_json::Value::Number(n) => {
-                if n.is_i64() {
-                    let val = n.as_i64().unwrap();
-                    if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-                        ColumnType::Int32
-                    } else {
-                        ColumnType::Int64
-                    }
-                } else {
-                    ColumnType::Float64
+    for key in first.keys() {
+        let mut inferred: Option<ColumnType> = None;
+        for item in rows {
+            let obj = item.as_object().ok_or("Expected array of objects")?;
+            match obj.get(key) {
+                None | Some(serde_json::Value::Null) => continue,
+                Some(value) => {
+                    let natural = json_value_natural_type(key, value)?;
+                    inferred = Some(match inferred {
+                        None => natural,
+                        Some(prev) => unify_json_column_types(key, prev, natural)?,
+                    });
                 }
             }
-            serde_json::Value::String(s) => {
-                // Try to detect date/datetime strings
-                if (s.contains('T') || (s.contains(' ') && s.contains(':')))
-                    && parse_datetime(s).is_some()
-                {
-                    ColumnType::DateTime
-                } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some()
-                {
-                    ColumnType::Date
-                } else {
-                    ColumnType::String
-                }
-            }
-            serde_json::Value::Bool(_) => ColumnType::Bool,
-            serde_json::Value::Null => ColumnType::String, // Default to String for null
-            _ => return Err(format!("Unsupported JSON value type for column '{}'", key)),
-        };
-        columns.push((key.clone(), col_type, true)); // All nullable
+        }
+        // A column with no non-null values defaults to String
+        columns.push((key.clone(), inferred.unwrap_or(ColumnType::String), true));
     }
 
     Ok(Schema::new(columns))
 }
 
-/// Convert a JSON object to a row map
+/// Convert a single JSON value to the ColumnValue the schema expects.
+fn json_value_to_column_value(
+    key: &str,
+    value: &serde_json::Value,
+    col_type: ColumnType,
+) -> Result<ColumnValue, String> {
+    let mismatch = |value: &serde_json::Value| format!("Column '{}': cannot store {} ", key, value);
+
+    match value {
+        serde_json::Value::Null => Ok(ColumnValue::Null),
+        serde_json::Value::Number(n) => match col_type {
+            ColumnType::Int32 => n
+                .as_i64()
+                .filter(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64)
+                .map(|v| ColumnValue::Int32(v as i32))
+                .ok_or_else(|| mismatch(value)),
+            ColumnType::Int64 => n
+                .as_i64()
+                .map(ColumnValue::Int64)
+                .ok_or_else(|| mismatch(value)),
+            ColumnType::Float64 => n
+                .as_f64()
+                .map(ColumnValue::Float64)
+                .ok_or_else(|| mismatch(value)),
+            _ => Err(mismatch(value)),
+        },
+        serde_json::Value::String(s) => match col_type {
+            ColumnType::String => Ok(ColumnValue::String(s.clone())),
+            ColumnType::Date => parse_date(s)
+                .map(ColumnValue::Date)
+                .ok_or_else(|| format!("Column '{}': invalid date '{}'", key, s)),
+            ColumnType::DateTime => parse_datetime(s)
+                // A bare date in a DATETIME column lands at midnight
+                .or_else(|| parse_date(s).map(|days| days as i64 * 86_400_000))
+                .map(ColumnValue::DateTime)
+                .ok_or_else(|| format!("Column '{}': invalid datetime '{}'", key, s)),
+            _ => Err(mismatch(value)),
+        },
+        serde_json::Value::Bool(b) => match col_type {
+            ColumnType::Bool => Ok(ColumnValue::Bool(*b)),
+            _ => Err(mismatch(value)),
+        },
+        _ => Err(format!("Unsupported JSON value type for key '{}'", key)),
+    }
+}
+
+/// Convert a JSON object to a row map, coercing each value to its column's
+/// inferred type. Keys absent from the schema are ignored.
 fn json_object_to_row_map(
     obj: &serde_json::Map<String, serde_json::Value>,
+    schema: &Schema,
 ) -> Result<HashMap<String, ColumnValue>, String> {
     let mut row = HashMap::new();
 
     for (key, value) in obj {
-        let col_value = match value {
-            serde_json::Value::Number(n) => {
-                if n.is_i64() {
-                    let val = n.as_i64().unwrap();
-                    if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-                        ColumnValue::Int32(val as i32)
-                    } else {
-                        ColumnValue::Int64(val)
-                    }
-                } else {
-                    ColumnValue::Float64(n.as_f64().unwrap())
-                }
-            }
-            serde_json::Value::String(s) => {
-                // Try to detect and parse date/datetime strings
-                if (s.contains('T') || (s.contains(' ') && s.contains(':')))
-                    && parse_datetime(s).is_some()
-                {
-                    ColumnValue::DateTime(parse_datetime(s).unwrap())
-                } else if s.len() == 10 && s.chars().nth(4) == Some('-') && parse_date(s).is_some()
-                {
-                    ColumnValue::Date(parse_date(s).unwrap())
-                } else {
-                    ColumnValue::String(s.clone())
-                }
-            }
-            serde_json::Value::Bool(b) => ColumnValue::Bool(*b),
-            serde_json::Value::Null => ColumnValue::Null,
-            _ => return Err(format!("Unsupported JSON value type for key '{}'", key)),
+        let Some(col_type) = schema.get_column_type(key) else {
+            continue;
         };
-        row.insert(key.clone(), col_value);
+        row.insert(
+            key.clone(),
+            json_value_to_column_value(key, value, col_type)?,
+        );
     }
 
     Ok(row)
@@ -1960,5 +2024,105 @@ mod tests {
             table.version() >= v3,
             "clear_changeset must not rewind version"
         );
+    }
+
+    #[test]
+    fn test_from_json_null_in_first_row_infers_from_later_rows() {
+        let json = r#"[
+            {"id": null, "score": null, "name": null},
+            {"id": 7, "score": 1.5, "name": "Alice"}
+        ]"#;
+        let table = Table::from_json("test", json).unwrap();
+
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            table.schema().get_column_type("id"),
+            Some(ColumnType::Int32)
+        );
+        assert_eq!(
+            table.schema().get_column_type("score"),
+            Some(ColumnType::Float64)
+        );
+        assert_eq!(
+            table.schema().get_column_type("name"),
+            Some(ColumnType::String)
+        );
+        assert!(table.get_value(0, "id").unwrap().is_null());
+        assert_eq!(table.get_value(1, "id").unwrap().as_i32(), Some(7));
+        assert_eq!(table.get_value(1, "score").unwrap().as_f64(), Some(1.5));
+    }
+
+    #[test]
+    fn test_from_json_all_null_column_defaults_to_string() {
+        let json = r#"[{"x": null}, {"x": null}]"#;
+        let table = Table::from_json("test", json).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("x"),
+            Some(ColumnType::String)
+        );
+        assert!(table.get_value(0, "x").unwrap().is_null());
+        assert!(table.get_value(1, "x").unwrap().is_null());
+    }
+
+    #[test]
+    fn test_from_json_widens_int32_to_int64() {
+        let json = r#"[{"id": 1}, {"id": 5000000000}]"#;
+        let table = Table::from_json("test", json).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("id"),
+            Some(ColumnType::Int64)
+        );
+        assert_eq!(table.get_value(0, "id").unwrap().as_i64(), Some(1));
+        assert_eq!(
+            table.get_value(1, "id").unwrap().as_i64(),
+            Some(5_000_000_000)
+        );
+    }
+
+    #[test]
+    fn test_from_json_widens_int_to_float() {
+        let json = r#"[{"x": 1}, {"x": 2.5}]"#;
+        let table = Table::from_json("test", json).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("x"),
+            Some(ColumnType::Float64)
+        );
+        assert_eq!(table.get_value(0, "x").unwrap().as_f64(), Some(1.0));
+        assert_eq!(table.get_value(1, "x").unwrap().as_f64(), Some(2.5));
+    }
+
+    #[test]
+    fn test_from_json_date_like_string_in_string_column() {
+        // First non-null is a plain string, so the column is STRING; a later
+        // date-looking value must stay a string, not become a Date value.
+        let json = r#"[{"note": "hello"}, {"note": "2024-01-15"}]"#;
+        let table = Table::from_json("test", json).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("note"),
+            Some(ColumnType::String)
+        );
+        assert_eq!(
+            table.get_value(1, "note").unwrap().as_string(),
+            Some("2024-01-15")
+        );
+    }
+
+    #[test]
+    fn test_from_json_widens_date_to_datetime() {
+        let json = r#"[{"ts": "2024-01-15"}, {"ts": "2024-01-15T10:30:00"}]"#;
+        let table = Table::from_json("test", json).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("ts"),
+            Some(ColumnType::DateTime)
+        );
+        // The bare date lands at midnight of that day.
+        let day_ms = 86_400_000i64;
+        let midnight = table.get_value(0, "ts").unwrap().as_datetime().unwrap();
+        assert_eq!(midnight % day_ms, 0);
     }
 }

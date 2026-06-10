@@ -52,6 +52,11 @@ function EditableCell({
 
   const onBlur = () => {
     const nextValue = coerceEditedValue(value, initialValue);
+    // The cell is server-authoritative: snap back to the last confirmed value
+    // and let the server's CellUpdated echo move it forward. If the update is
+    // rejected (e.g. null into a non-nullable column) no echo arrives and the
+    // cell keeps showing data that matches the table.
+    setValue(String(initialValue ?? ''));
     if (nextValue !== initialValue) {
       updateCell(rowId, columnId, nextValue);
     }

@@ -16,6 +16,10 @@ type DeltaMessage = Extract<
 const isDev = import.meta.env.DEV;
 const configuredWsUrl = import.meta.env.VITE_LIVETABLE_WS_URL;
 
+// How long a seq gap may stay unfilled before we assume the missing delta is
+// lost and re-query for a fresh snapshot.
+export const SEQ_GAP_REQUERY_MS = 3000;
+
 const getDefaultWebSocketUrl = () => {
   if (configuredWsUrl) {
     return configuredWsUrl;
@@ -220,6 +224,7 @@ export function useTableWebSocket(
   // this connection), plus deltas that arrived before a contiguous baseline.
   const lastAppliedSeqRef = useRef<number | null>(null);
   const pendingDeltasRef = useRef<DeltaMessage[]>([]);
+  const gapTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -230,6 +235,33 @@ export function useTableWebSocket(
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+    };
+
+    const clearGapTimer = () => {
+      if (gapTimerRef.current !== null) {
+        window.clearTimeout(gapTimerRef.current);
+        gapTimerRef.current = null;
+      }
+    };
+
+    // Deltas left pending after a replay mean a seq gap. If it isn't filled
+    // within SEQ_GAP_REQUERY_MS, the missing delta is presumed lost and we
+    // re-query for a fresh snapshot to re-baseline.
+    const syncGapTimer = (socket: WebSocket) => {
+      if (pendingDeltasRef.current.length === 0) {
+        clearGapTimer();
+        return;
+      }
+      if (gapTimerRef.current !== null) {
+        return;
+      }
+      gapTimerRef.current = window.setTimeout(() => {
+        gapTimerRef.current = null;
+        if (socket.readyState === WebSocket.OPEN && wsRef.current === socket) {
+          logDebug('Seq gap unfilled; re-querying for a fresh snapshot');
+          sendSocketMessage(socket, { type: 'Query', table_name: tableName });
+        }
+      }, SEQ_GAP_REQUERY_MS);
     };
 
     const connect = () => {
@@ -250,6 +282,7 @@ export function useTableWebSocket(
         // seq cutoff and any buffered deltas from the previous connection.
         lastAppliedSeqRef.current = null;
         pendingDeltasRef.current = [];
+        clearGapTimer();
 
         sendSocketMessage(socket, { type: 'Subscribe', table_name: tableName });
         sendSocketMessage(socket, { type: 'Query', table_name: tableName });
@@ -281,6 +314,7 @@ export function useTableWebSocket(
             lastAppliedSeqRef.current = replay.lastAppliedSeq;
             dataRef.current = replay.rows;
             setData(replay.rows);
+            syncGapTimer(socket);
             break;
           }
           case 'RowInserted':
@@ -301,6 +335,7 @@ export function useTableWebSocket(
               lastAppliedSeqRef.current = replay.lastAppliedSeq;
               dataRef.current = replay.rows;
               setData(replay.rows);
+              syncGapTimer(socket);
             }
             break;
           }
@@ -320,6 +355,7 @@ export function useTableWebSocket(
           wsRef.current = null;
         }
         setConnected(false);
+        clearGapTimer();
 
         if (disposed) {
           return;
@@ -336,6 +372,7 @@ export function useTableWebSocket(
     return () => {
       disposed = true;
       clearReconnectTimer();
+      clearGapTimer();
       const activeSocket = wsRef.current;
       wsRef.current = null;
       activeSocket?.close();

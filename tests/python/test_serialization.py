@@ -329,6 +329,32 @@ class TestFromJson:
         assert table.get_row(0)["value"] == 100
         assert table.get_row(1)["value"] is None
 
+    def test_from_json_null_in_first_row(self):
+        """Types are inferred from the first non-null value, not just row 0"""
+        json_str = '[{"id": null, "score": null}, {"id": 7, "score": 1.5}]'
+        table = livetable.Table.from_json("test", json_str)
+
+        assert len(table) == 2
+        assert table.get_row(0)["id"] is None
+        assert table.get_row(1)["id"] == 7
+        assert table.get_row(1)["score"] == 1.5
+
+    def test_from_json_mixed_int_sizes(self):
+        """A column mixing small and large integers widens to INT64"""
+        json_str = '[{"id": 1}, {"id": 5000000000}]'
+        table = livetable.Table.from_json("test", json_str)
+
+        assert table.get_row(0)["id"] == 1
+        assert table.get_row(1)["id"] == 5000000000
+
+    def test_from_json_mixed_int_and_float(self):
+        """A column mixing ints and floats widens to FLOAT64"""
+        json_str = '[{"x": 1}, {"x": 2.5}]'
+        table = livetable.Table.from_json("test", json_str)
+
+        assert table.get_row(0)["x"] == 1.0
+        assert table.get_row(1)["x"] == 2.5
+
     def test_from_json_empty_array_error(self):
         """JSON import should error on empty array"""
         with pytest.raises(ValueError, match="empty"):

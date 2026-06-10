@@ -104,6 +104,8 @@ cd frontend && npm install && npm run dev
 - Join operations use O(N+M) algorithm
 - WebSocket protocol: `UpdateCell`, `AddRow`, `DeleteRow` messages with broadcast to all clients
 - WebSocket reconciliation: every `TableData` and delta carries a monotonic `seq` (the table's `Changeset::total_len`, read under the same lock as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. This closes a snapshot/delta race where a concurrent insert during subscribe could otherwise be applied twice. Keep `seq` populated when adding new server→client messages.
+- WebSocket gap recovery: deltas only apply contiguously (`seq == applied + 1`); if a gap persists for `SEQ_GAP_REQUERY_MS` the client re-sends `Query` and re-baselines from the fresh snapshot (`useTableWebSocket.ts`). Cell edits are server-authoritative: on blur the input snaps back to the last confirmed value and only the `CellUpdated` broadcast echo moves it forward, so rejected updates (e.g. null into a non-nullable column) self-heal.
+- `Table::from_json` infers each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null → STRING); values are then converted against the inferred schema, not in isolation. Incompatible mixes (number + string) are rejected at inference with a clear error.
 - JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
 - String columns use `NULL_STRING_ID` (u32::MAX) as null sentinel in `string_ids` — never use 0
 - `Column::check_value_type(&value)` validates without consuming — use before batch mutations
