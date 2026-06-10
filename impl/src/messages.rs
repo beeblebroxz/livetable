@@ -88,8 +88,33 @@ pub enum ServerMessage {
     },
 
     /// Subscription confirmed
-    Subscribed { table_name: String },
+    Subscribed {
+        table_name: String,
+        /// Wire-protocol version, so clients can detect a mismatched server
+        /// instead of failing mysteriously on unknown message shapes.
+        protocol_version: u32,
+    },
 
     /// Error occurred
     Error { message: String },
+}
+
+/// Current server→client wire-protocol version. Bump on breaking changes to
+/// message shapes or semantics.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subscribed_carries_protocol_version() {
+        let msg = ServerMessage::Subscribed {
+            table_name: "demo".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"protocol_version\":1"), "got: {}", json);
+        assert!(json.contains("\"type\":\"Subscribed\""), "got: {}", json);
+    }
 }

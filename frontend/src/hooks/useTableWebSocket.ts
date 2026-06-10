@@ -20,6 +20,15 @@ const configuredWsUrl = import.meta.env.VITE_LIVETABLE_WS_URL;
 // lost and re-query for a fresh snapshot.
 export const SEQ_GAP_REQUERY_MS = 3000;
 
+// Upper bound on buffered out-of-order/pre-snapshot deltas. Overflow evicts
+// the oldest; the resulting seq gap is recovered by the re-query path.
+export const MAX_PENDING_DELTAS = 500;
+
+// Wire-protocol version this client understands. The server reports its own
+// in the Subscribed handshake; a mismatch is logged so protocol drift is
+// visible instead of failing mysteriously.
+export const SUPPORTED_PROTOCOL_VERSION = 1;
+
 const getDefaultWebSocketUrl = () => {
   if (configuredWsUrl) {
     return configuredWsUrl;
@@ -134,6 +143,15 @@ const parseServerMessage = (payload: unknown): ServerMessage | null => {
 
 const sendSocketMessage = (socket: WebSocket, message: ClientMessage) => {
   socket.send(JSON.stringify(message));
+};
+
+// Buffer a delta, evicting the oldest entries past MAX_PENDING_DELTAS. An
+// evicted delta shows up later as a seq gap, which the re-query path heals.
+const pushPendingDelta = (pending: DeltaMessage[], delta: DeltaMessage): DeltaMessage[] => {
+  pending.push(delta);
+  return pending.length > MAX_PENDING_DELTAS
+    ? pending.slice(pending.length - MAX_PENDING_DELTAS)
+    : pending;
 };
 
 const applyServerMessage = (
@@ -323,9 +341,15 @@ export function useTableWebSocket(
             const lastAppliedSeq = lastAppliedSeqRef.current;
             if (lastAppliedSeq === null) {
               // No baseline yet — buffer until the snapshot defines the cutoff.
-              pendingDeltasRef.current.push(message);
+              pendingDeltasRef.current = pushPendingDelta(
+                pendingDeltasRef.current,
+                message
+              );
             } else {
-              pendingDeltasRef.current.push(message);
+              pendingDeltasRef.current = pushPendingDelta(
+                pendingDeltasRef.current,
+                message
+              );
               const replay = applyBufferedDeltasInSequence(
                 dataRef.current,
                 pendingDeltasRef.current,
@@ -341,6 +365,16 @@ export function useTableWebSocket(
           }
           case 'Subscribed':
             logDebug('Subscribed to', message.table_name);
+            if (
+              message.protocol_version !== undefined &&
+              message.protocol_version !== SUPPORTED_PROTOCOL_VERSION
+            ) {
+              console.warn(
+                `Server reports protocol version ${message.protocol_version}, ` +
+                  `but this client supports ${SUPPORTED_PROTOCOL_VERSION}; ` +
+                  'updates may not apply correctly'
+              );
+            }
             break;
           case 'Error':
             console.error('Server error:', message.message);

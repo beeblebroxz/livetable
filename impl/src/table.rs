@@ -630,12 +630,31 @@ impl Table {
             ));
         }
 
-        let mut result = HashMap::new();
-
-        for (i, col) in self.columns.iter_mut().enumerate() {
-            let col_name = self.schema.get_column_info(i).unwrap().0;
-            result.insert(col_name.to_string(), col.delete(index)?);
+        // Two-phase commit: if any column's delete fails (e.g. a desynced
+        // length or poisoned interner mutex), re-insert the already-deleted
+        // values so no column is left one row short.
+        let mut deleted: Vec<ColumnValue> = Vec::with_capacity(self.columns.len());
+        for i in 0..self.columns.len() {
+            match self.columns[i].delete(index) {
+                Ok(value) => deleted.push(value),
+                Err(e) => {
+                    for (j, value) in deleted.into_iter().enumerate() {
+                        let _ = self.columns[j].insert(index, value);
+                    }
+                    let col_name = self.schema.get_column_info(i).unwrap().0;
+                    return Err(format!("Column '{}': {}", col_name, e));
+                }
+            }
         }
+
+        let result: HashMap<String, ColumnValue> = deleted
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let col_name = self.schema.get_column_info(i).unwrap().0;
+                (col_name.to_string(), value)
+            })
+            .collect();
 
         self.row_count -= 1;
 
@@ -925,12 +944,13 @@ impl Table {
     /// Create a table from a CSV string.
     ///
     /// The first line is treated as the header row containing column names.
-    /// Column types are inferred from the first data row:
-    /// - Numbers that fit in i32 → INT32
-    /// - Larger integers → INT64
-    /// - Numbers with decimals → FLOAT64
+    /// Column types are inferred by scanning every data row and unifying:
+    /// - Numbers that fit in i32 → INT32, widened to INT64 (or FLOAT64 when
+    ///   any value has a decimal point) as later rows require
     /// - "true"/"false" (case-insensitive) → BOOL
-    /// - Everything else → STRING
+    /// - Dates → DATE, widened to DATETIME if any value carries a time
+    /// - Empty values are skipped for inference (they import as NULL)
+    /// - Anything else, or a column mixing incompatible types → STRING
     ///
     /// All columns are created as nullable to handle empty values.
     ///
@@ -964,21 +984,20 @@ impl Table {
             .filter(|row| !row.iter().all(|f| f.is_empty()))
             .collect();
 
-        // Infer types from first row (or default to STRING if no data)
+        // Infer types from all rows (or default to STRING if no data)
         let types = if rows.is_empty() {
             // No data rows - default all columns to STRING
             vec![ColumnType::String; column_names.len()]
         } else {
-            let inferred = infer_types_from_csv_row(rows.first());
-            // Ensure we have the right number of types
-            if inferred.len() != column_names.len() {
+            let first_len = rows.first().map(|r| r.len()).unwrap_or(0);
+            if first_len != column_names.len() {
                 return Err(format!(
                     "Column count mismatch: header has {}, but data row has {} values",
                     column_names.len(),
-                    inferred.len()
+                    first_len
                 ));
             }
-            inferred
+            infer_types_from_csv_rows(&rows, column_names.len())
         };
 
         // Create schema (all nullable)
@@ -1322,13 +1341,42 @@ fn parse_csv_rows(csv: &str) -> Vec<Vec<String>> {
 }
 
 /// Infer column types from a CSV row
-fn infer_types_from_csv_row(row: Option<&Vec<String>>) -> Vec<ColumnType> {
-    match row {
-        None => Vec::new(),
-        Some(values) => values
-            .iter()
-            .map(|v| infer_type_from_csv_value(v))
-            .collect(),
+/// Infer each column's type by unifying every non-empty value across all
+/// rows. Empty values import as NULL and don't influence the type; a column
+/// with no non-empty values defaults to STRING.
+fn infer_types_from_csv_rows(rows: &[Vec<String>], column_count: usize) -> Vec<ColumnType> {
+    (0..column_count)
+        .map(|i| {
+            let mut inferred: Option<ColumnType> = None;
+            for row in rows {
+                let value = row.get(i).map(|s| s.trim()).unwrap_or("");
+                if value.is_empty() {
+                    continue;
+                }
+                let natural = infer_type_from_csv_value(value);
+                inferred = Some(match inferred {
+                    None => natural,
+                    Some(prev) => unify_csv_column_types(prev, natural),
+                });
+            }
+            inferred.unwrap_or(ColumnType::String)
+        })
+        .collect()
+}
+
+/// Combine the types of two CSV values in the same column. Numeric and
+/// temporal families widen; any other mix is STRING — every CSV value is a
+/// string at heart, so that fallback is always lossless.
+fn unify_csv_column_types(a: ColumnType, b: ColumnType) -> ColumnType {
+    use ColumnType::*;
+    if a == b {
+        return a;
+    }
+    match (a, b) {
+        (Int32, Int64) | (Int64, Int32) => Int64,
+        (Int32 | Int64, Float64) | (Float64, Int32 | Int64) => Float64,
+        (Date, DateTime) | (DateTime, Date) => DateTime,
+        _ => String,
     }
 }
 
@@ -1435,6 +1483,8 @@ fn parse_csv_value(value: &str, col_type: ColumnType) -> Result<ColumnValue, Str
             .map(ColumnValue::Date)
             .ok_or_else(|| format!("Cannot parse '{}' as DATE (expected YYYY-MM-DD)", trimmed)),
         ColumnType::DateTime => parse_datetime(trimmed)
+            // A bare date in a DATETIME column lands at midnight
+            .or_else(|| parse_date(trimmed).map(|days| days as i64 * 86_400_000))
             .map(ColumnValue::DateTime)
             .ok_or_else(|| {
                 format!(
@@ -2109,6 +2159,106 @@ mod tests {
             table.get_value(1, "note").unwrap().as_string(),
             Some("2024-01-15")
         );
+    }
+
+    #[test]
+    fn test_delete_row_rolls_back_on_partial_failure() {
+        let schema = Schema::new(vec![
+            ("a".to_string(), ColumnType::Int32, false),
+            ("b".to_string(), ColumnType::String, false),
+        ]);
+        let mut table = Table::new("test".to_string(), schema);
+        for (a, b) in [(1, "x"), (2, "y")] {
+            let mut row = HashMap::new();
+            row.insert("a".to_string(), ColumnValue::Int32(a));
+            row.insert("b".to_string(), ColumnValue::String(b.to_string()));
+            table.append_row(row).unwrap();
+        }
+
+        // Inject a fault: shorten column "b" so its delete(1) fails after
+        // column "a" has already deleted successfully.
+        table.columns[1].truncate_to(1);
+
+        assert!(table.delete_row(1).is_err());
+
+        // Column "a" must be rolled back, not left one row short.
+        assert_eq!(table.columns[0].len(), 2);
+        assert_eq!(table.get_value(1, "a").unwrap().as_i32(), Some(2));
+        assert_eq!(table.len(), 2, "row_count must be unchanged on failure");
+    }
+
+    #[test]
+    fn test_from_csv_empty_in_first_row_infers_from_later_rows() {
+        // Fully empty rows are skipped entirely, so use a partially empty one
+        let csv = "id,score\n,9.5\n7,1.5";
+        let table = Table::from_csv("test", csv).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("id"),
+            Some(ColumnType::Int32)
+        );
+        assert_eq!(
+            table.schema().get_column_type("score"),
+            Some(ColumnType::Float64)
+        );
+        assert!(table.get_value(0, "id").unwrap().is_null());
+        assert_eq!(table.get_value(1, "id").unwrap().as_i32(), Some(7));
+    }
+
+    #[test]
+    fn test_from_csv_widens_int32_to_int64() {
+        let csv = "id\n1\n5000000000";
+        let table = Table::from_csv("test", csv).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("id"),
+            Some(ColumnType::Int64)
+        );
+        assert_eq!(
+            table.get_value(1, "id").unwrap().as_i64(),
+            Some(5_000_000_000)
+        );
+    }
+
+    #[test]
+    fn test_from_csv_widens_int_to_float() {
+        let csv = "x\n1\n2.5";
+        let table = Table::from_csv("test", csv).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("x"),
+            Some(ColumnType::Float64)
+        );
+        assert_eq!(table.get_value(0, "x").unwrap().as_f64(), Some(1.0));
+        assert_eq!(table.get_value(1, "x").unwrap().as_f64(), Some(2.5));
+    }
+
+    #[test]
+    fn test_from_csv_mixed_types_fall_back_to_string() {
+        // CSV values are all strings at heart, so a number/text mix is STRING
+        let csv = "x\n1\nhello";
+        let table = Table::from_csv("test", csv).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("x"),
+            Some(ColumnType::String)
+        );
+        assert_eq!(table.get_value(0, "x").unwrap().as_string(), Some("1"));
+        assert_eq!(table.get_value(1, "x").unwrap().as_string(), Some("hello"));
+    }
+
+    #[test]
+    fn test_from_csv_widens_date_to_datetime() {
+        let csv = "ts\n2024-01-15\n2024-01-15T10:30:00";
+        let table = Table::from_csv("test", csv).unwrap();
+
+        assert_eq!(
+            table.schema().get_column_type("ts"),
+            Some(ColumnType::DateTime)
+        );
+        let day_ms = 86_400_000i64;
+        let midnight = table.get_value(0, "ts").unwrap().as_datetime().unwrap();
+        assert_eq!(midnight % day_ms, 0);
     }
 
     #[test]

@@ -199,6 +199,26 @@ class TestSchemaAwareTypedConversion:
         table.insert_row(1, {"score": 2})
         assert table.get_value(1, "score") == 2.0
 
+    def test_int32_overflow_error_names_the_problem(self):
+        """An int that doesn't fit INT32 should say overflow, not type error."""
+        schema = livetable.Schema([
+            ("id", livetable.ColumnType.INT32, False),
+        ])
+        table = livetable.Table("int32_overflow", schema)
+
+        with pytest.raises(ValueError, match="out of range for INT32.*INT64"):
+            table.append_row({"id": 5_000_000_000})
+
+    def test_int32_non_integer_error_unchanged(self):
+        """A non-integer value still reports a plain type error."""
+        schema = livetable.Schema([
+            ("id", livetable.ColumnType.INT32, False),
+        ])
+        table = livetable.Table("int32_type", schema)
+
+        with pytest.raises(ValueError, match="Expected INT32"):
+            table.append_row({"id": "not an int"})
+
 
 class TestTableDelete:
     """Test deleting rows from tables"""

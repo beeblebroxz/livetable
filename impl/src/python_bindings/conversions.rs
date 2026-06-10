@@ -180,10 +180,20 @@ fn py_to_column_value_typed(
     }
 
     match expected_type {
-        RustColumnType::Int32 => value
-            .extract::<i32>()
-            .map(RustColumnValue::Int32)
-            .map_err(|_| PyValueError::new_err("Expected INT32 value")),
+        RustColumnType::Int32 => {
+            if let Ok(v) = value.extract::<i32>() {
+                Ok(RustColumnValue::Int32(v))
+            } else if let Ok(v) = value.extract::<i64>() {
+                Err(PyValueError::new_err(format!(
+                    "{} is out of range for INT32 ({}..={}); use an INT64 column",
+                    v,
+                    i32::MIN,
+                    i32::MAX
+                )))
+            } else {
+                Err(PyValueError::new_err("Expected INT32 value"))
+            }
+        }
         RustColumnType::Int64 => {
             if let Ok(v) = value.extract::<i64>() {
                 Ok(RustColumnValue::Int64(v))

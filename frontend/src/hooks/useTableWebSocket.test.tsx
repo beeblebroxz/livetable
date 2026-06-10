@@ -1,6 +1,10 @@
 import { act, render, screen } from '@testing-library/react';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { useTableWebSocket, SEQ_GAP_REQUERY_MS } from './useTableWebSocket';
+import {
+  useTableWebSocket,
+  SEQ_GAP_REQUERY_MS,
+  MAX_PENDING_DELTAS,
+} from './useTableWebSocket';
 import { FakeWebSocket } from '../test/fakeWebSocket';
 
 function HookHarness({ label, wsUrl = 'ws://localhost:8080/ws' }: { label: string; wsUrl?: string }) {
@@ -444,5 +448,95 @@ describe('useTableWebSocket', () => {
     const rendered = screen.getByTestId('client-rows').textContent ?? '[]';
     const rows = JSON.parse(rendered) as { rowId: number }[];
     expect(rows.map((row) => row.rowId)).toEqual([11, 22, 33]);
+  });
+
+  // If the snapshot is slow (or never arrives) the pre-baseline delta buffer
+  // must not grow without bound. Overflow evicts the oldest deltas; the
+  // resulting seq gap is healed by the re-query path.
+  it('bounds the pre-snapshot delta buffer and recovers via re-query', async () => {
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+    });
+
+    // Flood: two more contiguous deltas than the buffer holds, no snapshot yet.
+    await act(async () => {
+      for (let i = 0; i < MAX_PENDING_DELTAS + 2; i++) {
+        socket.receive({
+          type: 'RowInserted',
+          table_name: 'demo',
+          seq: 100 + i,
+          index: i,
+          row_id: 1000 + i,
+          row: { id: i, name: `Row ${i}`, value: i },
+        });
+      }
+    });
+
+    // Snapshot predates the whole flood, so every kept delta is newer — but
+    // the two oldest (seq 100, 101) were evicted, leaving a gap at the front.
+    await act(async () => {
+      socket.receive({
+        type: 'TableData',
+        table_name: 'demo',
+        seq: 99,
+        columns: ['id', 'name', 'value'],
+        rows: [
+          { row_id: 11, row: { id: 1, name: 'Alice', value: 100 } },
+        ],
+      });
+    });
+
+    const rendered = screen.getByTestId('client-rows').textContent ?? '[]';
+    const rows = JSON.parse(rendered) as { rowId: number }[];
+    expect(rows.map((row) => row.rowId)).toEqual([11]);
+
+    // The gap triggers the snapshot re-query, which would heal the state.
+    await act(async () => {
+      vi.advanceTimersByTime(SEQ_GAP_REQUERY_MS);
+    });
+    const queries = socket.sentMessages.filter(
+      (message) => message.type === 'Query'
+    );
+    expect(queries).toHaveLength(2);
+  });
+
+  it('warns when the server reports a different protocol version', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+      socket.receive({
+        type: 'Subscribed',
+        table_name: 'demo',
+        protocol_version: 99,
+      });
+    });
+
+    const warned = warnSpy.mock.calls.flat().join(' ');
+    expect(warned).toContain('protocol version');
+    warnSpy.mockRestore();
+  });
+
+  it('does not warn when the protocol version matches', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    render(<HookHarness label="client" />);
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+      socket.receive({
+        type: 'Subscribed',
+        table_name: 'demo',
+        protocol_version: 1,
+      });
+    });
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 });

@@ -104,8 +104,10 @@ cd frontend && npm install && npm run dev
 - Join operations use O(N+M) algorithm
 - WebSocket protocol: `UpdateCell`, `AddRow`, `DeleteRow` messages with broadcast to all clients
 - WebSocket reconciliation: every `TableData` and delta carries a monotonic `seq` (the table's `Changeset::total_len`, read under the same lock as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. This closes a snapshot/delta race where a concurrent insert during subscribe could otherwise be applied twice. Keep `seq` populated when adding new server→client messages.
-- WebSocket gap recovery: deltas only apply contiguously (`seq == applied + 1`); if a gap persists for `SEQ_GAP_REQUERY_MS` the client re-sends `Query` and re-baselines from the fresh snapshot (`useTableWebSocket.ts`). Cell edits are server-authoritative: on blur the input snaps back to the last confirmed value and only the `CellUpdated` broadcast echo moves it forward, so rejected updates (e.g. null into a non-nullable column) self-heal.
-- `Table::from_json` infers each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null → STRING); values are then converted against the inferred schema, not in isolation. Incompatible mixes (number + string) are rejected at inference with a clear error.
+- WebSocket gap recovery: deltas only apply contiguously (`seq == applied + 1`); if a gap persists for `SEQ_GAP_REQUERY_MS` the client re-sends `Query` and re-baselines from the fresh snapshot (`useTableWebSocket.ts`). The pending-delta buffer is capped at `MAX_PENDING_DELTAS` (oldest evicted; the resulting gap heals via re-query). Cell edits are server-authoritative: on blur the input snaps back to the last confirmed value and only the `CellUpdated` broadcast echo moves it forward, so rejected updates (e.g. null into a non-nullable column) self-heal.
+- WebSocket `Subscribed` carries `protocol_version` (`messages::PROTOCOL_VERSION`); the client warns on mismatch with `SUPPORTED_PROTOCOL_VERSION`. Bump both on breaking wire changes.
+- `Table::from_json`/`from_csv` infer each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null/empty → STRING); values are then converted against the inferred schema, not in isolation. JSON rejects incompatible mixes (number + string) at inference with a clear error; CSV falls back to STRING since every CSV value is a string at heart.
+- Iterator mutation guards: every Py iterator (table and all six views) captures a version at `__iter__` and raises `RuntimeError` from `__next__` if it changes. View iterators use `ReadableTable::version()` (own sync counter + parent version), so both parent mutations and `sync()`/`refresh()` trip the guard.
 - JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
 - String columns use `NULL_STRING_ID` (u32::MAX) as null sentinel in `string_ids` — never use 0
 - `Column::check_value_type(&value)` validates without consuming — use before batch mutations
@@ -131,7 +133,7 @@ cd frontend && npm install && npm run dev
 
 4. **RefCell borrow safety**: When holding `Rc<RefCell<Table>>` borrows in PyO3 code, release the borrow before making Python calls (e.g., pandas DataFrame construction) to avoid panics from GC reentrancy
 
-5. **Mutation safety**: Always validate all values before mutating any column — partial mutations on type errors corrupt column lengths irrecoverably. Use `Column::check_value_type()` for pre-validation.
+5. **Mutation safety**: Always validate all values before mutating any column — partial mutations on type errors corrupt column lengths irrecoverably. Use `Column::check_value_type()` for pre-validation. `append_row` rolls back via `truncate_to` and `delete_row` re-inserts already-deleted values on partial failure; keep two-phase commit semantics when adding row-level mutations.
 
 6. **Float serialization**: `serde_json::Number::from_f64()` returns `None` for NaN/Infinity — always handle with `.unwrap_or(JsonValue::Null)`, never `.unwrap()`
 

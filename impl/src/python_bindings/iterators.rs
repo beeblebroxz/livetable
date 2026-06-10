@@ -132,6 +132,8 @@ pub struct PyJoinViewIterator {
     view: Py<PyJoinView>,
     index: usize,
     length: usize,
+    /// View version (own sync counter + both parents) at iterator creation.
+    start_version: u64,
 }
 
 #[pymethods]
@@ -145,6 +147,11 @@ impl PyJoinViewIterator {
             return Ok(None);
         }
         let view = self.view.borrow(py);
+        if crate::readable::ReadableTable::version(&*view.inner.borrow()) != self.start_version {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parent table mutated during iteration",
+            ));
+        }
         let row = view.get_row(py, self.index)?;
         self.index += 1;
         Ok(Some(row))
@@ -157,6 +164,8 @@ pub struct PySortedViewIterator {
     view: Py<PySortedView>,
     index: usize,
     length: usize,
+    /// View version (own sync counter + parent) at iterator creation.
+    start_version: u64,
 }
 
 #[pymethods]
@@ -170,6 +179,11 @@ impl PySortedViewIterator {
             return Ok(None);
         }
         let view = self.view.borrow(py);
+        if crate::readable::ReadableTable::version(&*view.inner.borrow()) != self.start_version {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parent table mutated during iteration",
+            ));
+        }
         let row = view.get_row(py, self.index)?;
         self.index += 1;
         Ok(Some(row))
@@ -182,6 +196,8 @@ pub struct PyAggregateViewIterator {
     view: Py<PyAggregateView>,
     index: usize,
     length: usize,
+    /// View version (own sync counter + parent) at iterator creation.
+    start_version: u64,
 }
 
 #[pymethods]
@@ -195,6 +211,11 @@ impl PyAggregateViewIterator {
             return Ok(None);
         }
         let view = self.view.borrow(py);
+        if crate::readable::ReadableTable::version(&*view.inner.borrow()) != self.start_version {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Parent table mutated during iteration",
+            ));
+        }
         let row = view.get_row(py, self.index)?;
         self.index += 1;
         Ok(Some(row))

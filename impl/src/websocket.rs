@@ -349,6 +349,7 @@ impl TableWebSocket {
 
                 let response = ServerMessage::Subscribed {
                     table_name: table_name.clone(),
+                    protocol_version: crate::messages::PROTOCOL_VERSION,
                 };
                 ctx.text(serialize_ws_message(&response));
             }

@@ -368,10 +368,62 @@ class TestMutationDuringIteration:
         with pytest.raises(RuntimeError, match="mutated during iteration"):
             next(it)
 
+    def test_sorted_view_detects_parent_mutation(self, sample_table):
+        view = sample_table.sort("score", descending=True)
+        it = iter(view)
+        next(it)
+        sample_table.delete_row(0)
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
+    def test_join_view_detects_left_parent_mutation(self, sample_table):
+        grades = livetable.Table("grades", livetable.Schema([
+            ("id", livetable.ColumnType.INT32, False),
+            ("grade", livetable.ColumnType.STRING, False),
+        ]))
+        grades.append_row({"id": 1, "grade": "A"})
+        grades.append_row({"id": 2, "grade": "B"})
+        grades.append_row({"id": 3, "grade": "A"})
+
+        view = sample_table.join(grades, on="id")
+        it = iter(view)
+        next(it)
+        sample_table.delete_row(0)
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
+    def test_join_view_detects_right_parent_mutation(self, sample_table):
+        grades = livetable.Table("grades", livetable.Schema([
+            ("id", livetable.ColumnType.INT32, False),
+            ("grade", livetable.ColumnType.STRING, False),
+        ]))
+        grades.append_row({"id": 1, "grade": "A"})
+        grades.append_row({"id": 2, "grade": "B"})
+        grades.append_row({"id": 3, "grade": "A"})
+
+        view = sample_table.join(grades, on="id")
+        it = iter(view)
+        next(it)
+        grades.append_row({"id": 99, "grade": "F"})
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
+    def test_aggregate_view_detects_parent_mutation(self, sample_table):
+        view = sample_table.group_by("name", agg=[("total", "score", "sum")])
+        it = iter(view)
+        next(it)
+        sample_table.append_row({"id": 99, "name": "Eve", "score": 70.0})
+        with pytest.raises(RuntimeError, match="mutated during iteration"):
+            next(it)
+
     def test_iteration_completes_without_mutation(self, sample_table):
         """Baseline: unmutated iteration must still work."""
         rows = list(sample_table)
         assert len(rows) == 3
+        sorted_rows = list(sample_table.sort("score"))
+        assert len(sorted_rows) == 3
+        groups = list(sample_table.group_by("name", agg=[("total", "score", "sum")]))
+        assert len(groups) == 3
 
 
 class TestReentrantCallbackSafety:

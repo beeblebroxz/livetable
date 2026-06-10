@@ -2119,11 +2119,18 @@ impl PyJoinView {
     /// Return an iterator over the joined rows.
     /// Enables: `for row in join_view:`
     fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyJoinViewIterator> {
-        let length = slf.inner.borrow().len();
+        let (length, start_version) = {
+            let inner = slf.inner.borrow();
+            (
+                inner.len(),
+                crate::readable::ReadableTable::version(&*inner),
+            )
+        };
         Ok(PyJoinViewIterator {
             view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
+            start_version,
         })
     }
 }
@@ -2361,11 +2368,18 @@ impl PySortedView {
     /// Return an iterator over the sorted rows.
     /// Enables: `for row in sorted_view:`
     fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PySortedViewIterator> {
-        let length = slf.inner.borrow().len();
+        let (length, start_version) = {
+            let inner = slf.inner.borrow();
+            (
+                inner.len(),
+                crate::readable::ReadableTable::version(&*inner),
+            )
+        };
         Ok(PySortedViewIterator {
             view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
+            start_version,
         })
     }
 }
@@ -2618,11 +2632,18 @@ impl PyAggregateView {
     /// Return an iterator over the aggregated groups.
     /// Enables: `for group in aggregate_view:`
     fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyAggregateViewIterator> {
-        let length = slf.inner.borrow().len();
+        let (length, start_version) = {
+            let inner = slf.inner.borrow();
+            (
+                inner.len(),
+                crate::readable::ReadableTable::version(&*inner),
+            )
+        };
         Ok(PyAggregateViewIterator {
             view: slf.into_py(py).extract(py)?,
             index: 0,
             length,
+            start_version,
         })
     }
 }
