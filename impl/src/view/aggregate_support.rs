@@ -4,6 +4,7 @@
 //! `view.rs::AggregateView` are exposed as `pub(super)`; the rest stays
 //! private to this submodule.
 
+use super::JoinKeyPart;
 use crate::column::ColumnValue;
 use crate::table::Table;
 use std::collections::{HashMap, HashSet};
@@ -192,179 +193,92 @@ impl GroupState {
     }
 }
 
-/// A key for grouping rows - vector of column values converted to comparable strings
+/// A key for grouping rows — one typed part per group-by column, `None` = NULL.
+///
+/// Uses the same typed `JoinKeyPart` representation as joins, but with a
+/// different float policy: GROUP BY folds all NaNs into a single group
+/// (Postgres-style) and folds -0.0 into +0.0 (they compare equal), whereas
+/// joins exclude NaN keys entirely.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct GroupKey(Vec<Option<String>>);
+pub(super) struct GroupKey(Vec<Option<JoinKeyPart>>);
+
+fn canonical_f32_bits(v: f32) -> u32 {
+    if v.is_nan() {
+        f32::NAN.to_bits()
+    } else if v == 0.0 {
+        0.0_f32.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
+fn canonical_f64_bits(v: f64) -> u64 {
+    if v.is_nan() {
+        f64::NAN.to_bits()
+    } else if v == 0.0 {
+        0.0_f64.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
+/// Convert a group-by column value into a typed key part (None = NULL group).
+fn group_key_part(value: ColumnValue) -> Option<JoinKeyPart> {
+    match value {
+        ColumnValue::Float32(v) => Some(JoinKeyPart::Float32Bits(canonical_f32_bits(v))),
+        ColumnValue::Float64(v) => Some(JoinKeyPart::Float64Bits(canonical_f64_bits(v))),
+        other => super::column_value_into_join_key_part(other),
+    }
+}
 
 impl GroupKey {
     pub(super) fn from_row(row: &HashMap<String, ColumnValue>, group_by: &[String]) -> Self {
-        let values: Vec<Option<String>> = group_by
-            .iter()
-            .map(|col| {
-                row.get(col).and_then(|v| match v {
-                    ColumnValue::Null => None,
-                    ColumnValue::Int32(n) => Some(format!("i{}", n)),
-                    ColumnValue::Int64(n) => Some(format!("I{}", n)),
-                    ColumnValue::Float32(f) => Some(format!("f{}", f)),
-                    ColumnValue::Float64(f) => Some(format!("F{}", f)),
-                    ColumnValue::String(s) => Some(format!("s{}", s)),
-                    ColumnValue::Bool(b) => Some(if *b {
-                        "B1".to_string()
-                    } else {
-                        "B0".to_string()
-                    }),
-                    ColumnValue::Date(d) => Some(format!("d{}", d)),
-                    ColumnValue::DateTime(dt) => Some(format!("D{}", dt)),
-                })
-            })
-            .collect();
-        GroupKey(values)
+        GroupKey(
+            group_by
+                .iter()
+                .map(|col| row.get(col).cloned().and_then(group_key_part))
+                .collect(),
+        )
     }
 
     /// Build GroupKey directly from table using column indices (faster than from_row)
     pub(super) fn from_indices(table: &Table, row_idx: usize, col_indices: &[usize]) -> Self {
-        let values: Vec<Option<String>> = col_indices
-            .iter()
-            .map(|&col_idx| match table.get_value_by_index(row_idx, col_idx) {
-                Ok(ColumnValue::Null) => None,
-                Ok(ColumnValue::Int32(v)) => Some(format!("i{}", v)),
-                Ok(ColumnValue::Int64(v)) => Some(format!("I{}", v)),
-                Ok(ColumnValue::Float32(v)) => Some(format!("f{}", v)),
-                Ok(ColumnValue::Float64(v)) => Some(format!("F{}", v)),
-                Ok(ColumnValue::String(s)) => Some(format!("s{}", s)),
-                Ok(ColumnValue::Bool(b)) => Some(if b {
-                    "B1".to_string()
-                } else {
-                    "B0".to_string()
-                }),
-                Ok(ColumnValue::Date(d)) => Some(format!("d{}", d)),
-                Ok(ColumnValue::DateTime(dt)) => Some(format!("D{}", dt)),
-                Err(_) => None,
-            })
-            .collect();
-        GroupKey(values)
+        GroupKey(
+            col_indices
+                .iter()
+                .map(|&col_idx| {
+                    table
+                        .get_value_by_index(row_idx, col_idx)
+                        .ok()
+                        .and_then(group_key_part)
+                })
+                .collect(),
+        )
     }
 
     #[inline]
     pub(super) fn from_single_int(value: i32) -> Self {
-        GroupKey(vec![Some(format!("i{}", value))])
+        GroupKey(vec![Some(JoinKeyPart::Int32(value))])
     }
 
-    pub(super) fn to_column_values(
-        &self,
-        group_by: &[String],
-        parent: &Table,
-    ) -> HashMap<String, ColumnValue> {
-        let mut result = HashMap::new();
-        for (i, col_name) in group_by.iter().enumerate() {
-            let value = match &self.0[i] {
-                None => ColumnValue::Null,
-                Some(s) => {
-                    if let Some(col_idx) = parent.schema().get_column_index(col_name) {
-                        if let Some((_, col_type, _)) = parent.schema().get_column_info(col_idx) {
-                            match col_type {
-                                crate::column::ColumnType::String => {
-                                    if let Some(stripped) = s.strip_prefix('s') {
-                                        ColumnValue::String(stripped.to_string())
-                                    } else if s.starts_with("String(\"") && s.ends_with("\")") {
-                                        let inner = &s[8..s.len() - 2];
-                                        ColumnValue::String(inner.to_string())
-                                    } else {
-                                        ColumnValue::String(s.clone())
-                                    }
-                                }
-                                crate::column::ColumnType::Int32 => {
-                                    if let Some(stripped) = s.strip_prefix('i') {
-                                        stripped
-                                            .parse()
-                                            .map(ColumnValue::Int32)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else if s.starts_with("Int32(") && s.ends_with(')') {
-                                        let inner = &s[6..s.len() - 1];
-                                        inner
-                                            .parse()
-                                            .map(ColumnValue::Int32)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Int64 => {
-                                    if let Some(stripped) = s.strip_prefix('I') {
-                                        stripped
-                                            .parse()
-                                            .map(ColumnValue::Int64)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else if s.starts_with("Int64(") && s.ends_with(')') {
-                                        let inner = &s[6..s.len() - 1];
-                                        inner
-                                            .parse()
-                                            .map(ColumnValue::Int64)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Float32 => {
-                                    if let Some(stripped) = s.strip_prefix('f') {
-                                        stripped
-                                            .parse()
-                                            .map(ColumnValue::Float32)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Float64 => {
-                                    if let Some(stripped) = s.strip_prefix('F') {
-                                        stripped
-                                            .parse()
-                                            .map(ColumnValue::Float64)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Bool => {
-                                    if s == "B1" || s == "Bool(true)" {
-                                        ColumnValue::Bool(true)
-                                    } else if s == "B0" || s == "Bool(false)" {
-                                        ColumnValue::Bool(false)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::Date => {
-                                    if let Some(stripped) = s.strip_prefix('d') {
-                                        stripped
-                                            .parse()
-                                            .map(ColumnValue::Date)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                                crate::column::ColumnType::DateTime => {
-                                    if let Some(stripped) = s.strip_prefix('D') {
-                                        stripped
-                                            .parse()
-                                            .map(ColumnValue::DateTime)
-                                            .unwrap_or(ColumnValue::Null)
-                                    } else {
-                                        ColumnValue::Null
-                                    }
-                                }
-                            }
-                        } else {
-                            ColumnValue::String(s.clone())
-                        }
-                    } else {
-                        ColumnValue::String(s.clone())
-                    }
-                }
-            };
-            result.insert(col_name.clone(), value);
-        }
-        result
+    pub(super) fn to_column_values(&self, group_by: &[String]) -> HashMap<String, ColumnValue> {
+        group_by
+            .iter()
+            .zip(&self.0)
+            .map(|(col_name, part)| {
+                let value = match part {
+                    None => ColumnValue::Null,
+                    Some(JoinKeyPart::Int32(v)) => ColumnValue::Int32(*v),
+                    Some(JoinKeyPart::Int64(v)) => ColumnValue::Int64(*v),
+                    Some(JoinKeyPart::Float32Bits(b)) => ColumnValue::Float32(f32::from_bits(*b)),
+                    Some(JoinKeyPart::Float64Bits(b)) => ColumnValue::Float64(f64::from_bits(*b)),
+                    Some(JoinKeyPart::String(s)) => ColumnValue::String(s.clone()),
+                    Some(JoinKeyPart::Bool(b)) => ColumnValue::Bool(*b),
+                    Some(JoinKeyPart::Date(d)) => ColumnValue::Date(*d),
+                    Some(JoinKeyPart::DateTime(dt)) => ColumnValue::DateTime(*dt),
+                };
+                (col_name.clone(), value)
+            })
+            .collect()
     }
 }

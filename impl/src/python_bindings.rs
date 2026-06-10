@@ -625,21 +625,27 @@ impl PyTable {
 
         // Try string for column access
         if let Ok(column_name) = key.extract::<String>() {
-            let table = self.inner.borrow();
-            let column_names = table.schema().get_column_names();
-            if !column_names.iter().any(|c| c == &column_name) {
-                return Err(PyKeyError::new_err(format!(
-                    "Column '{}' not found. Available columns: {:?}",
-                    column_name, column_names
-                )));
-            }
+            // Collect values under the borrow, then release it before calling
+            // into Python: column_value_to_py can re-enter the interpreter
+            // (datetime import), where GC may touch this same table.
+            let values: Vec<RustColumnValue> = {
+                let table = self.inner.borrow();
+                let column_names = table.schema().get_column_names();
+                if !column_names.iter().any(|c| c == &column_name) {
+                    return Err(PyKeyError::new_err(format!(
+                        "Column '{}' not found. Available columns: {:?}",
+                        column_name, column_names
+                    )));
+                }
+                (0..table_len)
+                    .map(|i| table.get_value(i, &column_name))
+                    .collect::<Result<_, _>>()
+                    .map_err(PyIndexError::new_err)?
+            };
 
             let list = PyList::empty_bound(py);
-            for i in 0..table_len {
-                let value = table
-                    .get_value(i, &column_name)
-                    .map_err(PyIndexError::new_err)?;
-                list.append(column_value_to_py(py, &value)?)?;
+            for value in &values {
+                list.append(column_value_to_py(py, value)?)?;
             }
             return Ok(list.to_object(py));
         }

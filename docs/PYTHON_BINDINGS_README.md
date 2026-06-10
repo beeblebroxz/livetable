@@ -198,6 +198,11 @@ agg = livetable.AggregateView(
     ]
 )
 
+# NaN handling: float NaN values in aggregated columns are excluded like NULL
+# (they would otherwise permanently poison incremental SUM/AVG/percentile state).
+# In group-by keys, all NaNs form a single group (Postgres-style) and -0.0
+# groups together with 0.0.
+
 # Access aggregated data
 for i in range(len(agg)):
     row = agg.get_row(i)
@@ -442,7 +447,10 @@ with open("data.csv", "r") as f:
 
 ### ✅ Date and DateTime Types
 
-Native support for dates and timestamps:
+Native support for dates and timestamps. DATETIME values are stored as naive
+(timezone-less) timestamps; timezone-aware `datetime` objects are rejected with
+a `ValueError` — convert first with
+`dt.astimezone(timezone.utc).replace(tzinfo=None)`:
 
 ```python
 from datetime import date, datetime

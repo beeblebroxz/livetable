@@ -25,6 +25,9 @@ type ComputeFunction = dyn Fn(&HashMap<String, ColumnValue>) -> ColumnValue;
 /// Float variants store IEEE 754 bit patterns so `Eq`/`Hash` derive cleanly.
 /// Per SQL semantics, NaN never equals anything: builders return `None` for any
 /// NaN-bearing row, which excludes it from joins.
+///
+/// Also reused by `aggregate_support::GroupKey`, which applies a different
+/// float policy (NaN/-0.0 canonicalized instead of excluded — see there).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum JoinKeyPart {
     Int32(i32),
@@ -2320,7 +2323,12 @@ impl AggregateView {
         match value {
             ColumnValue::Int32(v) => Some(*v as f64),
             ColumnValue::Int64(v) => Some(*v as f64),
+            // NaN is excluded like NULL: once a NaN enters the running state it
+            // can never be removed (sum -= NaN stays NaN, and binary search in
+            // sorted_values can't locate it), permanently corrupting the group.
+            ColumnValue::Float32(v) if v.is_nan() => None,
             ColumnValue::Float32(v) => Some(*v as f64),
+            ColumnValue::Float64(v) if v.is_nan() => None,
             ColumnValue::Float64(v) => Some(*v),
             ColumnValue::Null => None,
             _ => None, // String, Bool not numeric
@@ -2358,10 +2366,9 @@ impl AggregateView {
         }
 
         let key = &self.group_order[index];
-        let parent = self.parent.borrow();
         let mut result =
             HashMap::with_capacity(self.group_by_columns.len() + self.aggregations.len());
-        result.extend(key.to_column_values(&self.group_by_columns, &parent));
+        result.extend(key.to_column_values(&self.group_by_columns));
 
         if let Some(state) = self.groups.get(key) {
             for (result_col, source_col, func) in &self.aggregations {
@@ -2381,8 +2388,7 @@ impl AggregateView {
 
         // Check if it's a group-by column
         if self.group_by_columns.iter().any(|c| c == column) {
-            let parent = self.parent.borrow();
-            let values = key.to_column_values(&self.group_by_columns, &parent);
+            let values = key.to_column_values(&self.group_by_columns);
             return values
                 .get(column)
                 .cloned()
@@ -6604,5 +6610,201 @@ mod tests {
         // Expected: (left.id=1, right.id=1), (left.id=2, right=None)
         let result = collect_join_rows(&joined);
         assert_eq!(result, vec![(Some(1), Some(1)), (Some(2), None)]);
+    }
+
+    // === NaN handling in aggregates ===
+
+    #[test]
+    fn test_aggregate_nan_values_excluded_like_null() {
+        let schema = Schema::new(vec![
+            ("region".to_string(), ColumnType::String, false),
+            ("amount".to_string(), ColumnType::Float64, false),
+        ]);
+
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+        {
+            let mut t = table.borrow_mut();
+            for v in [10.0, f64::NAN, 20.0] {
+                let mut row = HashMap::new();
+                row.insert(
+                    "region".to_string(),
+                    ColumnValue::String("North".to_string()),
+                );
+                row.insert("amount".to_string(), ColumnValue::Float64(v));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let mut agg = AggregateView::new(
+            "by_region".to_string(),
+            table.clone(),
+            vec!["region".to_string()],
+            vec![
+                (
+                    "total".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Sum,
+                ),
+                (
+                    "average".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Avg,
+                ),
+                (
+                    "cnt".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Count,
+                ),
+                (
+                    "lo".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Min,
+                ),
+                (
+                    "hi".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Max,
+                ),
+                (
+                    "med".to_string(),
+                    "amount".to_string(),
+                    AggregateFunction::Median,
+                ),
+            ],
+        )
+        .unwrap();
+
+        let get_f64 = |row: &HashMap<String, ColumnValue>, col: &str| -> f64 {
+            match row.get(col).unwrap() {
+                ColumnValue::Float64(v) => *v,
+                other => panic!("Expected Float64 for {}, got {:?}", col, other),
+            }
+        };
+
+        assert_eq!(agg.len(), 1);
+        let row = agg.get_row(0).unwrap();
+        assert!((get_f64(&row, "total") - 30.0).abs() < 1e-9);
+        assert!((get_f64(&row, "average") - 15.0).abs() < 1e-9);
+        assert_eq!(row.get("cnt").unwrap(), &ColumnValue::Int64(2));
+        assert!((get_f64(&row, "lo") - 10.0).abs() < 1e-9);
+        assert!((get_f64(&row, "hi") - 20.0).abs() < 1e-9);
+        assert!((get_f64(&row, "med") - 15.0).abs() < 1e-9);
+
+        // Deleting the NaN row must not corrupt the running state
+        table.borrow_mut().delete_row(1).unwrap();
+        agg.sync();
+        let row = agg.get_row(0).unwrap();
+        assert!((get_f64(&row, "total") - 30.0).abs() < 1e-9);
+        assert_eq!(row.get("cnt").unwrap(), &ColumnValue::Int64(2));
+        assert!((get_f64(&row, "med") - 15.0).abs() < 1e-9);
+
+        // Subsequent inserts keep working on the same state
+        {
+            let mut row = HashMap::new();
+            row.insert(
+                "region".to_string(),
+                ColumnValue::String("North".to_string()),
+            );
+            row.insert("amount".to_string(), ColumnValue::Float64(40.0));
+            table.borrow_mut().append_row(row).unwrap();
+        }
+        agg.sync();
+        let row = agg.get_row(0).unwrap();
+        assert!((get_f64(&row, "total") - 70.0).abs() < 1e-9);
+        assert_eq!(row.get("cnt").unwrap(), &ColumnValue::Int64(3));
+        assert!((get_f64(&row, "med") - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_aggregate_group_key_negative_zero_groups_with_positive_zero() {
+        let schema = Schema::new(vec![
+            ("price".to_string(), ColumnType::Float64, false),
+            ("qty".to_string(), ColumnType::Int32, false),
+        ]);
+
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+        {
+            let mut t = table.borrow_mut();
+            for (p, q) in [(0.0_f64, 1), (-0.0_f64, 2)] {
+                let mut row = HashMap::new();
+                row.insert("price".to_string(), ColumnValue::Float64(p));
+                row.insert("qty".to_string(), ColumnValue::Int32(q));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let agg = AggregateView::new(
+            "by_price".to_string(),
+            table.clone(),
+            vec!["price".to_string()],
+            vec![(
+                "total_qty".to_string(),
+                "qty".to_string(),
+                AggregateFunction::Sum,
+            )],
+        )
+        .unwrap();
+
+        // 0.0 == -0.0, so they must form a single group
+        assert_eq!(agg.len(), 1);
+        let row = agg.get_row(0).unwrap();
+        match row.get("total_qty").unwrap() {
+            ColumnValue::Float64(v) => assert!((*v - 3.0).abs() < 1e-9),
+            other => panic!("Expected Float64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_aggregate_group_key_nan_single_group_distinct_from_null() {
+        let schema = Schema::new(vec![
+            ("bucket".to_string(), ColumnType::Float64, true),
+            ("amount".to_string(), ColumnType::Float64, false),
+        ]);
+
+        let table = Rc::new(RefCell::new(Table::new("test".to_string(), schema)));
+        {
+            let mut t = table.borrow_mut();
+            for (b, a) in [
+                (ColumnValue::Float64(f64::NAN), 1.0),
+                (ColumnValue::Float64(f64::NAN), 2.0),
+                (ColumnValue::Null, 5.0),
+            ] {
+                let mut row = HashMap::new();
+                row.insert("bucket".to_string(), b);
+                row.insert("amount".to_string(), ColumnValue::Float64(a));
+                t.append_row(row).unwrap();
+            }
+        }
+
+        let agg = AggregateView::new(
+            "by_bucket".to_string(),
+            table.clone(),
+            vec!["bucket".to_string()],
+            vec![(
+                "total".to_string(),
+                "amount".to_string(),
+                AggregateFunction::Sum,
+            )],
+        )
+        .unwrap();
+
+        // All NaNs group together (Postgres-style); NULL stays its own group
+        assert_eq!(agg.len(), 2);
+        let mut nan_total = None;
+        let mut null_total = None;
+        for i in 0..agg.len() {
+            let row = agg.get_row(i).unwrap();
+            let total = match row.get("total").unwrap() {
+                ColumnValue::Float64(v) => *v,
+                other => panic!("Expected Float64, got {:?}", other),
+            };
+            match row.get("bucket").unwrap() {
+                ColumnValue::Float64(v) if v.is_nan() => nan_total = Some(total),
+                ColumnValue::Null => null_total = Some(total),
+                other => panic!("Unexpected bucket value: {:?}", other),
+            }
+        }
+        assert!((nan_total.unwrap() - 3.0).abs() < 1e-9);
+        assert!((null_total.unwrap() - 5.0).abs() < 1e-9);
     }
 }

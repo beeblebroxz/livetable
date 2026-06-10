@@ -14,6 +14,19 @@ fn date_to_days_since_epoch(date: &Bound<'_, PyAny>) -> PyResult<i32> {
 
 /// Convert a Python datetime.datetime to milliseconds since Unix epoch
 fn datetime_to_ms_since_epoch(dt: &Bound<'_, PyAny>) -> PyResult<i64> {
+    // Stored DATETIME values are naive ms-since-epoch. Reading wall-clock
+    // fields off an aware datetime would silently drop the UTC offset, so
+    // reject aware values instead of storing a wrong timestamp. (The pandas
+    // conversion path falls back to .timestamp(), which handles aware values
+    // correctly.)
+    let tzinfo = dt.getattr("tzinfo")?;
+    if !tzinfo.is_none() {
+        return Err(PyValueError::new_err(
+            "timezone-aware datetime not supported; convert to naive UTC first, \
+             e.g. dt.astimezone(timezone.utc).replace(tzinfo=None)",
+        ));
+    }
+
     let year: i32 = dt.getattr("year")?.extract()?;
     let month: u32 = dt.getattr("month")?.extract()?;
     let day: u32 = dt.getattr("day")?.extract()?;

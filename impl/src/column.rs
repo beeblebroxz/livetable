@@ -504,13 +504,11 @@ impl Column {
     /// mid-loop. Idempotent if the column is already <= target_len.
     pub(crate) fn truncate_to(&mut self, target_len: usize) {
         while self.len() > target_len {
-            let last = self.len() - 1;
-            let _ = self.sequence.delete(last);
-            if let Some(ref mut nf) = self.null_flags {
-                let _ = nf.delete(last);
-            }
-            if let Some(ref mut sids) = self.string_ids {
-                let _ = sids.delete(last);
+            let before = self.len();
+            // delete() handles null flags and releases interned-string refs
+            let _ = self.delete(before - 1);
+            if self.len() == before {
+                break; // rollback must never spin if a delete fails
             }
         }
     }
@@ -709,5 +707,34 @@ mod tests {
         assert_eq!(col.len(), 2);
         assert_eq!(col.get(0).unwrap().as_string(), Some("Alice"));
         assert_eq!(col.get(1).unwrap().as_string(), Some("Alice"));
+    }
+
+    #[test]
+    fn test_truncate_to_releases_interner_refs() {
+        let interner = Arc::new(Mutex::new(StringInterner::new()));
+
+        let mut col = Column::new_with_interner(
+            "names".to_string(),
+            ColumnType::String,
+            false,
+            false,
+            Some(interner.clone()),
+        );
+
+        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Alice".to_string())).unwrap();
+        col.append(ColumnValue::String("Bob".to_string())).unwrap();
+        assert_eq!(interner.lock().unwrap().len(), 2);
+
+        // Roll back the last two appends: drops one "Alice" ref and the only "Bob" ref
+        col.truncate_to(1);
+        assert_eq!(col.len(), 1);
+        assert_eq!(col.get(0).unwrap().as_string(), Some("Alice"));
+        assert_eq!(interner.lock().unwrap().len(), 1);
+
+        // Rolling back everything must leave the interner empty
+        col.truncate_to(0);
+        assert_eq!(col.len(), 0);
+        assert_eq!(interner.lock().unwrap().len(), 0);
     }
 }

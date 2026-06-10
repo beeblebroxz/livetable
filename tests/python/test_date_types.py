@@ -1,7 +1,7 @@
 """Tests for DATE and DATETIME column types."""
 
 import pytest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import livetable
 
 
@@ -337,3 +337,39 @@ class TestColumnTypeAttributes:
         """Test ColumnType.DATETIME exists and is usable."""
         assert hasattr(livetable.ColumnType, 'DATETIME')
         assert repr(livetable.ColumnType.DATETIME) == "ColumnType.DATETIME"
+
+
+class TestTimezoneAwareDatetime:
+    """Timezone-aware datetimes must be rejected, not silently mis-stored.
+
+    Stored DATETIME values are naive ms-since-epoch; reading wall-clock
+    fields off an aware datetime would silently drop the UTC offset.
+    """
+
+    def _make_table(self):
+        schema = livetable.Schema([
+            ("id", livetable.ColumnType.INT32, False),
+            ("created_at", livetable.ColumnType.DATETIME, False),
+        ])
+        return livetable.Table("events", schema)
+
+    def test_utc_aware_datetime_rejected(self):
+        table = self._make_table()
+        aware = datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+        with pytest.raises(ValueError, match="timezone-aware"):
+            table.append_row({"id": 1, "created_at": aware})
+        assert len(table) == 0  # rollback left no partial row
+
+    def test_offset_aware_datetime_rejected(self):
+        table = self._make_table()
+        aware = datetime(2024, 1, 15, 10, 30, 0,
+                         tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        with pytest.raises(ValueError, match="timezone-aware"):
+            table.append_row({"id": 1, "created_at": aware})
+        assert len(table) == 0
+
+    def test_naive_datetime_still_accepted(self):
+        table = self._make_table()
+        naive = datetime(2024, 1, 15, 10, 30, 0)
+        table.append_row({"id": 1, "created_at": naive})
+        assert table.get_row(0)["created_at"] == naive
