@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use livetable::{
-    AggregateFunction, AggregateView, ColumnType, ColumnValue, FilterView, ReadableTable, Schema,
-    SortKey, SortedView, Table, TickableTable,
+    AggregateFunction, AggregateView, ColumnType, ColumnValue, ComputedView, FilterView, JoinType,
+    JoinView, ReadableTable, Schema, SortKey, SortedView, Table, TickableTable,
 };
 
 type Row = HashMap<String, ColumnValue>;
@@ -153,21 +153,20 @@ fn assert_ordered_eq(label: &str, trial: u64, step: usize, live: &[Row], oracle:
     }
 }
 
-fn agg_map(rows: &[Row]) -> HashMap<String, Vec<Option<f64>>> {
+fn agg_map(rows: &[Row], key_col: &str) -> HashMap<String, Vec<Option<f64>>> {
     let mut m = HashMap::new();
     for r in rows {
-        let region = match r.get("region") {
-            Some(ColumnValue::String(s)) => s.clone(),
-            other => format!("{other:?}"),
-        };
-        m.insert(region, AGG_COLS.iter().map(|c| num(r, c)).collect());
+        // Debug-format the group key so String and Int32 keys both work and
+        // live/oracle stringify identically.
+        let key = format!("{:?}", r.get(key_col));
+        m.insert(key, AGG_COLS.iter().map(|c| num(r, c)).collect());
     }
     m
 }
 
-fn assert_agg_eq(label: &str, trial: u64, step: usize, live: &[Row], oracle: &[Row]) {
-    let lm = agg_map(live);
-    let om = agg_map(oracle);
+fn assert_agg_eq(label: &str, trial: u64, step: usize, key_col: &str, live: &[Row], oracle: &[Row]) {
+    let lm = agg_map(live, key_col);
+    let om = agg_map(oracle, key_col);
     assert_eq!(
         lm.len(),
         om.len(),
@@ -284,8 +283,8 @@ fn assert_pipeline_matches(trial: u64, step: usize, base: &Rc<RefCell<Table>>, p
     assert_ordered_eq("filter", trial, step, &snapshot(&*p.filter.borrow()), &snapshot(&*of.borrow()));
     assert_ordered_eq("sorted_direct", trial, step, &snapshot(&*p.sorted_direct.borrow()), &snapshot(&*osd.borrow()));
     assert_ordered_eq("sorted_chain", trial, step, &snapshot(&*p.sorted_chain.borrow()), &snapshot(&*osc.borrow()));
-    assert_agg_eq("agg_direct", trial, step, &snapshot(&*p.agg_direct.borrow()), &snapshot(&*ogd.borrow()));
-    assert_agg_eq("agg_chain", trial, step, &snapshot(&*p.agg_chain.borrow()), &snapshot(&*ogc.borrow()));
+    assert_agg_eq("agg_direct", trial, step, "region", &snapshot(&*p.agg_direct.borrow()), &snapshot(&*ogd.borrow()));
+    assert_agg_eq("agg_chain", trial, step, "region", &snapshot(&*p.agg_chain.borrow()), &snapshot(&*ogc.borrow()));
 }
 
 #[test]
@@ -322,6 +321,421 @@ fn differential_batched_forward_prop_fuzz() {
             }
             p.tick.tick();
             assert_pipeline_matches(trial, step, &base, &p);
+        }
+    }
+}
+
+/// GROUP BY a single Int32 column exercises a distinct fast path in
+/// `rebuild_index` (`is_single_int_group`) that the string-keyed fuzz never
+/// touches — including its deferred `row_to_group` population. Views are built
+/// AFTER seeding rows so the first incremental sync runs against a fast-path
+/// rebuild that already holds data.
+#[test]
+fn differential_int_group_by_fuzz() {
+    fn int_schema() -> Schema {
+        Schema::new(vec![
+            ("id".to_string(), ColumnType::Int64, false),
+            ("bucket".to_string(), ColumnType::Int32, false),
+            ("amount".to_string(), ColumnType::Float64, true),
+        ])
+    }
+    fn clone_int_base(base: &Rc<RefCell<Table>>) -> Rc<RefCell<Table>> {
+        let fresh = Rc::new(RefCell::new(Table::new("oracle".to_string(), int_schema())));
+        let src = base.borrow();
+        for i in 0..src.len() {
+            fresh.borrow_mut().append_row(src.get_row(i).unwrap()).unwrap();
+        }
+        fresh
+    }
+    let amount = |rng: &mut Lcg| {
+        if rng.pct() < 12 {
+            ColumnValue::Null
+        } else {
+            ColumnValue::Float64((300 + rng.below(401)) as f64)
+        }
+    };
+    let insert = |rng: &mut Lcg, base: &Rc<RefCell<Table>>, next_id: &mut i64| {
+        let id = *next_id;
+        *next_id += 1;
+        let mut row: Row = HashMap::new();
+        row.insert("id".to_string(), ColumnValue::Int64(id));
+        row.insert("bucket".to_string(), ColumnValue::Int32(rng.below(4) as i32));
+        let a = amount(rng);
+        row.insert("amount".to_string(), a);
+        base.borrow_mut().append_row(row).unwrap();
+    };
+
+    for trial in 0..40u64 {
+        let mut rng = Lcg(0xABCD_EF01_2345_6789 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let base = Rc::new(RefCell::new(Table::new("base".to_string(), int_schema())));
+        let mut next_id: i64 = 0;
+
+        // Seed rows BEFORE building the view so construction rebuilds via the
+        // Int32 fast path with data already present.
+        for _ in 0..12 {
+            insert(&mut rng, &base, &mut next_id);
+        }
+        let agg = Rc::new(RefCell::new(
+            AggregateView::new("g".to_string(), base.clone(), vec!["bucket".to_string()], aggs()).unwrap(),
+        ));
+        let tick = TickableTable::new(base.clone());
+        tick.register_aggregate(&agg);
+
+        for step in 0..200usize {
+            let len = base.borrow().len();
+            let roll = rng.pct();
+            if len == 0 || roll < 45 {
+                insert(&mut rng, &base, &mut next_id);
+            } else if roll < 70 {
+                let idx = rng.below(len);
+                let a = amount(&mut rng);
+                base.borrow_mut().set_value(idx, "amount", a).unwrap();
+            } else if roll < 85 {
+                let idx = rng.below(len);
+                base.borrow_mut()
+                    .set_value(idx, "bucket", ColumnValue::Int32(rng.below(4) as i32))
+                    .unwrap();
+            } else {
+                let idx = rng.below(len);
+                base.borrow_mut().delete_row(idx).unwrap();
+            }
+            tick.tick();
+
+            let ob = clone_int_base(&base);
+            let og = Rc::new(RefCell::new(
+                AggregateView::new("og".to_string(), ob.clone(), vec!["bucket".to_string()], aggs()).unwrap(),
+            ));
+            assert_agg_eq("int_agg", trial, step, "bucket", &snapshot(&*agg.borrow()), &snapshot(&*og.borrow()));
+        }
+    }
+}
+
+// ===========================================================================
+// JoinView differential fuzz
+// ===========================================================================
+
+fn left_schema() -> Schema {
+    Schema::new(vec![
+        ("lid".to_string(), ColumnType::Int64, false),
+        ("k".to_string(), ColumnType::Int32, false),
+        ("lval".to_string(), ColumnType::Int32, false),
+    ])
+}
+
+fn right_schema() -> Schema {
+    Schema::new(vec![
+        ("rid".to_string(), ColumnType::Int64, false),
+        ("k".to_string(), ColumnType::Int32, false),
+        ("rval".to_string(), ColumnType::Int32, false),
+    ])
+}
+
+fn clone_table(src: &Rc<RefCell<Table>>, schema: Schema) -> Rc<RefCell<Table>> {
+    let fresh = Rc::new(RefCell::new(Table::new("oracle".to_string(), schema)));
+    let s = src.borrow();
+    for i in 0..s.len() {
+        fresh.borrow_mut().append_row(s.get_row(i).unwrap()).unwrap();
+    }
+    fresh
+}
+
+/// Canonical, order-independent serialization of a row.
+fn canon_row(r: &Row) -> String {
+    let mut kv: Vec<String> = r.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
+    kv.sort();
+    kv.join("|")
+}
+
+/// Rows as a sorted multiset (join output order may differ between incremental
+/// and rebuild, but the SET of rows — with duplicates — must match exactly).
+fn multiset(rows: &[Row]) -> Vec<String> {
+    let mut v: Vec<String> = rows.iter().map(canon_row).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn differential_join_fuzz() {
+    let join_types = [
+        ("left", JoinType::Left),
+        ("inner", JoinType::Inner),
+        ("right", JoinType::Right),
+        ("full", JoinType::Full),
+    ];
+
+    for (jt_name, jt) in join_types {
+        for trial in 0..30u64 {
+            let mut rng = Lcg(0x1357_9BDF_0246_8ACE ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let left = Rc::new(RefCell::new(Table::new("left".to_string(), left_schema())));
+            let right = Rc::new(RefCell::new(Table::new("right".to_string(), right_schema())));
+            let mut joined = JoinView::new(
+                "j".to_string(),
+                left.clone(),
+                right.clone(),
+                "k".to_string(),
+                "k".to_string(),
+                jt,
+            )
+            .unwrap();
+            let mut next_lid: i64 = 0;
+            let mut next_rid: i64 = 0;
+
+            for step in 0..160usize {
+                let llen = left.borrow().len();
+                let rlen = right.borrow().len();
+                let roll = rng.pct();
+                // Small key space (0..4) so rows match 1:1, 1:many, many:many,
+                // and go unmatched. Mutate BOTH parents incl. join-key updates.
+                if (llen == 0 && rlen == 0) || roll < 28 {
+                    let id = next_lid;
+                    next_lid += 1;
+                    let mut row: Row = HashMap::new();
+                    row.insert("lid".to_string(), ColumnValue::Int64(id));
+                    row.insert("k".to_string(), ColumnValue::Int32(rng.below(4) as i32));
+                    row.insert("lval".to_string(), ColumnValue::Int32(rng.below(1000) as i32));
+                    left.borrow_mut().append_row(row).unwrap();
+                } else if roll < 54 {
+                    let id = next_rid;
+                    next_rid += 1;
+                    let mut row: Row = HashMap::new();
+                    row.insert("rid".to_string(), ColumnValue::Int64(id));
+                    row.insert("k".to_string(), ColumnValue::Int32(rng.below(4) as i32));
+                    row.insert("rval".to_string(), ColumnValue::Int32(rng.below(1000) as i32));
+                    right.borrow_mut().append_row(row).unwrap();
+                } else if roll < 66 && llen > 0 {
+                    let idx = rng.below(llen);
+                    left.borrow_mut().set_value(idx, "k", ColumnValue::Int32(rng.below(4) as i32)).unwrap();
+                } else if roll < 78 && rlen > 0 {
+                    let idx = rng.below(rlen);
+                    right.borrow_mut().set_value(idx, "k", ColumnValue::Int32(rng.below(4) as i32)).unwrap();
+                } else if roll < 84 && llen > 0 {
+                    let idx = rng.below(llen);
+                    left.borrow_mut().set_value(idx, "lval", ColumnValue::Int32(rng.below(1000) as i32)).unwrap();
+                } else if roll < 90 && rlen > 0 {
+                    let idx = rng.below(rlen);
+                    right.borrow_mut().set_value(idx, "rval", ColumnValue::Int32(rng.below(1000) as i32)).unwrap();
+                } else if roll < 95 && llen > 0 {
+                    let idx = rng.below(llen);
+                    left.borrow_mut().delete_row(idx).unwrap();
+                } else if rlen > 0 {
+                    let idx = rng.below(rlen);
+                    right.borrow_mut().delete_row(idx).unwrap();
+                } else {
+                    // Nothing applicable (e.g. right empty): append left.
+                    let id = next_lid;
+                    next_lid += 1;
+                    let mut row: Row = HashMap::new();
+                    row.insert("lid".to_string(), ColumnValue::Int64(id));
+                    row.insert("k".to_string(), ColumnValue::Int32(rng.below(4) as i32));
+                    row.insert("lval".to_string(), ColumnValue::Int32(rng.below(1000) as i32));
+                    left.borrow_mut().append_row(row).unwrap();
+                }
+
+                joined.sync();
+
+                // Oracle: a from-scratch join on the current parent states.
+                let ol = clone_table(&left, left_schema());
+                let or = clone_table(&right, right_schema());
+                let ojoined = JoinView::new(
+                    "oj".to_string(),
+                    ol.clone(),
+                    or.clone(),
+                    "k".to_string(),
+                    "k".to_string(),
+                    jt,
+                )
+                .unwrap();
+
+                let live = multiset(&snapshot(&joined));
+                let oracle = multiset(&snapshot(&ojoined));
+                assert_eq!(
+                    live, oracle,
+                    "[join:{jt_name}] trial {trial} step {step}: incremental != rebuild\nlive={live:#?}\noracle={oracle:#?}"
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// ComputedView differential check
+// ===========================================================================
+
+fn tier(row: &Row) -> ColumnValue {
+    match row.get("amount") {
+        Some(ColumnValue::Float64(v)) if *v >= 500.0 => ColumnValue::String("hi".to_string()),
+        _ => ColumnValue::String("lo".to_string()),
+    }
+}
+
+#[test]
+fn differential_computed_view_fuzz() {
+    // ComputedView is lazy/pass-through. Verify it always reflects its parent —
+    // both directly on the root and over a synced FilterView in a chain — and
+    // that the computed column matches a from-scratch ComputedView.
+    for trial in 0..30u64 {
+        let mut rng = Lcg(0xFACE_B00C_1234_5678 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let base = Rc::new(RefCell::new(Table::new("base".to_string(), schema())));
+
+        let computed_direct = Rc::new(RefCell::new(ComputedView::new(
+            "cd".to_string(),
+            base.clone(),
+            "tier".to_string(),
+            tier,
+        )));
+        let filter = Rc::new(RefCell::new(FilterView::new("f".to_string(), base.clone(), passes)));
+        let computed_chain = Rc::new(RefCell::new(ComputedView::new(
+            "cc".to_string(),
+            filter.clone(),
+            "tier".to_string(),
+            tier,
+        )));
+        let tick = TickableTable::new(base.clone());
+        tick.register_filter(&filter);
+
+        let mut next_id: i64 = 0;
+        for step in 0..120usize {
+            apply_random_op(&mut rng, &base, &mut next_id);
+            tick.tick();
+
+            let ob = clone_base(&base);
+            let ocd = Rc::new(RefCell::new(ComputedView::new(
+                "ocd".to_string(),
+                ob.clone(),
+                "tier".to_string(),
+                tier,
+            )));
+            let ofilt = Rc::new(RefCell::new(FilterView::new("of".to_string(), ob.clone(), passes)));
+            let occ = Rc::new(RefCell::new(ComputedView::new(
+                "occ".to_string(),
+                ofilt.clone(),
+                "tier".to_string(),
+                tier,
+            )));
+
+            assert_eq!(
+                multiset(&snapshot(&*computed_direct.borrow())),
+                multiset(&snapshot(&*ocd.borrow())),
+                "[computed_direct] trial {trial} step {step}"
+            );
+            assert_eq!(
+                multiset(&snapshot(&*computed_chain.borrow())),
+                multiset(&snapshot(&*occ.borrow())),
+                "[computed_chain] trial {trial} step {step}"
+            );
+        }
+    }
+}
+
+/// One random mutation to either join parent (insert/key-update/val-update/
+/// delete), shared by the single-change and batched join drivers.
+fn join_random_op(
+    rng: &mut Lcg,
+    left: &Rc<RefCell<Table>>,
+    right: &Rc<RefCell<Table>>,
+    next_lid: &mut i64,
+    next_rid: &mut i64,
+) {
+    let llen = left.borrow().len();
+    let rlen = right.borrow().len();
+    // Cap total rows: with a key space of 4 the many-to-many join output grows
+    // quadratically, so keep the parents small for speed. When over cap, delete.
+    if llen + rlen >= 24 {
+        if llen >= rlen && llen > 0 {
+            left.borrow_mut().delete_row(rng.below(llen)).unwrap();
+        } else if rlen > 0 {
+            right.borrow_mut().delete_row(rng.below(rlen)).unwrap();
+        }
+        return;
+    }
+    let roll = rng.pct();
+    if (llen == 0 && rlen == 0) || roll < 28 {
+        let id = *next_lid;
+        *next_lid += 1;
+        let mut row: Row = HashMap::new();
+        row.insert("lid".to_string(), ColumnValue::Int64(id));
+        row.insert("k".to_string(), ColumnValue::Int32(rng.below(4) as i32));
+        row.insert("lval".to_string(), ColumnValue::Int32(rng.below(1000) as i32));
+        left.borrow_mut().append_row(row).unwrap();
+    } else if roll < 54 {
+        let id = *next_rid;
+        *next_rid += 1;
+        let mut row: Row = HashMap::new();
+        row.insert("rid".to_string(), ColumnValue::Int64(id));
+        row.insert("k".to_string(), ColumnValue::Int32(rng.below(4) as i32));
+        row.insert("rval".to_string(), ColumnValue::Int32(rng.below(1000) as i32));
+        right.borrow_mut().append_row(row).unwrap();
+    } else if roll < 66 && llen > 0 {
+        let idx = rng.below(llen);
+        left.borrow_mut().set_value(idx, "k", ColumnValue::Int32(rng.below(4) as i32)).unwrap();
+    } else if roll < 78 && rlen > 0 {
+        let idx = rng.below(rlen);
+        right.borrow_mut().set_value(idx, "k", ColumnValue::Int32(rng.below(4) as i32)).unwrap();
+    } else if roll < 84 && llen > 0 {
+        let idx = rng.below(llen);
+        left.borrow_mut().set_value(idx, "lval", ColumnValue::Int32(rng.below(1000) as i32)).unwrap();
+    } else if roll < 90 && rlen > 0 {
+        let idx = rng.below(rlen);
+        right.borrow_mut().set_value(idx, "rval", ColumnValue::Int32(rng.below(1000) as i32)).unwrap();
+    } else if roll < 95 && llen > 0 {
+        let idx = rng.below(llen);
+        left.borrow_mut().delete_row(idx).unwrap();
+    } else if rlen > 0 {
+        let idx = rng.below(rlen);
+        right.borrow_mut().delete_row(idx).unwrap();
+    } else {
+        let id = *next_lid;
+        *next_lid += 1;
+        let mut row: Row = HashMap::new();
+        row.insert("lid".to_string(), ColumnValue::Int64(id));
+        row.insert("k".to_string(), ColumnValue::Int32(rng.below(4) as i32));
+        row.insert("lval".to_string(), ColumnValue::Int32(rng.below(1000) as i32));
+        left.borrow_mut().append_row(row).unwrap();
+    }
+}
+
+#[test]
+fn differential_join_batched_fuzz() {
+    let join_types = [
+        ("left", JoinType::Left),
+        ("inner", JoinType::Inner),
+        ("right", JoinType::Right),
+        ("full", JoinType::Full),
+    ];
+    for (jt_name, jt) in join_types {
+        for trial in 0..30u64 {
+            let mut rng = Lcg(0x0F1E_2D3C_4B5A_6978 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let left = Rc::new(RefCell::new(Table::new("left".to_string(), left_schema())));
+            let right = Rc::new(RefCell::new(Table::new("right".to_string(), right_schema())));
+            let mut joined = JoinView::new(
+                "j".to_string(), left.clone(), right.clone(),
+                "k".to_string(), "k".to_string(), jt,
+            ).unwrap();
+            let mut next_lid: i64 = 0;
+            let mut next_rid: i64 = 0;
+
+            for step in 0..120usize {
+                // Multi-change batch (1..=5 mutations) before one sync().
+                let batch = 1 + rng.below(5);
+                for _ in 0..batch {
+                    join_random_op(&mut rng, &left, &right, &mut next_lid, &mut next_rid);
+                }
+                joined.sync();
+
+                let ol = clone_table(&left, left_schema());
+                let or = clone_table(&right, right_schema());
+                let ojoined = JoinView::new(
+                    "oj".to_string(), ol.clone(), or.clone(),
+                    "k".to_string(), "k".to_string(), jt,
+                ).unwrap();
+
+                let live = multiset(&snapshot(&joined));
+                let oracle = multiset(&snapshot(&ojoined));
+                assert_eq!(
+                    live, oracle,
+                    "[join_batched:{jt_name}] trial {trial} step {step}: incremental != rebuild\nlive={live:#?}\noracle={oracle:#?}"
+                );
+            }
         }
     }
 }
