@@ -1,363 +1,856 @@
-import { useState, useMemo, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTableWebSocket } from '../hooks/useTableWebSocket';
-import type { TableRow } from '../types';
+import type { ScalarValue, TableRow } from '../types';
 
-// Types
-interface SaleRow extends TableRow {
-  region: string;
-  product: string;
-  amount: number;
-}
+type ViewKind = 'filter' | 'sort' | 'group';
+type NodeKind = 'base' | ViewKind;
+type Accent = 'base' | 'filter' | 'sort' | 'group';
 
-interface AggRow extends TableRow {
-  region: string;
-  total: number;
-  count: number;
-}
-
-// Utility
-const formatMoney = (amount: number) => `$${amount.toLocaleString()}`;
-
-// Connection status badge
-function ConnectionBadge({ connected }: { connected: boolean }) {
-  return (
-    <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-sm ${
-      connected ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
-    }`}>
-      <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
-      {connected ? 'Connected' : 'Disconnected'}
-    </div>
-  );
-}
-
-// Table card component
-function TableCard({
-  title,
-  subtitle,
-  color,
-  count,
-  children,
-  highlight
-}: {
+interface ViewDefinition {
+  id: string;
   title: string;
-  subtitle: string;
-  color: 'blue' | 'green' | 'purple' | 'orange';
-  count: number;
-  children: React.ReactNode;
-  highlight?: boolean;
-}) {
-  const colorClasses = {
-    blue: 'border-blue-200 bg-blue-50',
-    green: 'border-green-200 bg-green-50',
-    purple: 'border-purple-200 bg-purple-50',
-    orange: 'border-orange-200 bg-orange-50',
-  };
-
-  const headerClasses = {
-    blue: 'bg-blue-100 text-blue-800',
-    green: 'bg-green-100 text-green-800',
-    purple: 'bg-purple-100 text-purple-800',
-    orange: 'bg-orange-100 text-orange-800',
-  };
-
-  return (
-    <div className={`rounded-lg border-2 transition-all duration-300 ${colorClasses[color]} ${highlight ? 'ring-2 ring-offset-2 ring-yellow-400 shadow-lg' : ''}`}>
-      <div className={`px-4 py-2 border-b flex justify-between items-center ${headerClasses[color]}`}>
-        <div>
-          <h3 className="font-bold">{title}</h3>
-          <p className="text-xs opacity-75">{subtitle}</p>
-        </div>
-        <span className="text-sm font-mono bg-white/50 px-2 py-0.5 rounded">
-          {count} rows
-        </span>
-      </div>
-      <div className="p-3 max-h-64 overflow-y-auto">{children}</div>
-    </div>
-  );
+  sourceId: string;
+  kind: ViewKind;
+  expression: string;
+  defaultExpression: string;
 }
 
-// Simple table display with highlight for new rows
-function SimpleTable({
-  headers,
-  rows,
-  highlightIndices,
-  formatters = {}
-}: {
-  headers: string[];
+interface EvaluatedNode {
+  id: string;
+  title: string;
+  kind: NodeKind;
+  sourceId?: string;
+  sourceTitle?: string;
+  expression?: string;
   rows: TableRow[];
-  highlightIndices?: Set<number>;
-  formatters?: Record<string, (v: number) => string>;
-}) {
-  return (
-    <table className="w-full text-sm">
-      <thead>
-        <tr className="border-b">
-          {headers.map(h => (
-            <th key={h} className="text-left py-1 px-2 font-semibold text-gray-600">
-              {h}
-            </th>
-          ))}
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((row, idx) => (
-          <tr
-            key={idx}
-            className={`border-b border-gray-100 transition-all duration-700 ${
-              highlightIndices?.has(idx)
-                ? 'bg-yellow-200 animate-pulse'
-                : ''
-            }`}
-          >
-            {headers.map(h => {
-              const value = row[h];
-              const formatted = formatters[h] && typeof value === 'number'
-                ? formatters[h](value)
-                : value;
-              return (
-                <td key={h} className="py-1 px-2">
-                  {formatted as string | number}
-                </td>
-              );
-            })}
-          </tr>
-        ))}
-        {rows.length === 0 && (
-          <tr>
-            <td colSpan={headers.length} className="py-4 px-2 text-gray-400 text-center">
-              Waiting for data...
-            </td>
-          </tr>
-        )}
-      </tbody>
-    </table>
-  );
+  columns: string[];
+  tickKey: string;
+  error?: string;
 }
 
-// Main demo component
+interface AggregateSpec {
+  alias: string;
+  op: 'sum' | 'avg' | 'min' | 'max' | 'count';
+  field: string | null;
+}
+
+interface GroupAccumulator {
+  row: TableRow;
+  count: number;
+  values: Record<string, number[]>;
+}
+
 interface CascadeDemoProps {
   onBack: () => void;
 }
 
-export function CascadeDemo({ onBack }: CascadeDemoProps) {
-  // Connect to WebSocket
-  const { data: records, connected } = useTableWebSocket('demo');
+const DEFAULT_DEFINITIONS: ViewDefinition[] = [
+  {
+    id: 'high-value',
+    title: 'High Value Filter',
+    sourceId: 'base',
+    kind: 'filter',
+    expression: 'amount >= 500',
+    defaultExpression: 'amount >= 500',
+  },
+  {
+    id: 'ranked',
+    title: 'Ranked Sales',
+    sourceId: 'high-value',
+    kind: 'sort',
+    expression: 'amount desc',
+    defaultExpression: 'amount desc',
+  },
+  {
+    id: 'regional-totals',
+    title: 'Regional Totals',
+    sourceId: 'ranked',
+    kind: 'group',
+    expression: 'region | total=sum(amount), average=avg(amount), count=count()',
+    defaultExpression: 'region | total=sum(amount), average=avg(amount), count=count()',
+  },
+];
 
-  // Track recently added rows for highlighting
-  const [recentIndices, setRecentIndices] = useState<Set<number>>(new Set());
-  const prevLengthRef = useRef(0);
+const SAMPLE_REGIONS = ['West', 'East', 'North', 'South', 'Central'];
+const SAMPLE_PRODUCTS = ['Widget', 'Gadget', 'Premium', 'Basic', 'Deluxe', 'Ultra', 'Pro', 'Lite'];
+const DEFAULT_BASE_COLUMNS = ['region', 'product', 'amount'];
 
-  const data = useMemo(() => records.map((record) => record.values), [records]);
+const accentStyles: Record<Accent, {
+  border: string;
+  dot: string;
+  badge: string;
+  active: string;
+}> = {
+  base: {
+    border: 'border-sky-200',
+    dot: 'bg-sky-500',
+    badge: 'border-sky-200 bg-sky-50 text-sky-800',
+    active: 'ring-sky-300',
+  },
+  filter: {
+    border: 'border-emerald-200',
+    dot: 'bg-emerald-500',
+    badge: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+    active: 'ring-emerald-300',
+  },
+  sort: {
+    border: 'border-indigo-200',
+    dot: 'bg-indigo-500',
+    badge: 'border-indigo-200 bg-indigo-50 text-indigo-800',
+    active: 'ring-indigo-300',
+  },
+  group: {
+    border: 'border-amber-200',
+    dot: 'bg-amber-500',
+    badge: 'border-amber-200 bg-amber-50 text-amber-900',
+    active: 'ring-amber-300',
+  },
+};
 
-  // When new rows arrive, highlight them briefly
-  useEffect(() => {
-    if (data.length > prevLengthRef.current) {
-      const newIndices = new Set<number>();
-      for (let i = prevLengthRef.current; i < data.length; i++) {
-        newIndices.add(i);
-      }
-      setRecentIndices(newIndices);
+const isNumber = (value: ScalarValue): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
 
-      // Clear highlights after animation
-      const timer = setTimeout(() => {
-        setRecentIndices(new Set());
-      }, 1500);
+const formatMoney = (amount: number) =>
+  `$${amount.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
 
-      prevLengthRef.current = data.length;
-      return () => clearTimeout(timer);
+const formatCellValue = (column: string, value: ScalarValue): string => {
+  if (value === null || value === undefined) {
+    return '-';
+  }
+
+  if (typeof value === 'number') {
+    const lowerColumn = column.toLowerCase();
+    if (
+      lowerColumn.includes('amount') ||
+      lowerColumn.includes('total') ||
+      lowerColumn.includes('average')
+    ) {
+      return formatMoney(value);
     }
-    prevLengthRef.current = data.length;
-  }, [data.length]);
 
-  // Cast data to SaleRow type
-  const sales = data as SaleRow[];
+    return Number.isInteger(value) ? String(value) : value.toFixed(2);
+  }
 
-  // Derived views (computed from real data)
-  const filteredView = useMemo(() =>
-    sales.filter(row => row.amount > 500),
-    [sales]
-  );
+  return String(value);
+};
 
-  const sortedView = useMemo(() =>
-    [...sales].sort((a, b) => b.amount - a.amount),
-    [sales]
-  );
+const inferColumns = (rows: TableRow[], fallback: string[] = DEFAULT_BASE_COLUMNS): string[] => {
+  const columns = new Set<string>();
+  for (const row of rows) {
+    Object.keys(row).forEach((column) => columns.add(column));
+  }
+  return columns.size > 0 ? Array.from(columns) : fallback;
+};
 
-  const aggregateView = useMemo(() => {
-    const groups: Record<string, AggRow> = {};
-    for (const row of sales) {
-      if (!row.region) continue;
-      if (!groups[row.region]) {
-        groups[row.region] = { region: row.region, total: 0, count: 0 };
-      }
-      groups[row.region].total += row.amount || 0;
-      groups[row.region].count += 1;
+const rowsSignature = (rows: TableRow[]): string =>
+  rows.map((row) => JSON.stringify(row)).join('|');
+
+const parseLiteral = (rawValue: string): ScalarValue => {
+  const value = rawValue.trim();
+  if (!value) {
+    return '';
+  }
+
+  const quoted = value.match(/^["'](.*)["']$/);
+  if (quoted) {
+    return quoted[1];
+  }
+
+  if (/^-?\d+(\.\d+)?$/.test(value)) {
+    return Number(value);
+  }
+
+  if (/^true$/i.test(value)) {
+    return true;
+  }
+
+  if (/^false$/i.test(value)) {
+    return false;
+  }
+
+  if (/^null$/i.test(value)) {
+    return null;
+  }
+
+  return value;
+};
+
+const compareValues = (
+  left: ScalarValue,
+  operator: string,
+  right: ScalarValue
+): boolean => {
+  if (operator === 'contains' || operator === 'startsWith' || operator === 'endsWith') {
+    const leftText = String(left ?? '');
+    const rightText = String(right ?? '');
+    if (operator === 'contains') {
+      return leftText.includes(rightText);
     }
-    return Object.values(groups).sort((a, b) => b.total - a.total);
-  }, [sales]);
+    if (operator === 'startsWith') {
+      return leftText.startsWith(rightText);
+    }
+    return leftText.endsWith(rightText);
+  }
 
-  // Stats
-  const totalSales = sales.reduce((sum, row) => sum + (row.amount || 0), 0);
-  const avgSale = sales.length > 0 ? totalSales / sales.length : 0;
-  const highValueCount = filteredView.length;
+  if (operator === '=' || operator === '==') {
+    return left === right || String(left) === String(right);
+  }
+
+  if (operator === '!=') {
+    return left !== right && String(left) !== String(right);
+  }
+
+  const leftComparable = isNumber(left) && isNumber(right) ? left : String(left ?? '');
+  const rightComparable = isNumber(left) && isNumber(right) ? right : String(right ?? '');
+
+  switch (operator) {
+    case '>':
+      return leftComparable > rightComparable;
+    case '>=':
+      return leftComparable >= rightComparable;
+    case '<':
+      return leftComparable < rightComparable;
+    case '<=':
+      return leftComparable <= rightComparable;
+    default:
+      throw new Error(`Unsupported operator "${operator}"`);
+  }
+};
+
+const evaluateCondition = (row: TableRow, condition: string): boolean => {
+  const parsed = condition
+    .trim()
+    .match(/^([A-Za-z_][\w]*)\s*(contains|startsWith|endsWith|==|=|!=|>=|<=|>|<)\s*(.+)$/i);
+
+  if (!parsed) {
+    throw new Error(`Could not parse condition "${condition.trim()}"`);
+  }
+
+  const [, field, operator, rawLiteral] = parsed;
+  return compareValues(row[field] ?? null, operator, parseLiteral(rawLiteral));
+};
+
+const applyFilter = (rows: TableRow[], expression: string): TableRow[] => {
+  const trimmed = expression.trim();
+  if (!trimmed) {
+    return rows;
+  }
+
+  return rows.filter((row) => {
+    const parts = trimmed.split(/\s+(AND|OR)\s+/i);
+    let result = evaluateCondition(row, parts[0]);
+
+    for (let index = 1; index < parts.length; index += 2) {
+      const connector = parts[index].toUpperCase();
+      const nextResult = evaluateCondition(row, parts[index + 1]);
+      result = connector === 'AND' ? result && nextResult : result || nextResult;
+    }
+
+    return result;
+  });
+};
+
+const compareForSort = (left: ScalarValue, right: ScalarValue): number => {
+  if (left === right) {
+    return 0;
+  }
+  if (left === null || left === undefined) {
+    return 1;
+  }
+  if (right === null || right === undefined) {
+    return -1;
+  }
+  if (isNumber(left) && isNumber(right)) {
+    return left - right;
+  }
+  return String(left).localeCompare(String(right));
+};
+
+const applySort = (rows: TableRow[], expression: string): TableRow[] => {
+  const sortParts = expression
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const [field, direction = 'asc'] = part.split(/\s+/);
+      const normalizedDirection = direction.toLowerCase();
+      if (!field || !/^[A-Za-z_][\w]*$/.test(field)) {
+        throw new Error(`Invalid sort field in "${part}"`);
+      }
+      if (normalizedDirection !== 'asc' && normalizedDirection !== 'desc') {
+        throw new Error(`Sort direction must be asc or desc in "${part}"`);
+      }
+      return { field, descending: normalizedDirection === 'desc' };
+    });
+
+  if (sortParts.length === 0) {
+    return rows;
+  }
+
+  return [...rows].sort((left, right) => {
+    for (const sortPart of sortParts) {
+      const comparison = compareForSort(left[sortPart.field] ?? null, right[sortPart.field] ?? null);
+      if (comparison !== 0) {
+        return sortPart.descending ? -comparison : comparison;
+      }
+    }
+    return 0;
+  });
+};
+
+const parseGroupExpression = (expression: string): {
+  groupField: string;
+  specs: AggregateSpec[];
+} => {
+  const [rawGroupField, rawAggs = 'count=count()'] = expression.split('|').map((part) => part.trim());
+  if (!rawGroupField || !/^[A-Za-z_][\w]*$/.test(rawGroupField)) {
+    throw new Error('Group expression must start with a column name');
+  }
+
+  const specs = rawAggs
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const parsed = part.match(/^([A-Za-z_][\w]*)\s*=\s*(sum|avg|min|max|count)\(([^)]*)\)$/i);
+      if (!parsed) {
+        throw new Error(`Could not parse aggregate "${part}"`);
+      }
+
+      const [, alias, rawOp, rawField] = parsed;
+      const op = rawOp.toLowerCase() as AggregateSpec['op'];
+      const field = rawField.trim();
+      if (op !== 'count' && !/^[A-Za-z_][\w]*$/.test(field)) {
+        throw new Error(`${op}() needs a column name`);
+      }
+      if (op === 'count' && field && field !== '*' && !/^[A-Za-z_][\w]*$/.test(field)) {
+        throw new Error('count() must be empty, *, or a column name');
+      }
+
+      return {
+        alias,
+        op,
+        field: field && field !== '*' ? field : null,
+      };
+    });
+
+  return {
+    groupField: rawGroupField,
+    specs: specs.length > 0 ? specs : [{ alias: 'count', op: 'count', field: null }],
+  };
+};
+
+const applyGroup = (rows: TableRow[], expression: string): {
+  rows: TableRow[];
+  columns: string[];
+} => {
+  const { groupField, specs } = parseGroupExpression(expression);
+  const groups = new Map<string, GroupAccumulator>();
+
+  for (const sourceRow of rows) {
+    const keyValue = sourceRow[groupField] ?? '-';
+    const key = String(keyValue);
+    const group = groups.get(key) ?? {
+      row: { [groupField]: keyValue },
+      count: 0,
+      values: {},
+    };
+
+    group.count += 1;
+    for (const spec of specs) {
+      if (spec.op === 'count') {
+        if (spec.field && sourceRow[spec.field] !== null && sourceRow[spec.field] !== undefined) {
+          group.values[spec.alias] = [...(group.values[spec.alias] ?? []), 1];
+        }
+        continue;
+      }
+
+      if (!spec.field) {
+        continue;
+      }
+
+      const value = sourceRow[spec.field];
+      if (isNumber(value)) {
+        group.values[spec.alias] = [...(group.values[spec.alias] ?? []), value];
+      }
+    }
+
+    groups.set(key, group);
+  }
+
+  const resultRows = Array.from(groups.values()).map((group) => {
+    const output: TableRow = { ...group.row };
+    for (const spec of specs) {
+      if (spec.op === 'count') {
+        output[spec.alias] = spec.field
+          ? group.values[spec.alias]?.length ?? 0
+          : group.count;
+        continue;
+      }
+
+      const values = group.values[spec.alias] ?? [];
+      if (values.length === 0) {
+        output[spec.alias] = 0;
+        continue;
+      }
+
+      if (spec.op === 'sum') {
+        output[spec.alias] = values.reduce((sum, value) => sum + value, 0);
+      } else if (spec.op === 'avg') {
+        output[spec.alias] = values.reduce((sum, value) => sum + value, 0) / values.length;
+      } else if (spec.op === 'min') {
+        output[spec.alias] = Math.min(...values);
+      } else {
+        output[spec.alias] = Math.max(...values);
+      }
+    }
+    return output;
+  });
+
+  resultRows.sort((left, right) => String(left[groupField]).localeCompare(String(right[groupField])));
+
+  return {
+    rows: resultRows,
+    columns: [groupField, ...specs.map((spec) => spec.alias)],
+  };
+};
+
+const evaluateView = (
+  definition: ViewDefinition,
+  source: EvaluatedNode
+): Pick<EvaluatedNode, 'rows' | 'columns' | 'error'> => {
+  try {
+    if (definition.kind === 'filter') {
+      return {
+        rows: applyFilter(source.rows, definition.expression),
+        columns: source.columns,
+      };
+    }
+
+    if (definition.kind === 'sort') {
+      return {
+        rows: applySort(source.rows, definition.expression),
+        columns: source.columns,
+      };
+    }
+
+    return applyGroup(source.rows, definition.expression);
+  } catch (error) {
+    return {
+      rows: [],
+      columns: source.columns,
+      error: error instanceof Error ? error.message : 'Expression failed',
+    };
+  }
+};
+
+const evaluatePipeline = (
+  baseRows: TableRow[],
+  baseColumns: string[],
+  definitions: ViewDefinition[]
+): EvaluatedNode[] => {
+  const nodesById = new Map<string, EvaluatedNode>();
+  const baseNode: EvaluatedNode = {
+    id: 'base',
+    title: 'Base Sales',
+    kind: 'base',
+    rows: baseRows,
+    columns: baseColumns,
+    tickKey: rowsSignature(baseRows),
+  };
+
+  nodesById.set(baseNode.id, baseNode);
+  const nodes = [baseNode];
+
+  for (const definition of definitions) {
+    const source = nodesById.get(definition.sourceId) ?? baseNode;
+    const evaluated = evaluateView(definition, source);
+    const node: EvaluatedNode = {
+      id: definition.id,
+      title: definition.title,
+      kind: definition.kind,
+      sourceId: source.id,
+      sourceTitle: source.title,
+      expression: definition.expression,
+      rows: evaluated.rows,
+      columns: evaluated.columns,
+      error: evaluated.error,
+      tickKey: [
+        source.tickKey,
+        definition.kind,
+        definition.expression,
+        evaluated.error ?? 'ok',
+      ].join('::'),
+    };
+    nodesById.set(node.id, node);
+    nodes.push(node);
+  }
+
+  return nodes;
+};
+
+const createRandomSale = (): TableRow => ({
+  region: SAMPLE_REGIONS[Math.floor(Math.random() * SAMPLE_REGIONS.length)],
+  product: SAMPLE_PRODUCTS[Math.floor(Math.random() * SAMPLE_PRODUCTS.length)],
+  amount: Math.round(100 + Math.random() * 2400),
+});
+
+function ConnectionBadge({ connected }: { connected: boolean }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-sm font-medium ${
+        connected
+          ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+          : 'border-rose-200 bg-rose-50 text-rose-800'
+      }`}
+    >
+      <span className={`h-2 w-2 rounded-full ${connected ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+      {connected ? 'Connected' : 'Disconnected'}
+    </span>
+  );
+}
+
+function FlowStrip({
+  nodes,
+  tickCounts,
+  activeTicks,
+}: {
+  nodes: EvaluatedNode[];
+  tickCounts: Record<string, number>;
+  activeTicks: Set<string>;
+}) {
+  return (
+    <div className="overflow-x-auto rounded-md border border-gray-200 bg-white">
+      <div className="flex min-w-max items-center gap-2 px-4 py-3">
+        {nodes.map((node, index) => {
+          const accent = accentStyles[node.kind === 'base' ? 'base' : node.kind];
+          return (
+            <div key={node.id} className="flex items-center gap-2">
+              {index > 0 && <span className="text-gray-300">-&gt;</span>}
+              <div
+                className={`rounded-md border px-3 py-2 text-sm transition ${
+                  accent.badge
+                } ${
+                  activeTicks.has(node.id) ? `ring-2 ring-offset-2 ${accent.active}` : ''
+                }`}
+              >
+                <div className="flex items-center gap-2 font-semibold">
+                  <span className={`h-2 w-2 rounded-full ${accent.dot}`} />
+                  {node.title}
+                </div>
+                <div className="mt-1 text-xs opacity-75">
+                  {node.rows.length} rows · tick {tickCounts[node.id] ?? 0}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function DataPreview({
+  columns,
+  rows,
+  maxRows = 8,
+}: {
+  columns: string[];
+  rows: TableRow[];
+  maxRows?: number;
+}) {
+  const visibleRows = rows.slice(0, maxRows);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
-      {/* Header */}
-      <header className="bg-white shadow-md">
-        <div className="max-w-7xl mx-auto py-4 px-4 flex items-center justify-between">
+    <div className="overflow-x-auto">
+      <table className="w-full table-fixed border-collapse text-sm">
+        <thead>
+          <tr className="border-b border-gray-200 text-left text-xs uppercase tracking-wide text-gray-500">
+            {columns.map((column) => (
+              <th key={column} className="px-3 py-2 font-semibold">
+                {column}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {visibleRows.map((row, rowIndex) => (
+            <tr key={`${rowIndex}-${JSON.stringify(row)}`} className="border-b border-gray-100">
+              {columns.map((column) => (
+                <td key={column} className="truncate px-3 py-2 text-gray-800">
+                  {formatCellValue(column, row[column] ?? null)}
+                </td>
+              ))}
+            </tr>
+          ))}
+          {visibleRows.length === 0 && (
+            <tr>
+              <td colSpan={columns.length} className="px-3 py-8 text-center text-gray-400">
+                No matching rows
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+      {rows.length > maxRows && (
+        <div className="border-t border-gray-100 px-3 py-2 text-xs text-gray-500">
+          Showing {maxRows} of {rows.length} rows
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NodePanel({
+  node,
+  definition,
+  tickCount,
+  isActive,
+  onExpressionChange,
+  onReset,
+}: {
+  node: EvaluatedNode;
+  definition?: ViewDefinition;
+  tickCount: number;
+  isActive: boolean;
+  onExpressionChange?: (expression: string) => void;
+  onReset?: () => void;
+}) {
+  const accent = accentStyles[node.kind === 'base' ? 'base' : node.kind];
+  const expressionRows = node.kind === 'group' ? 3 : 2;
+
+  return (
+    <section
+      className={`rounded-md border bg-white shadow-sm transition ${accent.border} ${
+        isActive ? `ring-2 ring-offset-2 ${accent.active}` : ''
+      }`}
+    >
+      <div className="flex items-start justify-between gap-4 border-b border-gray-100 px-4 py-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className={`h-2.5 w-2.5 rounded-full ${accent.dot}`} />
+            <h2 className="text-base font-semibold text-gray-950">{node.title}</h2>
+          </div>
+          <p className="mt-1 text-xs text-gray-500">
+            {node.sourceTitle ? `${node.sourceTitle} -> ${node.kind}` : 'WebSocket source'}
+          </p>
+        </div>
+        <div className="shrink-0 text-right">
+          <div className="text-lg font-semibold text-gray-950">{node.rows.length}</div>
+          <div className="text-xs text-gray-500">rows · tick {tickCount}</div>
+        </div>
+      </div>
+
+      {definition && onExpressionChange && onReset && (
+        <div className="border-b border-gray-100 px-4 py-3">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <label htmlFor={`${node.id}-expression`} className="text-xs font-semibold uppercase text-gray-500">
+              {definition.kind} expression
+            </label>
+            <button
+              type="button"
+              onClick={onReset}
+              className="rounded-md border border-gray-200 px-2 py-1 text-xs font-medium text-gray-600 hover:border-gray-300 hover:bg-gray-50"
+            >
+              Reset
+            </button>
+          </div>
+          <textarea
+            id={`${node.id}-expression`}
+            value={definition.expression}
+            rows={expressionRows}
+            onChange={(event) => onExpressionChange(event.target.value)}
+            spellCheck={false}
+            className="block w-full resize-none rounded-md border border-gray-300 bg-gray-50 px-3 py-2 font-mono text-sm text-gray-900 outline-none focus:border-sky-400 focus:bg-white focus:ring-2 focus:ring-sky-100"
+          />
+          {node.error && (
+            <div className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+              {node.error}
+            </div>
+          )}
+        </div>
+      )}
+
+      <DataPreview columns={node.columns} rows={node.rows} />
+    </section>
+  );
+}
+
+export function CascadeDemo({ onBack }: CascadeDemoProps) {
+  const {
+    data: records,
+    columns: serverColumns,
+    connected,
+    insertRow,
+  } = useTableWebSocket('demo');
+  const [definitions, setDefinitions] = useState<ViewDefinition[]>(DEFAULT_DEFINITIONS);
+  const [autoStream, setAutoStream] = useState(false);
+  const [tickCounts, setTickCounts] = useState<Record<string, number>>({});
+  const [activeTicks, setActiveTicks] = useState<Set<string>>(new Set());
+  const lastTickKeysRef = useRef<Record<string, string>>({});
+
+  const baseRows = useMemo(() => records.map((record) => record.values), [records]);
+  const baseColumns = useMemo(
+    () => (serverColumns.length > 0 ? serverColumns : inferColumns(baseRows)),
+    [baseRows, serverColumns]
+  );
+
+  const nodes = useMemo(
+    () => evaluatePipeline(baseRows, baseColumns, definitions),
+    [baseColumns, baseRows, definitions]
+  );
+  const tickSignature = nodes.map((node) => `${node.id}:${node.tickKey}`).join('\n');
+  const definitionById = useMemo(
+    () => new Map(definitions.map((definition) => [definition.id, definition])),
+    [definitions]
+  );
+
+  const pushRandomSale = useCallback(() => {
+    insertRow(createRandomSale());
+  }, [insertRow]);
+
+  useEffect(() => {
+    if (!autoStream || !connected) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(pushRandomSale, 1600);
+    return () => window.clearInterval(timer);
+  }, [autoStream, connected, pushRandomSale]);
+
+  useEffect(() => {
+    const changedIds = nodes
+      .filter((node) => lastTickKeysRef.current[node.id] !== node.tickKey)
+      .map((node) => node.id);
+
+    if (changedIds.length === 0) {
+      return undefined;
+    }
+
+    lastTickKeysRef.current = Object.fromEntries(nodes.map((node) => [node.id, node.tickKey]));
+    setTickCounts((previous) => {
+      const next = { ...previous };
+      for (const id of changedIds) {
+        next[id] = (next[id] ?? 0) + 1;
+      }
+      return next;
+    });
+    setActiveTicks(new Set(changedIds));
+
+    const timer = window.setTimeout(() => setActiveTicks(new Set()), 750);
+    return () => window.clearTimeout(timer);
+  }, [nodes, tickSignature]);
+
+  const updateExpression = (id: string, expression: string) => {
+    setDefinitions((current) =>
+      current.map((definition) =>
+        definition.id === id ? { ...definition, expression } : definition
+      )
+    );
+  };
+
+  const resetExpression = (id: string) => {
+    setDefinitions((current) =>
+      current.map((definition) =>
+        definition.id === id
+          ? { ...definition, expression: definition.defaultExpression }
+          : definition
+      )
+    );
+  };
+
+  const totalSales = baseRows.reduce((sum, row) => {
+    const amount = row.amount;
+    return isNumber(amount) ? sum + amount : sum;
+  }, 0);
+  const pipelineTicks = Object.values(tickCounts).reduce((sum, count) => sum + count, 0);
+
+  return (
+    <div className="min-h-screen bg-gray-100">
+      <header className="border-b border-gray-200 bg-white">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-4 py-4">
           <div>
-            <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-3">
-              Real-Time Derived Views
+            <div className="flex flex-wrap items-center gap-3">
+              <h1 className="text-2xl font-semibold text-gray-950">Forward Propagation Demo</h1>
               <ConnectionBadge connected={connected} />
-            </h1>
-            <p className="text-gray-600 text-sm">
-              Live WebSocket rows with browser-computed filters, sorting, and totals
+            </div>
+            <p className="mt-1 text-sm text-gray-600">
+              Live base rows flow through editable derived tables on every tick.
             </p>
           </div>
-          <button
-            onClick={onBack}
-            className="px-4 py-2 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition"
-          >
-            &larr; Back to Editor
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={pushRandomSale}
+              disabled={!connected}
+              className="rounded-md bg-gray-950 px-3 py-2 text-sm font-semibold text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
+            >
+              Insert sale
+            </button>
+            <button
+              type="button"
+              onClick={() => setAutoStream((current) => !current)}
+              disabled={!connected}
+              className={`rounded-md border px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:border-gray-200 disabled:text-gray-400 ${
+                autoStream
+                  ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
+                  : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'
+              }`}
+            >
+              {autoStream ? 'Streaming on' : 'Auto stream'}
+            </button>
+            <button
+              type="button"
+              onClick={onBack}
+              className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50"
+            >
+              Editor
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* Main content */}
-      <main className="max-w-7xl mx-auto py-6 px-4">
-        {/* Stats bar */}
-        <div className="bg-white rounded-lg shadow-md p-4 mb-6">
-          <div className="flex flex-wrap items-center gap-6">
-            <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-2">
-              <div className="text-xs text-gray-500">Total Rows</div>
-              <div className="text-xl font-bold">{sales.length}</div>
-            </div>
-            <div className="bg-green-50 border border-green-200 rounded-lg px-4 py-2">
-              <div className="text-xs text-gray-500">High-Value (&gt;$500)</div>
-              <div className="text-xl font-bold">{highValueCount}</div>
-            </div>
-            <div className="bg-purple-50 border border-purple-200 rounded-lg px-4 py-2">
-              <div className="text-xs text-gray-500">Total Revenue</div>
-              <div className="text-xl font-bold">{formatMoney(totalSales)}</div>
-            </div>
-            <div className="bg-orange-50 border border-orange-200 rounded-lg px-4 py-2">
-              <div className="text-xs text-gray-500">Avg Sale</div>
-              <div className="text-xl font-bold">{formatMoney(Math.round(avgSale))}</div>
-            </div>
-            <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-2">
-              <div className="text-xs text-gray-500">Regions</div>
-              <div className="text-xl font-bold">{aggregateView.length}</div>
-            </div>
+      <main className="mx-auto max-w-7xl px-4 py-5">
+        <div className="mb-5 grid grid-cols-2 gap-px overflow-hidden rounded-md border border-gray-200 bg-gray-200 md:grid-cols-4">
+          <div className="bg-white px-4 py-3">
+            <div className="text-xs font-medium uppercase text-gray-500">Base rows</div>
+            <div className="mt-1 text-2xl font-semibold text-gray-950">{baseRows.length}</div>
+          </div>
+          <div className="bg-white px-4 py-3">
+            <div className="text-xs font-medium uppercase text-gray-500">Revenue</div>
+            <div className="mt-1 text-2xl font-semibold text-gray-950">{formatMoney(totalSales)}</div>
+          </div>
+          <div className="bg-white px-4 py-3">
+            <div className="text-xs font-medium uppercase text-gray-500">Derived tables</div>
+            <div className="mt-1 text-2xl font-semibold text-gray-950">{definitions.length}</div>
+          </div>
+          <div className="bg-white px-4 py-3">
+            <div className="text-xs font-medium uppercase text-gray-500">Ticks observed</div>
+            <div className="mt-1 text-2xl font-semibold text-gray-950">{pipelineTicks}</div>
           </div>
         </div>
 
-        {/* Architecture diagram */}
-        <div className="bg-white rounded-lg shadow-md p-4 mb-6">
-          <div className="flex items-center justify-center gap-2 text-sm text-gray-600 font-mono">
-            <span className="px-3 py-1 bg-blue-100 rounded text-blue-700">WebSocket Rows</span>
-            <span>&rarr;</span>
-            <span className="px-3 py-1 bg-blue-100 rounded text-blue-700">Base Table</span>
-            <span>──┬─&gt;</span>
-            <span className="px-3 py-1 bg-green-100 rounded text-green-700">Filtered Rows (&gt;$500)</span>
-          </div>
-          <div className="flex items-center justify-center gap-2 text-sm text-gray-600 font-mono mt-1">
-            <span className="w-64"></span>
-            <span className="ml-6">├─&gt;</span>
-            <span className="px-3 py-1 bg-purple-100 rounded text-purple-700">Sorted Rows (by amount)</span>
-          </div>
-          <div className="flex items-center justify-center gap-2 text-sm text-gray-600 font-mono mt-1">
-            <span className="w-64"></span>
-            <span className="ml-6">└─&gt;</span>
-            <span className="px-3 py-1 bg-orange-100 rounded text-orange-700">Regional Totals</span>
-          </div>
+        <div className="mb-5">
+          <FlowStrip nodes={nodes} tickCounts={tickCounts} activeTicks={activeTicks} />
         </div>
 
-        {/* Tables grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Base Table */}
-          <TableCard
-            title="[1] Base Table"
-            subtitle="All incoming sales from WebSocket"
-            color="blue"
-            count={sales.length}
-            highlight={recentIndices.size > 0}
-          >
-            <SimpleTable
-              headers={['region', 'product', 'amount']}
-              rows={sales.slice(-20).reverse()}
-              highlightIndices={new Set([0])}
-              formatters={{ amount: formatMoney }}
-            />
-            {sales.length > 20 && (
-              <div className="text-xs text-gray-400 mt-2 text-center">
-                Showing last 20 of {sales.length} rows
-              </div>
-            )}
-          </TableCard>
-
-          {/* Filter View */}
-          <TableCard
-            title="[2] Filtered Rows"
-            subtitle="amount > $500 only"
-            color="green"
-            count={filteredView.length}
-          >
-            <SimpleTable
-              headers={['region', 'product', 'amount']}
-              rows={filteredView.slice(-15).reverse()}
-              formatters={{ amount: formatMoney }}
-            />
-            <div className="mt-2 text-xs text-gray-500">
-              {sales.length - filteredView.length} rows filtered out
-            </div>
-          </TableCard>
-
-          {/* Sorted View */}
-          <TableCard
-            title="[3] Sorted Rows"
-            subtitle="Ordered by amount descending"
-            color="purple"
-            count={sortedView.length}
-          >
-            <SimpleTable
-              headers={['region', 'product', 'amount']}
-              rows={sortedView.slice(0, 15)}
-              formatters={{ amount: formatMoney }}
-            />
-            {sortedView.length > 0 && (
-              <div className="mt-2 text-xs text-gray-500">
-                Top sale: {formatMoney(sortedView[0]?.amount || 0)}
-              </div>
-            )}
-          </TableCard>
-
-          {/* Aggregate View */}
-          <TableCard
-            title="[4] Regional Totals"
-            subtitle="Grouped by region"
-            color="orange"
-            count={aggregateView.length}
-          >
-            <SimpleTable
-              headers={['region', 'total', 'count']}
-              rows={aggregateView}
-              formatters={{ total: formatMoney }}
-            />
-          </TableCard>
-        </div>
-
-        {/* Instructions */}
-        <div className="mt-6 bg-gray-50 rounded-lg p-4 text-sm text-gray-600">
-          <h3 className="font-semibold text-gray-700 mb-2">How to use:</h3>
-          <ol className="list-decimal list-inside space-y-1">
-            <li>Start the backend: <code className="bg-gray-200 px-1 rounded">cd impl && cargo run --bin livetable-server --features server</code></li>
-            <li>Start the publisher: <code className="bg-gray-200 px-1 rounded">cd examples && python3 streaming_publisher.py</code></li>
-            <li>Watch the tables update in real-time as new sales stream in</li>
-          </ol>
-          <p className="mt-3 text-gray-500">
-            Publisher options: <code className="bg-gray-200 px-1 rounded">--fast</code> (0.5s) or <code className="bg-gray-200 px-1 rounded">--slow</code> (5s)
-          </p>
+        <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
+          {nodes.map((node) => {
+            const definition = definitionById.get(node.id);
+            return (
+              <NodePanel
+                key={node.id}
+                node={node}
+                definition={definition}
+                tickCount={tickCounts[node.id] ?? 0}
+                isActive={activeTicks.has(node.id)}
+                onExpressionChange={
+                  definition ? (expression) => updateExpression(definition.id, expression) : undefined
+                }
+                onReset={definition ? () => resetExpression(definition.id) : undefined}
+              />
+            );
+          })}
         </div>
       </main>
     </div>
