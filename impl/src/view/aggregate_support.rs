@@ -115,6 +115,10 @@ impl ColumnAggState {
 
     pub(super) fn get_result(&self, func: AggregateFunction) -> ColumnValue {
         match func {
+            // SQL semantics: SUM over zero non-null values is NULL, not 0. This
+            // also makes a state that was emptied by incremental removal agree
+            // with a from-scratch rebuild (which has no per-column state at all).
+            AggregateFunction::Sum if self.count == 0 => ColumnValue::Null,
             AggregateFunction::Sum => ColumnValue::Float64(self.sum),
             AggregateFunction::Count => ColumnValue::Int64(self.count as i64),
             AggregateFunction::Avg => {
@@ -181,7 +185,15 @@ impl GroupState {
         if let Some(stats) = self.column_stats.get(source_col) {
             stats.get_result(func)
         } else {
-            ColumnValue::Null
+            // The group exists but has no non-null values for this column
+            // (a from-scratch rebuild never creates per-column state for a
+            // column with no numeric values). COUNT of nothing is 0; every
+            // other aggregate is NULL. This mirrors the emptied incremental
+            // state so both code paths produce identical output.
+            match func {
+                AggregateFunction::Count => ColumnValue::Int64(0),
+                _ => ColumnValue::Null,
+            }
         }
     }
 

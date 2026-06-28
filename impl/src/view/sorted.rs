@@ -426,6 +426,18 @@ impl SortedView {
 
         let changes: Vec<TableChange> = changes.to_vec();
         drop(parent);
+
+        // `find_insertion_position` reads the LIVE parent for an inserted/updated
+        // row's sort key. That is only valid when the parent matches the
+        // post-change state — i.e. a single change. In a multi-change batch the
+        // parent has advanced past intermediate changes, so its rows/indices no
+        // longer line up; fall back to a full rebuild, which is always correct.
+        // (Caught by the forward_prop_fuzz batched differential test.)
+        if changes.len() > 1 {
+            self.rebuild_index();
+            return true;
+        }
+
         let modified = self.apply_changes(&changes);
         let parent = self.parent.borrow();
         if let Some(cs) = parent.changeset() {

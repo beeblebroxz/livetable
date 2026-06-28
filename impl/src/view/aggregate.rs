@@ -343,6 +343,7 @@ impl AggregateView {
         &mut self,
         row_idx: usize,
         row: &HashMap<String, ColumnValue>,
+        pending_recalc: &mut HashSet<(GroupKey, String)>,
     ) -> bool {
         let key = GroupKey::from_row(row, &self.group_by_columns);
 
@@ -378,9 +379,9 @@ impl AggregateView {
                 return true;
             }
 
-            // Recalculate MIN/MAX for columns that need it
+            // Defer MIN/MAX recalc until all batch index shifts are applied.
             for source_col in cols_needing_recalc {
-                self.recalculate_group_column_min_max(&key, &source_col);
+                pending_recalc.insert((key.clone(), source_col));
             }
 
             true
@@ -545,6 +546,23 @@ impl AggregateView {
         let parent_version = parent.version();
         drop(parent);
 
+        // A CellUpdated on a group-by column is applied by reading the LIVE
+        // parent (reconstruct_old_row / add_row_to_aggregates). That is only
+        // valid when the parent reflects exactly the post-change state — i.e. a
+        // single change. In a multi-change batch the parent has already moved
+        // past the intermediate change, so its rows/indices no longer match and
+        // the read grabs the wrong values. Fall back to a full rebuild, which
+        // reads the final parent and is always correct. (Caught by the
+        // forward_prop_fuzz batched differential test.)
+        let has_group_key_update = new_changes.iter().any(|change| {
+            matches!(change, TableChange::CellUpdated { column, .. }
+                if self.group_by_columns.contains(column))
+        });
+        if new_changes.len() > 1 && has_group_key_update {
+            self.rebuild_index();
+            return true;
+        }
+
         // Ensure row_to_group is built before processing changes
         self.ensure_row_to_group_built();
 
@@ -560,6 +578,13 @@ impl AggregateView {
 impl IncrementalView for AggregateView {
     fn apply_changes(&mut self, changes: &[TableChange]) -> bool {
         let mut modified = false;
+        // MIN/MAX (and sorted_values) recalcs are DEFERRED to the end of the
+        // batch. `recalculate_group_column_min_max` reads the parent at the
+        // group's row indices, but those indices only line up with the parent
+        // AFTER every insert/delete in this batch has shifted them. Recalcing
+        // mid-batch reads misaligned rows and yields a stale MIN/MAX. (Caught
+        // by the forward_prop_fuzz differential test.)
+        let mut pending_recalc: HashSet<(GroupKey, String)> = HashSet::new();
 
         for change in changes {
             match change {
@@ -572,8 +597,8 @@ impl IncrementalView for AggregateView {
                 }
 
                 TableChange::RowDeleted { index, data } => {
-                    // Remove from aggregates
-                    self.remove_row_from_aggregates(*index, data);
+                    // Remove from aggregates (records any MIN/MAX recalc needed)
+                    self.remove_row_from_aggregates(*index, data, &mut pending_recalc);
                     // Adjust remaining row indices
                     self.adjust_indices_for_delete(*index);
                     modified = true;
@@ -589,7 +614,7 @@ impl IncrementalView for AggregateView {
                     if self.group_by_columns.contains(column) {
                         // Need to move row to a different group
                         if let Ok(old_row) = self.reconstruct_old_row(*row, column, old_value) {
-                            self.remove_row_from_aggregates(*row, &old_row);
+                            self.remove_row_from_aggregates(*row, &old_row, &mut pending_recalc);
                         }
                         // Get new row separately to avoid borrow conflicts
                         let new_row = self.parent.borrow().get_row(*row).ok();
@@ -613,9 +638,9 @@ impl IncrementalView for AggregateView {
                                     }
                                 }
 
-                                // Recalculate if needed (outside of the borrow)
+                                // Defer MIN/MAX recalc to end of batch (see above)
                                 if needs_recalc {
-                                    self.recalculate_group_column_min_max(&key, column);
+                                    pending_recalc.insert((key.clone(), column.clone()));
                                 }
 
                                 // Add new value
@@ -630,6 +655,13 @@ impl IncrementalView for AggregateView {
                     }
                 }
             }
+        }
+
+        // Apply deferred MIN/MAX recalcs now that all batch index shifts are
+        // done and the view's row indices match the parent layout. recalc
+        // safely no-ops for any group pruned during the batch.
+        for (key, col) in &pending_recalc {
+            self.recalculate_group_column_min_max(key, col);
         }
 
         modified

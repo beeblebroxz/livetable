@@ -145,6 +145,16 @@ impl FilterView {
         let changes: Vec<TableChange> = changes.to_vec();
         drop(parent);
 
+        // The CellUpdated path re-evaluates the predicate by reading the LIVE
+        // parent for the changed row, valid only when the parent matches the
+        // post-change state — i.e. a single change. In a multi-change batch the
+        // parent has advanced past intermediate changes, so fall back to a full
+        // rebuild. (Caught by the forward_prop_fuzz batched differential test.)
+        if changes.len() > 1 {
+            self.rebuild_index();
+            return true;
+        }
+
         let modified = self.apply_changes(&changes);
         let parent = self.parent.borrow();
         if let Some(cs) = parent.changeset() {
