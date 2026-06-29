@@ -33,6 +33,8 @@ pub use python_bindings::*;
 #[cfg(feature = "server")]
 pub mod messages;
 #[cfg(feature = "server")]
+pub mod pipeline_spec;
+#[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]
 pub mod websocket;
