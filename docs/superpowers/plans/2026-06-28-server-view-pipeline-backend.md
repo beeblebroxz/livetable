@@ -8,6 +8,42 @@
 
 **Tech Stack:** Rust, actix / actix-web-actors, serde/serde_json, PyO3 (unaffected), existing `crate::view`, `crate::expr`, `crate::table`.
 
+## Status / Resume Here (updated 2026-06-28)
+
+**Paused after Task 2 of 5.** Tasks 1–2 are complete, committed, and green.
+
+Prior commits (newest first):
+- `5785552` Task 2 — `pipeline_spec` (spec → real views; `count` requires a column)
+- `cf85c56` Task 1 — `SetPipeline`/`ViewData`/`ViewError` wire types (protocol v2)
+- `b97b0c9` this backend plan · `bb9a1ea` design spec · `efe8eac`+`07a5735` core forward-prop fixes + differential fuzz
+
+**Next: Task 3 (`TableEngine`)** — large but mechanical and concurrency-agnostic
+(same pure struct regardless of how Task 4's concurrency resolves). Good
+candidate to hand to a **subagent** since this plan is detailed.
+
+**Before building Task 4, run a ~10-min de-risk spike:** confirm an actix
+`Actor` holding `!Send` (`Rc`-based) state can be `start()`ed and receive
+messages from connection actors on other actix-web worker threads. If actix
+rejects it, switch to the dedicated-thread + `std::sync::mpsc` fallback in
+Task 4's self-review note (same `TableEngine` logic, no actix actor).
+
+**Gotchas already learned:**
+- Server modules (`messages`/`websocket`/`server`/`engine`/`pipeline_spec`) are
+  `#[cfg(feature = "server")]`; test with `cargo test --lib --features server`
+  (plain `cargo test --lib` silently skips them and won't even recompile them).
+- `count` is `COUNT(col)` (non-null count); the engine has no row-count
+  aggregate. The frontend's default group spec must use `count(amount)`, not
+  `count()`. Carry this into the (not-yet-written) frontend plan.
+- Single change per tick is the verified-correct engine path; the server ticks
+  once per mutation message.
+
+Commands: core views `cargo test --lib`; server `cargo test --lib --features server`;
+fuzz `cargo test --test forward_prop_fuzz`; build server
+`cargo build --bin livetable-server --features server`. All under
+`env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` from `impl/`.
+
+---
+
 ## Global Constraints
 
 - Build with `env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` (per CLAUDE.md).
