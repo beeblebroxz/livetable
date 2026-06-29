@@ -382,6 +382,12 @@ impl TableWebSocket {
                     Err(err) => AppState::send_error(ctx, err),
                 }
             }
+
+            // Server-side view pipelines are wired up in a later task; until
+            // then, acknowledge the message without building a pipeline.
+            ClientMessage::SetPipeline { .. } => {
+                AppState::send_error(ctx, "SetPipeline not yet supported".to_string());
+            }
         }
     }
 }

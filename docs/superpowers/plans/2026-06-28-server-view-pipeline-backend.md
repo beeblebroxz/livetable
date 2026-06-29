@@ -17,7 +17,7 @@
 - Single change per tick is the verified-correct path; the engine ticks once per mutation message.
 - Keep `seq` populated on every server→client message (existing reconciliation invariant).
 - Preserve two-phase-commit mutation semantics (validate-all-before-mutate; `truncate_to`/re-insert rollback) when moving mutation logic.
-- Run all Rust tests with `cd impl && env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib` and the differential fuzz with `cargo test --test forward_prop_fuzz`.
+- The `messages`/`websocket`/`server` modules are gated behind `#[cfg(feature = "server")]`; the new `engine`/`pipeline_spec` modules depend on `messages` and so must also be `#[cfg(feature = "server")]`. **Test them with `cargo test --lib --features server`** (plain `cargo test --lib` silently skips them). Run the core view suite with `cargo test --lib` and the differential fuzz with `cargo test --test forward_prop_fuzz`.
 
 ---
 
