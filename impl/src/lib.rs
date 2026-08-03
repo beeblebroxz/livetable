@@ -31,6 +31,8 @@ pub use python_bindings::*;
 
 // WebSocket server modules - only when server feature is enabled
 #[cfg(feature = "server")]
+pub mod engine;
+#[cfg(feature = "server")]
 pub mod messages;
 #[cfg(feature = "server")]
 pub mod pipeline_spec;

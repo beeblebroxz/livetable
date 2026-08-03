@@ -44,6 +44,9 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
         run: cargo test --manifest-path impl/Cargo.toml --lib --features server
 
+      - name: Run protocol v2 WebSocket integration test
+        run: cargo test --manifest-path impl/Cargo.toml --features server --test protocol_v2_websocket
+
       - name: Build Python wheel
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'

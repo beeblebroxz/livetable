@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useTableWebSocket } from '../hooks/useTableWebSocket';
-import type { ScalarValue, TableRow } from '../types';
+import { usePipeline } from '../hooks/usePipeline';
+import type {
+  PipelineSnapshot,
+  ScalarValue,
+  TableRow,
+  ViewNodeSpec,
+} from '../types';
 
 type ViewKind = 'filter' | 'sort' | 'group';
 type NodeKind = 'base' | ViewKind;
@@ -23,21 +28,10 @@ interface EvaluatedNode {
   sourceTitle?: string;
   expression?: string;
   rows: TableRow[];
+  rowIds?: (number | null)[];
   columns: string[];
   tickKey: string;
   error?: string;
-}
-
-interface AggregateSpec {
-  alias: string;
-  op: 'sum' | 'avg' | 'min' | 'max' | 'count';
-  field: string | null;
-}
-
-interface GroupAccumulator {
-  row: TableRow;
-  count: number;
-  values: Record<string, number[]>;
 }
 
 interface CascadeDemoProps {
@@ -66,8 +60,8 @@ const DEFAULT_DEFINITIONS: ViewDefinition[] = [
     title: 'Regional Totals',
     sourceId: 'ranked',
     kind: 'group',
-    expression: 'region | total=sum(amount), average=avg(amount), count=count()',
-    defaultExpression: 'region | total=sum(amount), average=avg(amount), count=count()',
+    expression: 'region | total=sum(amount), average=avg(amount), count=count(amount)',
+    defaultExpression: 'region | total=sum(amount), average=avg(amount), count=count(amount)',
   },
 ];
 
@@ -134,140 +128,8 @@ const formatCellValue = (column: string, value: ScalarValue): string => {
   return String(value);
 };
 
-const inferColumns = (rows: TableRow[], fallback: string[] = DEFAULT_BASE_COLUMNS): string[] => {
-  const columns = new Set<string>();
-  for (const row of rows) {
-    Object.keys(row).forEach((column) => columns.add(column));
-  }
-  return columns.size > 0 ? Array.from(columns) : fallback;
-};
-
-const rowsSignature = (rows: TableRow[]): string =>
-  rows.map((row) => JSON.stringify(row)).join('|');
-
-const parseLiteral = (rawValue: string): ScalarValue => {
-  const value = rawValue.trim();
-  if (!value) {
-    return '';
-  }
-
-  const quoted = value.match(/^["'](.*)["']$/);
-  if (quoted) {
-    return quoted[1];
-  }
-
-  if (/^-?\d+(\.\d+)?$/.test(value)) {
-    return Number(value);
-  }
-
-  if (/^true$/i.test(value)) {
-    return true;
-  }
-
-  if (/^false$/i.test(value)) {
-    return false;
-  }
-
-  if (/^null$/i.test(value)) {
-    return null;
-  }
-
-  return value;
-};
-
-const compareValues = (
-  left: ScalarValue,
-  operator: string,
-  right: ScalarValue
-): boolean => {
-  if (operator === 'contains' || operator === 'startsWith' || operator === 'endsWith') {
-    const leftText = String(left ?? '');
-    const rightText = String(right ?? '');
-    if (operator === 'contains') {
-      return leftText.includes(rightText);
-    }
-    if (operator === 'startsWith') {
-      return leftText.startsWith(rightText);
-    }
-    return leftText.endsWith(rightText);
-  }
-
-  if (operator === '=' || operator === '==') {
-    return left === right || String(left) === String(right);
-  }
-
-  if (operator === '!=') {
-    return left !== right && String(left) !== String(right);
-  }
-
-  const leftComparable = isNumber(left) && isNumber(right) ? left : String(left ?? '');
-  const rightComparable = isNumber(left) && isNumber(right) ? right : String(right ?? '');
-
-  switch (operator) {
-    case '>':
-      return leftComparable > rightComparable;
-    case '>=':
-      return leftComparable >= rightComparable;
-    case '<':
-      return leftComparable < rightComparable;
-    case '<=':
-      return leftComparable <= rightComparable;
-    default:
-      throw new Error(`Unsupported operator "${operator}"`);
-  }
-};
-
-const evaluateCondition = (row: TableRow, condition: string): boolean => {
-  const parsed = condition
-    .trim()
-    .match(/^([A-Za-z_][\w]*)\s*(contains|startsWith|endsWith|==|=|!=|>=|<=|>|<)\s*(.+)$/i);
-
-  if (!parsed) {
-    throw new Error(`Could not parse condition "${condition.trim()}"`);
-  }
-
-  const [, field, operator, rawLiteral] = parsed;
-  return compareValues(row[field] ?? null, operator, parseLiteral(rawLiteral));
-};
-
-const applyFilter = (rows: TableRow[], expression: string): TableRow[] => {
-  const trimmed = expression.trim();
-  if (!trimmed) {
-    return rows;
-  }
-
-  return rows.filter((row) => {
-    const parts = trimmed.split(/\s+(AND|OR)\s+/i);
-    let result = evaluateCondition(row, parts[0]);
-
-    for (let index = 1; index < parts.length; index += 2) {
-      const connector = parts[index].toUpperCase();
-      const nextResult = evaluateCondition(row, parts[index + 1]);
-      result = connector === 'AND' ? result && nextResult : result || nextResult;
-    }
-
-    return result;
-  });
-};
-
-const compareForSort = (left: ScalarValue, right: ScalarValue): number => {
-  if (left === right) {
-    return 0;
-  }
-  if (left === null || left === undefined) {
-    return 1;
-  }
-  if (right === null || right === undefined) {
-    return -1;
-  }
-  if (isNumber(left) && isNumber(right)) {
-    return left - right;
-  }
-  return String(left).localeCompare(String(right));
-};
-
-const applySort = (rows: TableRow[], expression: string): TableRow[] => {
-  const sortParts = expression
+const parseSortExpression = (expression: string) => {
+  const keys = expression
     .split(',')
     .map((part) => part.trim())
     .filter(Boolean)
@@ -280,213 +142,99 @@ const applySort = (rows: TableRow[], expression: string): TableRow[] => {
       if (normalizedDirection !== 'asc' && normalizedDirection !== 'desc') {
         throw new Error(`Sort direction must be asc or desc in "${part}"`);
       }
-      return { field, descending: normalizedDirection === 'desc' };
+      return { column: field, descending: normalizedDirection === 'desc' };
     });
-
-  if (sortParts.length === 0) {
-    return rows;
+  if (keys.length === 0) {
+    throw new Error('Sort expression needs at least one column');
   }
-
-  return [...rows].sort((left, right) => {
-    for (const sortPart of sortParts) {
-      const comparison = compareForSort(left[sortPart.field] ?? null, right[sortPart.field] ?? null);
-      if (comparison !== 0) {
-        return sortPart.descending ? -comparison : comparison;
-      }
-    }
-    return 0;
-  });
+  return keys;
 };
 
-const parseGroupExpression = (expression: string): {
-  groupField: string;
-  specs: AggregateSpec[];
-} => {
-  const [rawGroupField, rawAggs = 'count=count()'] = expression.split('|').map((part) => part.trim());
-  if (!rawGroupField || !/^[A-Za-z_][\w]*$/.test(rawGroupField)) {
+const parseGroupExpression = (expression: string) => {
+  const parts = expression.split('|');
+  if (parts.length !== 2) {
+    throw new Error('Group expression must be "column | alias=op(column)"');
+  }
+  const groupBy = parts[0]
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (groupBy.length === 0 || groupBy.some((field) => !/^[A-Za-z_][\w]*$/.test(field))) {
     throw new Error('Group expression must start with a column name');
   }
-
-  const specs = rawAggs
+  const aggs = parts[1]
     .split(',')
     .map((part) => part.trim())
     .filter(Boolean)
     .map((part) => {
-      const parsed = part.match(/^([A-Za-z_][\w]*)\s*=\s*(sum|avg|min|max|count)\(([^)]*)\)$/i);
+      const parsed = part.match(/^([A-Za-z_][\w]*)\s*=\s*(.+)\(\s*([A-Za-z_][\w]*)\s*\)$/);
       if (!parsed) {
         throw new Error(`Could not parse aggregate "${part}"`);
       }
-
-      const [, alias, rawOp, rawField] = parsed;
-      const op = rawOp.toLowerCase() as AggregateSpec['op'];
-      const field = rawField.trim();
-      if (op !== 'count' && !/^[A-Za-z_][\w]*$/.test(field)) {
-        throw new Error(`${op}() needs a column name`);
-      }
-      if (op === 'count' && field && field !== '*' && !/^[A-Za-z_][\w]*$/.test(field)) {
-        throw new Error('count() must be empty, *, or a column name');
-      }
-
-      return {
-        alias,
-        op,
-        field: field && field !== '*' ? field : null,
-      };
+      const [, alias, op, column] = parsed;
+      return { alias, op: op.trim(), column };
     });
-
-  return {
-    groupField: rawGroupField,
-    specs: specs.length > 0 ? specs : [{ alias: 'count', op: 'count', field: null }],
-  };
-};
-
-const applyGroup = (rows: TableRow[], expression: string): {
-  rows: TableRow[];
-  columns: string[];
-} => {
-  const { groupField, specs } = parseGroupExpression(expression);
-  const groups = new Map<string, GroupAccumulator>();
-
-  for (const sourceRow of rows) {
-    const keyValue = sourceRow[groupField] ?? '-';
-    const key = String(keyValue);
-    const group = groups.get(key) ?? {
-      row: { [groupField]: keyValue },
-      count: 0,
-      values: {},
-    };
-
-    group.count += 1;
-    for (const spec of specs) {
-      if (spec.op === 'count') {
-        if (spec.field && sourceRow[spec.field] !== null && sourceRow[spec.field] !== undefined) {
-          group.values[spec.alias] = [...(group.values[spec.alias] ?? []), 1];
-        }
-        continue;
-      }
-
-      if (!spec.field) {
-        continue;
-      }
-
-      const value = sourceRow[spec.field];
-      if (isNumber(value)) {
-        group.values[spec.alias] = [...(group.values[spec.alias] ?? []), value];
-      }
-    }
-
-    groups.set(key, group);
+  if (aggs.length === 0) {
+    throw new Error('Group expression needs at least one aggregate');
   }
-
-  const resultRows = Array.from(groups.values()).map((group) => {
-    const output: TableRow = { ...group.row };
-    for (const spec of specs) {
-      if (spec.op === 'count') {
-        output[spec.alias] = spec.field
-          ? group.values[spec.alias]?.length ?? 0
-          : group.count;
-        continue;
-      }
-
-      const values = group.values[spec.alias] ?? [];
-      if (values.length === 0) {
-        output[spec.alias] = 0;
-        continue;
-      }
-
-      if (spec.op === 'sum') {
-        output[spec.alias] = values.reduce((sum, value) => sum + value, 0);
-      } else if (spec.op === 'avg') {
-        output[spec.alias] = values.reduce((sum, value) => sum + value, 0) / values.length;
-      } else if (spec.op === 'min') {
-        output[spec.alias] = Math.min(...values);
-      } else {
-        output[spec.alias] = Math.max(...values);
-      }
-    }
-    return output;
-  });
-
-  resultRows.sort((left, right) => String(left[groupField]).localeCompare(String(right[groupField])));
-
-  return {
-    rows: resultRows,
-    columns: [groupField, ...specs.map((spec) => spec.alias)],
-  };
+  return { group_by: groupBy, aggs };
 };
 
-const evaluateView = (
-  definition: ViewDefinition,
-  source: EvaluatedNode
-): Pick<EvaluatedNode, 'rows' | 'columns' | 'error'> => {
-  try {
-    if (definition.kind === 'filter') {
-      return {
-        rows: applyFilter(source.rows, definition.expression),
-        columns: source.columns,
-      };
-    }
-
-    if (definition.kind === 'sort') {
-      return {
-        rows: applySort(source.rows, definition.expression),
-        columns: source.columns,
-      };
-    }
-
-    return applyGroup(source.rows, definition.expression);
-  } catch (error) {
-    return {
-      rows: [],
-      columns: source.columns,
-      error: error instanceof Error ? error.message : 'Expression failed',
-    };
-  }
-};
-
-const evaluatePipeline = (
-  baseRows: TableRow[],
-  baseColumns: string[],
+const compilePipeline = (
   definitions: ViewDefinition[]
-): EvaluatedNode[] => {
-  const nodesById = new Map<string, EvaluatedNode>();
-  const baseNode: EvaluatedNode = {
-    id: 'base',
-    title: 'Base Sales',
-    kind: 'base',
-    rows: baseRows,
-    columns: baseColumns,
-    tickKey: rowsSignature(baseRows),
-  };
-
-  nodesById.set(baseNode.id, baseNode);
-  const nodes = [baseNode];
-
+): { specs: ViewNodeSpec[]; errors: Record<string, string> } => {
+  const specs: ViewNodeSpec[] = [];
+  const errors: Record<string, string> = {};
   for (const definition of definitions) {
-    const source = nodesById.get(definition.sourceId) ?? baseNode;
-    const evaluated = evaluateView(definition, source);
-    const node: EvaluatedNode = {
-      id: definition.id,
-      title: definition.title,
-      kind: definition.kind,
-      sourceId: source.id,
-      sourceTitle: source.title,
-      expression: definition.expression,
-      rows: evaluated.rows,
-      columns: evaluated.columns,
-      error: evaluated.error,
-      tickKey: [
-        source.tickKey,
-        definition.kind,
-        definition.expression,
-        evaluated.error ?? 'ok',
-      ].join('::'),
-    };
-    nodesById.set(node.id, node);
-    nodes.push(node);
+    try {
+      if (definition.kind === 'filter') {
+        specs.push({
+          id: definition.id,
+          source_id: definition.sourceId,
+          kind: 'filter',
+          predicate: definition.expression,
+        });
+      } else if (definition.kind === 'sort') {
+        specs.push({
+          id: definition.id,
+          source_id: definition.sourceId,
+          kind: 'sort',
+          keys: parseSortExpression(definition.expression),
+        });
+      } else {
+        specs.push({
+          id: definition.id,
+          source_id: definition.sourceId,
+          kind: 'group',
+          ...parseGroupExpression(definition.expression),
+        });
+      }
+    } catch (error) {
+      errors[definition.id] = error instanceof Error ? error.message : 'Expression failed';
+      break;
+    }
   }
+  return { specs, errors };
+};
 
-  return nodes;
+const snapshotRows = (snapshot?: PipelineSnapshot): TableRow[] =>
+  snapshot?.rows.map((record) => record.row) ?? [];
+
+const parseEditedValue = (raw: string, previous: ScalarValue): ScalarValue => {
+  if (typeof previous === 'number') {
+    if (raw.trim() === '') {
+      return previous;
+    }
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : previous;
+  }
+  if (typeof previous === 'boolean') {
+    return raw.toLowerCase() === 'true';
+  }
+  if (previous === null) {
+    return raw === '' ? null : raw;
+  }
+  return raw;
 };
 
 const createRandomSale = (): TableRow => ({
@@ -553,10 +301,16 @@ function FlowStrip({
 function DataPreview({
   columns,
   rows,
+  rowIds,
+  onUpdateCell,
+  onDeleteRow,
   maxRows = 8,
 }: {
   columns: string[];
   rows: TableRow[];
+  rowIds?: (number | null)[];
+  onUpdateCell?: (rowId: number, column: string, value: ScalarValue) => void;
+  onDeleteRow?: (rowId: number) => void;
   maxRows?: number;
 }) {
   const visibleRows = rows.slice(0, maxRows);
@@ -571,21 +325,55 @@ function DataPreview({
                 {column}
               </th>
             ))}
+            {onDeleteRow && <th className="w-20 px-3 py-2 font-semibold">Actions</th>}
           </tr>
         </thead>
         <tbody>
-          {visibleRows.map((row, rowIndex) => (
-            <tr key={`${rowIndex}-${JSON.stringify(row)}`} className="border-b border-gray-100">
-              {columns.map((column) => (
-                <td key={column} className="truncate px-3 py-2 text-gray-800">
-                  {formatCellValue(column, row[column] ?? null)}
-                </td>
-              ))}
-            </tr>
-          ))}
+          {visibleRows.map((row, rowIndex) => {
+            const rowId = rowIds?.[rowIndex] ?? null;
+            return (
+              <tr key={rowId ?? `${rowIndex}-${JSON.stringify(row)}`} className="border-b border-gray-100">
+                {columns.map((column) => {
+                  const value = row[column] ?? null;
+                  return (
+                    <td key={column} className="truncate px-3 py-2 text-gray-800">
+                      {rowId !== null && onUpdateCell ? (
+                        <input
+                          key={`${rowId}:${column}:${String(value)}`}
+                          aria-label={`Edit ${column} for row ${rowId}`}
+                          defaultValue={value === null ? '' : String(value)}
+                          onBlur={(event) => {
+                            const next = parseEditedValue(event.target.value, value);
+                            if (next !== value) {
+                              onUpdateCell(rowId, column, next);
+                            }
+                          }}
+                          className="w-full rounded border border-transparent bg-transparent px-1 py-0.5 outline-none hover:border-gray-200 focus:border-sky-400 focus:bg-white"
+                        />
+                      ) : (
+                        formatCellValue(column, value)
+                      )}
+                    </td>
+                  );
+                })}
+                {onDeleteRow && (
+                  <td className="px-3 py-2">
+                    <button
+                      type="button"
+                      disabled={rowId === null}
+                      onClick={() => rowId !== null && onDeleteRow(rowId)}
+                      className="text-xs font-medium text-rose-700 hover:text-rose-900 disabled:text-gray-300"
+                    >
+                      Delete
+                    </button>
+                  </td>
+                )}
+              </tr>
+            );
+          })}
           {visibleRows.length === 0 && (
             <tr>
-              <td colSpan={columns.length} className="px-3 py-8 text-center text-gray-400">
+              <td colSpan={columns.length + (onDeleteRow ? 1 : 0)} className="px-3 py-8 text-center text-gray-400">
                 No matching rows
               </td>
             </tr>
@@ -608,6 +396,8 @@ function NodePanel({
   isActive,
   onExpressionChange,
   onReset,
+  onUpdateCell,
+  onDeleteRow,
 }: {
   node: EvaluatedNode;
   definition?: ViewDefinition;
@@ -615,6 +405,8 @@ function NodePanel({
   isActive: boolean;
   onExpressionChange?: (expression: string) => void;
   onReset?: () => void;
+  onUpdateCell?: (rowId: number, column: string, value: ScalarValue) => void;
+  onDeleteRow?: (rowId: number) => void;
 }) {
   const accent = accentStyles[node.kind === 'base' ? 'base' : node.kind];
   const expressionRows = node.kind === 'group' ? 3 : 2;
@@ -671,34 +463,81 @@ function NodePanel({
         </div>
       )}
 
-      <DataPreview columns={node.columns} rows={node.rows} />
+      {!definition && node.error && (
+        <div className="border-b border-gray-100 px-4 py-3">
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+            {node.error}
+          </div>
+        </div>
+      )}
+
+      <DataPreview
+        columns={node.columns}
+        rows={node.rows}
+        rowIds={node.rowIds}
+        onUpdateCell={onUpdateCell}
+        onDeleteRow={onDeleteRow}
+      />
     </section>
   );
 }
 
 export function CascadeDemo({ onBack }: CascadeDemoProps) {
-  const {
-    data: records,
-    columns: serverColumns,
-    connected,
-    insertRow,
-  } = useTableWebSocket('demo');
   const [definitions, setDefinitions] = useState<ViewDefinition[]>(DEFAULT_DEFINITIONS);
+  const compiled = useMemo(() => compilePipeline(definitions), [definitions]);
+  const {
+    connected,
+    generation,
+    snapshots,
+    errors: serverErrors,
+    insertRow,
+    updateCell,
+    deleteRow,
+  } = usePipeline('demo', compiled.specs);
   const [autoStream, setAutoStream] = useState(false);
   const [tickCounts, setTickCounts] = useState<Record<string, number>>({});
   const [activeTicks, setActiveTicks] = useState<Set<string>>(new Set());
   const lastTickKeysRef = useRef<Record<string, string>>({});
 
-  const baseRows = useMemo(() => records.map((record) => record.values), [records]);
-  const baseColumns = useMemo(
-    () => (serverColumns.length > 0 ? serverColumns : inferColumns(baseRows)),
-    [baseRows, serverColumns]
-  );
-
-  const nodes = useMemo(
-    () => evaluatePipeline(baseRows, baseColumns, definitions),
-    [baseColumns, baseRows, definitions]
-  );
+  const nodes = useMemo(() => {
+    const currentSnapshot = (id: string) => {
+      const snapshot = snapshots[id];
+      return snapshot?.generation === generation ? snapshot : undefined;
+    };
+    const baseSnapshot = currentSnapshot('base');
+    const baseNode: EvaluatedNode = {
+      id: 'base',
+      title: 'Base Sales',
+      kind: 'base',
+      rows: snapshotRows(baseSnapshot),
+      rowIds: baseSnapshot?.rows.map((record) => record.row_id),
+      columns: baseSnapshot?.columns ?? DEFAULT_BASE_COLUMNS,
+      tickKey: baseSnapshot ? `${baseSnapshot.generation}:${baseSnapshot.seq}` : '',
+      error: serverErrors.base ?? serverErrors.pipeline ?? serverErrors.connection,
+    };
+    const byId = new Map<string, EvaluatedNode>([['base', baseNode]]);
+    const materialized = [baseNode];
+    for (const definition of definitions) {
+      const source = byId.get(definition.sourceId) ?? baseNode;
+      const snapshot = currentSnapshot(definition.id);
+      const node: EvaluatedNode = {
+        id: definition.id,
+        title: definition.title,
+        kind: definition.kind,
+        sourceId: definition.sourceId,
+        sourceTitle: source.title,
+        expression: definition.expression,
+        rows: snapshotRows(snapshot),
+        columns: snapshot?.columns ?? source.columns,
+        tickKey: snapshot ? `${snapshot.generation}:${snapshot.seq}` : '',
+        error: compiled.errors[definition.id] ?? serverErrors[definition.id],
+      };
+      byId.set(node.id, node);
+      materialized.push(node);
+    }
+    return materialized;
+  }, [compiled.errors, definitions, generation, serverErrors, snapshots]);
+  const baseRows = nodes[0].rows;
   const tickSignature = nodes.map((node) => `${node.id}:${node.tickKey}`).join('\n');
   const definitionById = useMemo(
     () => new Map(definitions.map((definition) => [definition.id, definition])),
@@ -720,14 +559,16 @@ export function CascadeDemo({ onBack }: CascadeDemoProps) {
 
   useEffect(() => {
     const changedIds = nodes
-      .filter((node) => lastTickKeysRef.current[node.id] !== node.tickKey)
+      .filter((node) => node.tickKey && lastTickKeysRef.current[node.id] !== node.tickKey)
       .map((node) => node.id);
 
     if (changedIds.length === 0) {
       return undefined;
     }
 
-    lastTickKeysRef.current = Object.fromEntries(nodes.map((node) => [node.id, node.tickKey]));
+    lastTickKeysRef.current = Object.fromEntries(
+      nodes.filter((node) => node.tickKey).map((node) => [node.id, node.tickKey])
+    );
     setTickCounts((previous) => {
       const next = { ...previous };
       for (const id of changedIds) {
@@ -848,6 +689,8 @@ export function CascadeDemo({ onBack }: CascadeDemoProps) {
                   definition ? (expression) => updateExpression(definition.id, expression) : undefined
                 }
                 onReset={definition ? () => resetExpression(definition.id) : undefined}
+                onUpdateCell={node.kind === 'base' ? updateCell : undefined}
+                onDeleteRow={node.kind === 'base' ? deleteRow : undefined}
               />
             );
           })}

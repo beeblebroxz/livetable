@@ -9,6 +9,16 @@ pub struct WireTableRow {
     pub row: HashMap<String, JsonValue>,
 }
 
+/// A row in a derived-view snapshot. Derived rows do not always have a stable
+/// identity (group aggregates are the clearest example), so their row id is
+/// explicitly nullable instead of using an integer sentinel that JavaScript
+/// cannot represent safely.
+#[derive(Debug, Serialize, Clone)]
+pub struct WireViewRow {
+    pub row_id: Option<u64>,
+    pub row: HashMap<String, JsonValue>,
+}
+
 /// One sort key in a `Sort` view spec.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SortKeySpec {
@@ -18,12 +28,12 @@ pub struct SortKeySpec {
 
 /// One aggregate in a `Group` view spec. `op` is an engine-syntax op string
 /// (`sum|avg|min|max|count|median|pNN|percentile(x)`); `column` is the source
-/// column (may be omitted for `count`).
+/// column. `count` means `COUNT(column)` (non-null count), not row count.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AggSpec {
     pub alias: String,
     pub op: String,
-    pub column: Option<String>,
+    pub column: String,
 }
 
 /// The kind-specific payload of a pipeline node, internally tagged on `kind`
@@ -31,8 +41,12 @@ pub struct AggSpec {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ViewKindSpec {
-    Filter { predicate: String },
-    Sort { keys: Vec<SortKeySpec> },
+    Filter {
+        predicate: String,
+    },
+    Sort {
+        keys: Vec<SortKeySpec>,
+    },
     Group {
         group_by: Vec<String>,
         aggs: Vec<AggSpec>,
@@ -80,6 +94,10 @@ pub enum ClientMessage {
     /// Re-sent on every expression edit (the server rebuilds the affected views).
     SetPipeline {
         table_name: String,
+        /// Client-selected generation for this complete pipeline definition.
+        /// Echoed by ViewData/ViewError so a client can discard responses from
+        /// an older definition after rapid edits or reconnects.
+        pipeline_generation: u32,
         nodes: Vec<ViewNodeSpec>,
     },
 }
@@ -143,23 +161,27 @@ pub enum ServerMessage {
     },
 
     /// Full snapshot of one derived-view node after a tick. One per pipeline
-    /// node whose output changed. `rows` carry a `row_id` of `u64::MAX` for
-    /// derived nodes without a stable row identity (e.g. group aggregates);
-    /// the `base` node carries real row ids so the client can edit/delete.
+    /// node whose output changed. Rows without a stable identity carry a null
+    /// `row_id`; the `base` node carries real row ids so the client can
+    /// edit/delete.
     ViewData {
         table_name: String,
+        /// Generation from the SetPipeline request that created this node.
+        pipeline_generation: u32,
         node_id: String,
         source_id: String,
         kind: String,
         /// The node's monotonic version at snapshot time (own counter + parent).
         seq: u64,
         columns: Vec<String>,
-        rows: Vec<WireTableRow>,
+        rows: Vec<WireViewRow>,
     },
 
     /// A pipeline node failed to build/evaluate (e.g. a bad expression).
     ViewError {
         table_name: String,
+        /// Generation from the SetPipeline request that failed.
+        pipeline_generation: u32,
         node_id: String,
         message: String,
     },
@@ -189,7 +211,7 @@ mod tests {
 
     #[test]
     fn set_pipeline_deserializes_tagged_specs() {
-        let json = r#"{"type":"SetPipeline","table_name":"demo","nodes":[
+        let json = r#"{"type":"SetPipeline","table_name":"demo","pipeline_generation":12,"nodes":[
             {"id":"f","source_id":"base","kind":"filter","predicate":"amount >= 500"},
             {"id":"s","source_id":"f","kind":"sort","keys":[{"column":"amount","descending":true}]},
             {"id":"g","source_id":"s","kind":"group","group_by":["region"],
@@ -198,8 +220,13 @@ mod tests {
         ]}"#;
         let msg: ClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            ClientMessage::SetPipeline { table_name, nodes } => {
+            ClientMessage::SetPipeline {
+                table_name,
+                pipeline_generation,
+                nodes,
+            } => {
                 assert_eq!(table_name, "demo");
+                assert_eq!(pipeline_generation, 12);
                 assert_eq!(nodes.len(), 3);
                 assert_eq!(nodes[0].id, "f");
                 assert_eq!(nodes[0].source_id, "base");
@@ -221,31 +248,54 @@ mod tests {
     }
 
     #[test]
+    fn set_pipeline_requires_generation_and_aggregate_column() {
+        let missing_generation = r#"{"type":"SetPipeline","table_name":"demo","nodes":[]}"#;
+        assert!(serde_json::from_str::<ClientMessage>(missing_generation).is_err());
+
+        let missing_column = r#"{"type":"SetPipeline","table_name":"demo","pipeline_generation":1,"nodes":[
+            {"id":"g","source_id":"base","kind":"group","group_by":["region"],
+             "aggs":[{"alias":"count","op":"count"}]}
+        ]}"#;
+        assert!(serde_json::from_str::<ClientMessage>(missing_column).is_err());
+    }
+
+    #[test]
     fn view_data_serializes_with_seq() {
         let msg = ServerMessage::ViewData {
             table_name: "demo".into(),
+            pipeline_generation: 12,
             node_id: "g".into(),
             source_id: "s".into(),
             kind: "group".into(),
             seq: 7,
             columns: vec!["region".into(), "total".into()],
-            rows: vec![],
+            rows: vec![WireViewRow {
+                row_id: None,
+                row: HashMap::from([
+                    ("region".into(), JsonValue::String("West".into())),
+                    ("total".into(), JsonValue::from(500)),
+                ]),
+            }],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"ViewData\""), "got: {}", json);
         assert!(json.contains("\"seq\":7"), "got: {}", json);
+        assert!(json.contains("\"pipeline_generation\":12"), "got: {}", json);
         assert!(json.contains("\"node_id\":\"g\""), "got: {}", json);
+        assert!(json.contains("\"row_id\":null"), "got: {}", json);
     }
 
     #[test]
     fn view_error_serializes() {
         let msg = ServerMessage::ViewError {
             table_name: "demo".into(),
+            pipeline_generation: 13,
             node_id: "f".into(),
             message: "bad expr".into(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"ViewError\""), "got: {}", json);
+        assert!(json.contains("\"pipeline_generation\":13"), "got: {}", json);
         assert!(json.contains("\"node_id\":\"f\""), "got: {}", json);
     }
 }

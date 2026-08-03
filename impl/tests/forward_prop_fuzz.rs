@@ -9,15 +9,15 @@
 //! path, which is exactly what we want to catch.
 //!
 //! Coverage:
-//!   * FilterView directly on root           (incremental changeset path)
-//!   * SortedView directly on root           (incremental changeset path)
-//!   * AggregateView directly on root         (incremental running aggregates,
-//!                                             incl. MIN/MAX recalc + MEDIAN/p90
-//!                                             sorted_values maintenance)
-//!   * SortedView over a FilterView           (chained, version-checked refresh)
-//!   * AggregateView over the chained sort     (chained-of-chained)
-//! plus multi-consumer min-cursor changeset compaction (filter + the two direct
-//! views all consume the root changeset on the same TickableTable).
+//! - FilterView directly on root (incremental changeset path)
+//! - SortedView directly on root (incremental changeset path)
+//! - AggregateView directly on root (incremental running aggregates, including
+//!   MIN/MAX recalculation and MEDIAN/p90 sorted-values maintenance)
+//! - SortedView over a FilterView (chained, version-checked refresh)
+//! - AggregateView over the chained sort (chained-of-chained)
+//!
+//! It also covers multi-consumer min-cursor changeset compaction (filter + the
+//! two direct views all consume the root changeset on the same TickableTable).
 //!
 //! Two drivers:
 //!   * `differential_chained_forward_prop_fuzz` ticks after EVERY mutation

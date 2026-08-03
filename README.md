@@ -310,7 +310,11 @@ See [tests/README.md](tests/README.md) for the full test matrix and toolchain sp
 
 ## React Frontend
 
-Real-time table editor with WebSocket sync.
+Real-time table editor with WebSocket sync. Protocol v2 also supports
+connection-local server-computed pipelines: the forward-propagation demo sends
+`SetPipeline` definitions and renders Rust-engine `ViewData` snapshots for the
+base, filter, sort, and group nodes. Expression rebuilds are debounced and
+generation-scoped so stale responses cannot overwrite newer definitions.
 
 ```bash
 # Terminal 1: Start backend

@@ -6,6 +6,7 @@ import type {
   TableRecord,
   TableRow,
   WireTableRecord,
+  WireViewRecord,
 } from '../types';
 
 type DeltaMessage = Extract<
@@ -27,9 +28,9 @@ export const MAX_PENDING_DELTAS = 500;
 // Wire-protocol version this client understands. The server reports its own
 // in the Subscribed handshake; a mismatch is logged so protocol drift is
 // visible instead of failing mysteriously.
-export const SUPPORTED_PROTOCOL_VERSION = 1;
+export const SUPPORTED_PROTOCOL_VERSION = 2;
 
-const getDefaultWebSocketUrl = () => {
+export const getDefaultWebSocketUrl = () => {
   if (configuredWsUrl) {
     return configuredWsUrl;
   }
@@ -58,17 +59,21 @@ const isScalarValue = (value: unknown): value is ScalarValue =>
   typeof value === 'number' ||
   typeof value === 'boolean';
 
-const isSeq = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value) && value >= 0;
+const isWireInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
 const isTableRow = (value: unknown): value is TableRow =>
   isObject(value) && Object.values(value).every(isScalarValue);
 
 const isWireTableRecord = (value: unknown): value is WireTableRecord =>
   isObject(value) &&
-  typeof value.row_id === 'number' &&
-  Number.isInteger(value.row_id) &&
-  value.row_id >= 0 &&
+  isWireInteger(value.row_id) &&
+  isTableRow(value.row);
+
+const isWireViewRecord = (value: unknown): value is WireViewRecord =>
+  isObject(value) &&
+  (value.row_id === null ||
+    isWireInteger(value.row_id)) &&
   isTableRow(value.row);
 
 const toTableRecord = (record: WireTableRecord): TableRecord => ({
@@ -76,7 +81,7 @@ const toTableRecord = (record: WireTableRecord): TableRecord => ({
   values: record.row,
 });
 
-const parseServerMessage = (payload: unknown): ServerMessage | null => {
+export const parseServerMessage = (payload: unknown): ServerMessage | null => {
   if (typeof payload !== 'string') {
     return null;
   }
@@ -94,10 +99,13 @@ const parseServerMessage = (payload: unknown): ServerMessage | null => {
 
   switch (parsed.type) {
     case 'Subscribed':
-      return typeof parsed.table_name === 'string' ? parsed as ServerMessage : null;
+      return typeof parsed.table_name === 'string' &&
+        (parsed.protocol_version === undefined || isWireInteger(parsed.protocol_version))
+        ? parsed as ServerMessage
+        : null;
     case 'TableData':
       return typeof parsed.table_name === 'string' &&
-        isSeq(parsed.seq) &&
+        isWireInteger(parsed.seq) &&
         Array.isArray(parsed.columns) &&
         parsed.columns.every((column) => typeof column === 'string') &&
         Array.isArray(parsed.rows) &&
@@ -106,32 +114,47 @@ const parseServerMessage = (payload: unknown): ServerMessage | null => {
         : null;
     case 'RowInserted':
       return typeof parsed.table_name === 'string' &&
-        isSeq(parsed.seq) &&
-        typeof parsed.index === 'number' &&
-        Number.isInteger(parsed.index) &&
-        parsed.index >= 0 &&
-        typeof parsed.row_id === 'number' &&
-        Number.isInteger(parsed.row_id) &&
-        parsed.row_id >= 0 &&
+        isWireInteger(parsed.seq) &&
+        isWireInteger(parsed.index) &&
+        isWireInteger(parsed.row_id) &&
         isTableRow(parsed.row)
         ? parsed as ServerMessage
         : null;
     case 'CellUpdated':
       return typeof parsed.table_name === 'string' &&
-        isSeq(parsed.seq) &&
-        typeof parsed.row_id === 'number' &&
-        Number.isInteger(parsed.row_id) &&
-        parsed.row_id >= 0 &&
+        isWireInteger(parsed.seq) &&
+        isWireInteger(parsed.row_id) &&
         typeof parsed.column === 'string' &&
         isScalarValue(parsed.value)
         ? parsed as ServerMessage
         : null;
     case 'RowDeleted':
       return typeof parsed.table_name === 'string' &&
-        isSeq(parsed.seq) &&
-        typeof parsed.row_id === 'number' &&
-        Number.isInteger(parsed.row_id) &&
-        parsed.row_id >= 0
+        isWireInteger(parsed.seq) &&
+        isWireInteger(parsed.row_id)
+        ? parsed as ServerMessage
+        : null;
+    case 'ViewData':
+      return typeof parsed.table_name === 'string' &&
+        isWireInteger(parsed.pipeline_generation) &&
+        typeof parsed.node_id === 'string' &&
+        typeof parsed.source_id === 'string' &&
+        (parsed.kind === 'base' ||
+          parsed.kind === 'filter' ||
+          parsed.kind === 'sort' ||
+          parsed.kind === 'group') &&
+        isWireInteger(parsed.seq) &&
+        Array.isArray(parsed.columns) &&
+        parsed.columns.every((column) => typeof column === 'string') &&
+        Array.isArray(parsed.rows) &&
+        parsed.rows.every(isWireViewRecord)
+        ? parsed as ServerMessage
+        : null;
+    case 'ViewError':
+      return typeof parsed.table_name === 'string' &&
+        isWireInteger(parsed.pipeline_generation) &&
+        typeof parsed.node_id === 'string' &&
+        typeof parsed.message === 'string'
         ? parsed as ServerMessage
         : null;
     case 'Error':
@@ -375,6 +398,16 @@ export function useTableWebSocket(
                   'updates may not apply correctly'
               );
             }
+            break;
+          case 'ViewData':
+            // Pipeline state is consumed by the dedicated usePipeline hook.
+            // Recognizing it here keeps the shared protocol parser complete.
+            break;
+          case 'ViewError':
+            console.error(
+              `Pipeline node ${message.node_id} failed:`,
+              message.message
+            );
             break;
           case 'Error':
             console.error('Server error:', message.message);

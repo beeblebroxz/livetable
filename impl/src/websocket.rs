@@ -1,37 +1,23 @@
-/// WebSocket server for real-time table updates
+//! WebSocket transport and the single-threaded actor that owns `TableEngine`.
+
 use actix::prelude::*;
 use actix_web_actors::ws;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::column::{ColumnType, ColumnValue};
-use crate::messages::{ClientMessage, ServerMessage, WireTableRow};
-use crate::table::{Schema, Table};
+use crate::engine::{ConnId, NodeSnapshot, TableEngine};
+use crate::messages::{ClientMessage, ServerMessage, ViewNodeSpec, PROTOCOL_VERSION};
 
-/// How often heartbeat pings are sent
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-/// How long before lack of client response causes a timeout
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 type JsonRow = HashMap<String, JsonValue>;
 
-/// Acquire a mutex guard even if the mutex was poisoned by a prior panic.
-/// A poisoned mutex means the data MIGHT be in an inconsistent state, but
-/// for our use cases (HashMap<String, TableState>, Vec<Addr>) the invariants
-/// are statement-local and a partial mutation is tolerable — we prefer to
-/// keep the server running over crashing every future request.
-#[inline]
-fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-/// Serialize a `ServerMessage` to JSON. If serialization fails (e.g. a
-/// NaN/Infinity float slipped through), return a minimal Error envelope
-/// instead of panicking and tearing down the connection.
-fn serialize_ws_message(msg: &ServerMessage) -> String {
-    serde_json::to_string(msg).unwrap_or_else(|e| {
-        let safe = e.to_string().replace('"', "'").replace('\\', "/");
+fn serialize_ws_message(message: &ServerMessage) -> String {
+    serde_json::to_string(message).unwrap_or_else(|error| {
+        let safe = error.to_string().replace('"', "'").replace('\\', "/");
         format!(
             r#"{{"type":"Error","message":"Server serialization failure: {}"}}"#,
             safe
@@ -39,60 +25,279 @@ fn serialize_ws_message(msg: &ServerMessage) -> String {
     })
 }
 
-struct TableState {
-    table: Table,
-    row_ids: Vec<u64>,
-    next_row_id: u64,
+fn snapshot_message(table_name: &str, snapshot: NodeSnapshot) -> ServerMessage {
+    ServerMessage::ViewData {
+        table_name: table_name.to_string(),
+        pipeline_generation: snapshot.pipeline_generation,
+        node_id: snapshot.node_id,
+        source_id: snapshot.source_id,
+        kind: snapshot.kind,
+        seq: snapshot.seq,
+        columns: snapshot.columns,
+        rows: snapshot.rows,
+    }
 }
 
-impl TableState {
-    fn with_seed_data(table: Table) -> Self {
-        let row_count = table.len() as u64;
+/// The one outbound path to a WebSocket (or an actor-test probe).
+#[derive(Message, Clone)]
+#[rtype(result = "()")]
+pub(crate) struct BroadcastMessage(pub ServerMessage);
+
+type ClientRecipient = Recipient<BroadcastMessage>;
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct SubscribeBase {
+    table_name: String,
+    conn: ConnId,
+    requester: ClientRecipient,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Query {
+    table_name: String,
+    requester: ClientRecipient,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Insert {
+    table_name: String,
+    row: JsonRow,
+    requester: ClientRecipient,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Update {
+    table_name: String,
+    row_id: u64,
+    column: String,
+    value: JsonValue,
+    requester: ClientRecipient,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Delete {
+    table_name: String,
+    row_id: u64,
+    requester: ClientRecipient,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct SetPipeline {
+    conn: ConnId,
+    table_name: String,
+    pipeline_generation: u32,
+    nodes: Vec<ViewNodeSpec>,
+    requester: ClientRecipient,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Disconnect {
+    conn: ConnId,
+}
+
+/// Owns all core tables and `Rc`-based views on one Actix thread.
+pub struct TableEngineActor {
+    engine: TableEngine,
+    base_subscribers: HashMap<String, Vec<(ConnId, ClientRecipient)>>,
+    connections: HashMap<ConnId, ClientRecipient>,
+}
+
+impl Default for TableEngineActor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TableEngineActor {
+    pub fn new() -> Self {
         Self {
-            table,
-            row_ids: (1..=row_count).collect(),
-            next_row_id: row_count + 1,
+            engine: TableEngine::new(),
+            base_subscribers: HashMap::new(),
+            connections: HashMap::new(),
         }
     }
 
-    fn row_index_by_id(&self, row_id: u64) -> Option<usize> {
-        self.row_ids
-            .iter()
-            .position(|candidate| *candidate == row_id)
+    fn send(recipient: &ClientRecipient, message: ServerMessage) {
+        let _ = recipient.try_send(BroadcastMessage(message));
     }
 
-    fn insert_row(
+    fn send_error(recipient: &ClientRecipient, message: String) {
+        Self::send(recipient, ServerMessage::Error { message });
+    }
+
+    fn broadcast_base(&mut self, table_name: &str, message: ServerMessage) {
+        if let Some(subscribers) = self.base_subscribers.get_mut(table_name) {
+            subscribers.retain(|(_, recipient)| {
+                recipient
+                    .try_send(BroadcastMessage(message.clone()))
+                    .is_ok()
+            });
+        }
+    }
+
+    fn propagate_views(&mut self, table_name: &str) {
+        let collected = self.engine.tick_and_collect(table_name);
+        for (conn, snapshots) in collected {
+            let Some(recipient) = self.connections.get(&conn) else {
+                continue;
+            };
+            for snapshot in snapshots {
+                Self::send(recipient, snapshot_message(table_name, snapshot));
+            }
+        }
+    }
+
+    fn finish_mutation(
         &mut self,
-        row: HashMap<String, ColumnValue>,
-    ) -> Result<(usize, u64, JsonRow), String> {
-        let index = self.table.len();
-        let row_id = self.next_row_id;
-        self.next_row_id += 1;
-        self.table.append_row(row.clone())?;
-        self.row_ids.insert(index, row_id);
-        Ok((index, row_id, row_to_json(&row)))
+        table_name: &str,
+        requester: &ClientRecipient,
+        result: Result<ServerMessage, String>,
+    ) {
+        match result {
+            Ok(message) => {
+                self.broadcast_base(table_name, message);
+                self.propagate_views(table_name);
+            }
+            Err(message) => Self::send_error(requester, message),
+        }
     }
+}
 
-    fn update_cell(
-        &mut self,
-        row_id: u64,
-        column: &str,
-        value: ColumnValue,
-    ) -> Result<JsonValue, String> {
-        let row_index = self
-            .row_index_by_id(row_id)
-            .ok_or_else(|| format!("Row '{}' not found", row_id))?;
-        self.table.set_value(row_index, column, value.clone())?;
-        Ok(column_value_to_json(&value))
+impl Actor for TableEngineActor {
+    type Context = Context<Self>;
+}
+
+impl Handler<SubscribeBase> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: SubscribeBase, _ctx: &mut Self::Context) {
+        if !self.engine.has_table(&message.table_name) {
+            Self::send_error(
+                &message.requester,
+                format!("Table '{}' not found", message.table_name),
+            );
+            return;
+        }
+
+        for subscribers in self.base_subscribers.values_mut() {
+            subscribers.retain(|(conn, _)| *conn != message.conn);
+        }
+        self.connections
+            .insert(message.conn, message.requester.clone());
+        self.base_subscribers
+            .entry(message.table_name.clone())
+            .or_default()
+            .push((message.conn, message.requester.clone()));
+        Self::send(
+            &message.requester,
+            ServerMessage::Subscribed {
+                table_name: message.table_name,
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
     }
+}
 
-    fn delete_row(&mut self, row_id: u64) -> Result<(), String> {
-        let row_index = self
-            .row_index_by_id(row_id)
-            .ok_or_else(|| format!("Row '{}' not found", row_id))?;
-        self.table.delete_row(row_index)?;
-        self.row_ids.remove(row_index);
-        Ok(())
+impl Handler<Query> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: Query, _ctx: &mut Self::Context) {
+        match self.engine.query_table(&message.table_name) {
+            Ok(response) => Self::send(&message.requester, response),
+            Err(error) => Self::send_error(&message.requester, error),
+        }
+    }
+}
+
+impl Handler<Insert> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: Insert, _ctx: &mut Self::Context) {
+        let result = self.engine.insert_row(&message.table_name, message.row);
+        self.finish_mutation(&message.table_name, &message.requester, result);
+    }
+}
+
+impl Handler<Update> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: Update, _ctx: &mut Self::Context) {
+        let result = self.engine.update_cell(
+            &message.table_name,
+            message.row_id,
+            &message.column,
+            &message.value,
+        );
+        self.finish_mutation(&message.table_name, &message.requester, result);
+    }
+}
+
+impl Handler<Delete> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: Delete, _ctx: &mut Self::Context) {
+        let result = self.engine.delete_row(&message.table_name, message.row_id);
+        self.finish_mutation(&message.table_name, &message.requester, result);
+    }
+}
+
+impl Handler<SetPipeline> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: SetPipeline, _ctx: &mut Self::Context) {
+        self.connections
+            .insert(message.conn, message.requester.clone());
+        let results = self.engine.set_pipeline(
+            message.conn,
+            &message.table_name,
+            message.pipeline_generation,
+            &message.nodes,
+        );
+        for result in results {
+            let response = match result {
+                Ok(snapshot) => snapshot_message(&message.table_name, snapshot),
+                Err((node_id, error)) => ServerMessage::ViewError {
+                    table_name: message.table_name.clone(),
+                    pipeline_generation: message.pipeline_generation,
+                    node_id,
+                    message: error,
+                },
+            };
+            Self::send(&message.requester, response);
+        }
+    }
+}
+
+impl Handler<Disconnect> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: Disconnect, _ctx: &mut Self::Context) {
+        self.connections.remove(&message.conn);
+        for subscribers in self.base_subscribers.values_mut() {
+            subscribers.retain(|(conn, _)| *conn != message.conn);
+        }
+        self.engine.drop_connection(message.conn);
+    }
+}
+
+/// Cloneable application state shared by HTTP workers. The contained address
+/// routes every operation back to the one engine actor.
+pub struct AppState {
+    engine: Addr<TableEngineActor>,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            engine: TableEngineActor::new().start(),
+        }
     }
 }
 
@@ -102,222 +307,24 @@ impl Default for AppState {
     }
 }
 
-/// Shared state for all WebSocket connections
-pub struct AppState {
-    tables: Arc<Mutex<HashMap<String, TableState>>>,
-    subscribers: Arc<Mutex<HashMap<String, Vec<Addr<TableWebSocket>>>>>,
-}
-
-impl AppState {
-    pub fn new() -> Self {
-        let mut tables = HashMap::new();
-
-        // Create a demo sales table used by the frontend editor and cascade demo.
-        let schema = Schema::new(vec![
-            ("region".to_string(), ColumnType::String, false),
-            ("product".to_string(), ColumnType::String, false),
-            ("amount".to_string(), ColumnType::Float64, false),
-        ]);
-
-        let mut demo_table = Table::new("demo".to_string(), schema);
-
-        // Add some initial data
-        let mut row1 = HashMap::new();
-        row1.insert(
-            "region".to_string(),
-            ColumnValue::String("West".to_string()),
-        );
-        row1.insert(
-            "product".to_string(),
-            ColumnValue::String("Widget".to_string()),
-        );
-        row1.insert("amount".to_string(), ColumnValue::Float64(100.5));
-        demo_table.append_row(row1).unwrap();
-
-        let mut row2 = HashMap::new();
-        row2.insert(
-            "region".to_string(),
-            ColumnValue::String("East".to_string()),
-        );
-        row2.insert(
-            "product".to_string(),
-            ColumnValue::String("Gadget".to_string()),
-        );
-        row2.insert("amount".to_string(), ColumnValue::Float64(200.75));
-        demo_table.append_row(row2).unwrap();
-        demo_table.clear_changeset();
-
-        tables.insert("demo".to_string(), TableState::with_seed_data(demo_table));
-
-        Self {
-            tables: Arc::new(Mutex::new(tables)),
-            subscribers: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// Subscribe a WebSocket connection to a table
-    pub fn subscribe(&self, table_name: &str, addr: Addr<TableWebSocket>) {
-        let mut subscribers = lock_unpoisoned(&self.subscribers);
-        let subs = subscribers.entry(table_name.to_string()).or_default();
-        // Prevent duplicate subscriptions from the same actor
-        if !subs.contains(&addr) {
-            subs.push(addr);
-        }
-        println!(
-            "[subscribe] {} now has {} subscriber(s)",
-            table_name,
-            subs.len()
-        );
-    }
-
-    /// Broadcast a message to all subscribers of a table
-    pub fn broadcast(&self, table_name: &str, msg: ServerMessage) {
-        let mut subscribers = lock_unpoisoned(&self.subscribers);
-        if let Some(addrs) = subscribers.get_mut(table_name) {
-            println!("[broadcast] {} -> {} subscribers", table_name, addrs.len());
-            // Prune dead/full addresses: retain only subscribers that accepted the message
-            addrs.retain(|addr| addr.try_send(BroadcastMessage(msg.clone())).is_ok());
-        } else {
-            println!("[broadcast] {} -> no subscribers!", table_name);
-        }
-    }
-
-    /// Unsubscribe a WebSocket connection from a table
-    pub fn unsubscribe(&self, table_name: &str, addr: &Addr<TableWebSocket>) {
-        let mut subscribers = lock_unpoisoned(&self.subscribers);
-        if let Some(subs) = subscribers.get_mut(table_name) {
-            subs.retain(|a| a != addr);
-            println!(
-                "[unsubscribe] {} now has {} subscriber(s)",
-                table_name,
-                subs.len()
-            );
-        }
-    }
-
-    fn send_error(ctx: &mut ws::WebsocketContext<TableWebSocket>, message: String) {
-        ctx.text(serialize_ws_message(&ServerMessage::Error { message }));
-    }
-
-    pub fn query_table(&self, table_name: &str) -> Result<ServerMessage, String> {
-        let tables = lock_unpoisoned(&self.tables);
-        let table_state = tables
-            .get(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
-        let (columns, rows) = table_to_json(table_state)?;
-        // Captured under the same lock as the snapshot above, so any later
-        // mutation gets a strictly greater seq and any earlier one is already
-        // reflected here.
-        let seq = table_state.table.changeset().total_len() as u64;
-        Ok(ServerMessage::TableData {
-            table_name: table_name.to_string(),
-            seq,
-            columns,
-            rows,
-        })
-    }
-
-    pub fn insert_row(
-        &self,
-        table_name: &str,
-        row: HashMap<String, JsonValue>,
-    ) -> Result<ServerMessage, String> {
-        let mut tables = lock_unpoisoned(&self.tables);
-        let table_state = tables
-            .get_mut(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
-        let converted_row = convert_row_for_schema(table_state.table.schema(), &row)?;
-        let (index, row_id, json_row) = table_state.insert_row(converted_row)?;
-        let seq = table_state.table.changeset().total_len() as u64;
-        table_state.table.clear_changeset();
-
-        Ok(ServerMessage::RowInserted {
-            table_name: table_name.to_string(),
-            seq,
-            index,
-            row_id,
-            row: json_row,
-        })
-    }
-
-    pub fn update_cell(
-        &self,
-        table_name: &str,
-        row_id: u64,
-        column: &str,
-        value: &JsonValue,
-    ) -> Result<ServerMessage, String> {
-        let mut tables = lock_unpoisoned(&self.tables);
-        let table_state = tables
-            .get_mut(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
-        let col_type = table_state
-            .table
-            .schema()
-            .get_column_type(column)
-            .ok_or_else(|| format!("Column '{}' not found", column))?;
-        let nullable = table_state
-            .table
-            .schema()
-            .is_column_nullable(column)
-            .unwrap_or(false);
-        let col_value = json_to_column_value_typed(value, col_type, nullable)
-            .map_err(|e| format!("Column '{}': {}", column, e))?;
-        let json_value = table_state.update_cell(row_id, column, col_value)?;
-        let seq = table_state.table.changeset().total_len() as u64;
-        table_state.table.clear_changeset();
-
-        Ok(ServerMessage::CellUpdated {
-            table_name: table_name.to_string(),
-            seq,
-            row_id,
-            column: column.to_string(),
-            value: json_value,
-        })
-    }
-
-    pub fn delete_row(&self, table_name: &str, row_id: u64) -> Result<ServerMessage, String> {
-        let mut tables = lock_unpoisoned(&self.tables);
-        let table_state = tables
-            .get_mut(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
-        table_state.delete_row(row_id)?;
-        let seq = table_state.table.changeset().total_len() as u64;
-        table_state.table.clear_changeset();
-
-        Ok(ServerMessage::RowDeleted {
-            table_name: table_name.to_string(),
-            seq,
-            row_id,
-        })
-    }
-}
-
-/// Message to broadcast to clients
-#[derive(Message)]
-#[rtype(result = "()")]
-struct BroadcastMessage(ServerMessage);
-
-/// WebSocket connection actor
 pub struct TableWebSocket {
     hb: Instant,
+    conn_id: ConnId,
     state: actix_web::web::Data<AppState>,
-    subscribed_table: Option<String>,
 }
 
 impl TableWebSocket {
     pub fn new(state: actix_web::web::Data<AppState>) -> Self {
         Self {
             hb: Instant::now(),
+            conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
             state,
-            subscribed_table: None,
         }
     }
 
-    fn hb(&self, ctx: &mut ws::WebsocketContext<Self>) {
-        ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
-            if Instant::now().duration_since(act.hb) > CLIENT_TIMEOUT {
-                println!("WebSocket Client heartbeat failed, disconnecting!");
+    fn heartbeat(&self, ctx: &mut ws::WebsocketContext<Self>) {
+        ctx.run_interval(HEARTBEAT_INTERVAL, |actor, ctx| {
+            if Instant::now().duration_since(actor.hb) > CLIENT_TIMEOUT {
                 ctx.stop();
                 return;
             }
@@ -325,68 +332,66 @@ impl TableWebSocket {
         });
     }
 
-    fn handle_client_message(&mut self, msg: ClientMessage, ctx: &mut ws::WebsocketContext<Self>) {
-        match msg {
+    fn handle_client_message(
+        &mut self,
+        message: ClientMessage,
+        ctx: &mut ws::WebsocketContext<Self>,
+    ) {
+        let requester = ctx.address().recipient();
+        match message {
             ClientMessage::Subscribe { table_name } => {
-                // Only allow subscriptions to existing tables
-                let table_exists = lock_unpoisoned(&self.state.tables).contains_key(&table_name);
-                if !table_exists {
-                    ctx.text(serialize_ws_message(&ServerMessage::Error {
-                        message: format!("Table '{}' not found", table_name),
-                    }));
-                    return;
-                }
-
-                // If re-subscribing to a different table, remove the old subscription first.
-                if let Some(prev_table) = self.subscribed_table.as_ref() {
-                    if prev_table != &table_name {
-                        self.state.unsubscribe(prev_table, &ctx.address());
-                    }
-                }
-
-                self.subscribed_table = Some(table_name.clone());
-                self.state.subscribe(&table_name, ctx.address());
-
-                let response = ServerMessage::Subscribed {
-                    table_name: table_name.clone(),
-                    protocol_version: crate::messages::PROTOCOL_VERSION,
-                };
-                ctx.text(serialize_ws_message(&response));
+                self.state.engine.do_send(SubscribeBase {
+                    table_name,
+                    conn: self.conn_id,
+                    requester,
+                });
             }
-
-            ClientMessage::Query { table_name } => match self.state.query_table(&table_name) {
-                Ok(response) => ctx.text(serialize_ws_message(&response)),
-                Err(err) => AppState::send_error(ctx, err),
-            },
-
+            ClientMessage::Query { table_name } => {
+                self.state.engine.do_send(Query {
+                    table_name,
+                    requester,
+                });
+            }
             ClientMessage::InsertRow { table_name, row } => {
-                match self.state.insert_row(&table_name, row) {
-                    Ok(response) => self.state.broadcast(&table_name, response),
-                    Err(err) => AppState::send_error(ctx, err),
-                }
+                self.state.engine.do_send(Insert {
+                    table_name,
+                    row,
+                    requester,
+                });
             }
-
             ClientMessage::UpdateCell {
                 table_name,
                 row_id,
                 column,
                 value,
-            } => match self.state.update_cell(&table_name, row_id, &column, &value) {
-                Ok(response) => self.state.broadcast(&table_name, response),
-                Err(err) => AppState::send_error(ctx, err),
-            },
-
-            ClientMessage::DeleteRow { table_name, row_id } => {
-                match self.state.delete_row(&table_name, row_id) {
-                    Ok(response) => self.state.broadcast(&table_name, response),
-                    Err(err) => AppState::send_error(ctx, err),
-                }
+            } => {
+                self.state.engine.do_send(Update {
+                    table_name,
+                    row_id,
+                    column,
+                    value,
+                    requester,
+                });
             }
-
-            // Server-side view pipelines are wired up in a later task; until
-            // then, acknowledge the message without building a pipeline.
-            ClientMessage::SetPipeline { .. } => {
-                AppState::send_error(ctx, "SetPipeline not yet supported".to_string());
+            ClientMessage::DeleteRow { table_name, row_id } => {
+                self.state.engine.do_send(Delete {
+                    table_name,
+                    row_id,
+                    requester,
+                });
+            }
+            ClientMessage::SetPipeline {
+                table_name,
+                pipeline_generation,
+                nodes,
+            } => {
+                self.state.engine.do_send(SetPipeline {
+                    conn: self.conn_id,
+                    table_name,
+                    pipeline_generation,
+                    nodes,
+                    requester,
+                });
             }
         }
     }
@@ -396,46 +401,36 @@ impl Actor for TableWebSocket {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        self.hb(ctx);
+        self.heartbeat(ctx);
     }
 
-    fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
-        // Clean up subscription when connection closes
-        if let Some(ref table_name) = self.subscribed_table {
-            self.state.unsubscribe(table_name, &ctx.address());
-        }
+    fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
+        self.state.engine.do_send(Disconnect { conn: self.conn_id });
         Running::Stop
     }
 }
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for TableWebSocket {
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        match msg {
-            Ok(ws::Message::Ping(msg)) => {
+    fn handle(&mut self, message: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
+        match message {
+            Ok(ws::Message::Ping(message)) => {
                 self.hb = Instant::now();
-                ctx.pong(&msg);
+                ctx.pong(&message);
             }
-            Ok(ws::Message::Pong(_)) => {
-                self.hb = Instant::now();
-            }
+            Ok(ws::Message::Pong(_)) => self.hb = Instant::now(),
             Ok(ws::Message::Text(text)) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(client_msg) => {
-                    self.handle_client_message(client_msg, ctx);
-                }
-                Err(e) => {
-                    ctx.text(serialize_ws_message(&ServerMessage::Error {
-                        message: format!("Invalid message format: {}", e),
-                    }));
-                }
+                Ok(message) => self.handle_client_message(message, ctx),
+                Err(error) => ctx.text(serialize_ws_message(&ServerMessage::Error {
+                    message: format!("Invalid message format: {error}"),
+                })),
             },
-            Ok(ws::Message::Binary(_)) => {
-                println!("Unexpected binary message");
-            }
             Ok(ws::Message::Close(reason)) => {
                 ctx.close(reason);
                 ctx.stop();
             }
-            _ => ctx.stop(),
+            Ok(ws::Message::Binary(_)) | Ok(ws::Message::Continuation(_)) => {}
+            Ok(ws::Message::Nop) => {}
+            Err(_) => ctx.stop(),
         }
     }
 }
@@ -443,607 +438,171 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for TableWebSocket {
 impl Handler<BroadcastMessage> for TableWebSocket {
     type Result = ();
 
-    fn handle(&mut self, msg: BroadcastMessage, ctx: &mut Self::Context) {
-        ctx.text(serialize_ws_message(&msg.0));
+    fn handle(&mut self, message: BroadcastMessage, ctx: &mut Self::Context) {
+        ctx.text(serialize_ws_message(&message.0));
     }
-}
-
-/// Convert days since Unix epoch to (year, month, day)
-fn ymd_from_days(days: i32) -> (i32, u32, u32) {
-    // Shift to March 1, year 0 epoch (simplifies leap year calculation)
-    let z = days + 719468;
-    let era = if z >= 0 {
-        z / 146097
-    } else {
-        (z - 146096) / 146097
-    };
-    let doe = (z - era * 146097) as u32; // day of era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
-    let y = (yoe as i32) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153; // month in [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d)
-}
-
-/// Format a date (days since epoch) as ISO 8601 date string (YYYY-MM-DD)
-fn format_date_from_days(days: i32) -> String {
-    let (year, month, day) = ymd_from_days(days);
-    format!("{:04}-{:02}-{:02}", year, month, day)
-}
-
-/// Format a datetime (milliseconds since epoch) as ISO 8601 datetime string
-fn format_datetime_from_millis(ms: i64) -> String {
-    let ms_per_day: i64 = 86_400_000;
-    let days = ms.div_euclid(ms_per_day) as i32;
-    let time_ms = ms.rem_euclid(ms_per_day) as u32;
-    let (year, month, day) = ymd_from_days(days);
-    let hours = time_ms / 3_600_000;
-    let minutes = (time_ms % 3_600_000) / 60_000;
-    let seconds = (time_ms % 60_000) / 1000;
-    let millis = time_ms % 1000;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year, month, day, hours, minutes, seconds, millis
-    )
-}
-
-/// Convert ColumnValue to JSON Value
-fn column_value_to_json(cv: &ColumnValue) -> JsonValue {
-    match cv {
-        ColumnValue::Int32(v) => JsonValue::Number((*v).into()),
-        ColumnValue::Int64(v) => JsonValue::Number((*v).into()),
-        ColumnValue::Float32(v) => serde_json::Number::from_f64(*v as f64)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
-        ColumnValue::Float64(v) => serde_json::Number::from_f64(*v)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
-        ColumnValue::String(v) => JsonValue::String(v.clone()),
-        ColumnValue::Bool(v) => JsonValue::Bool(*v),
-        ColumnValue::Date(days) => {
-            // Convert days since Unix epoch to ISO 8601 date string (YYYY-MM-DD)
-            JsonValue::String(format_date_from_days(*days))
-        }
-        ColumnValue::DateTime(millis) => {
-            // Convert milliseconds since Unix epoch to ISO 8601 datetime string
-            JsonValue::String(format_datetime_from_millis(*millis))
-        }
-        ColumnValue::Null => JsonValue::Null,
-    }
-}
-
-fn table_to_json(table_state: &TableState) -> Result<(Vec<String>, Vec<WireTableRow>), String> {
-    let columns: Vec<String> = table_state
-        .table
-        .schema()
-        .get_column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    let mut rows = Vec::with_capacity(table_state.table.len());
-    for (row_idx, row_id) in table_state.row_ids.iter().enumerate() {
-        rows.push(WireTableRow {
-            row_id: *row_id,
-            row: row_to_json(&table_state.table.get_row(row_idx)?),
-        });
-    }
-
-    Ok((columns, rows))
-}
-
-/// Convert row to JSON
-fn row_to_json(row: &HashMap<String, ColumnValue>) -> JsonRow {
-    row.iter()
-        .map(|(k, v)| (k.clone(), column_value_to_json(v)))
-        .collect()
-}
-
-/// Convert JSON Value to ColumnValue
-fn json_to_column_value_typed(
-    value: &JsonValue,
-    col_type: ColumnType,
-    nullable: bool,
-) -> Result<ColumnValue, String> {
-    if matches!(value, JsonValue::Null) {
-        if nullable {
-            return Ok(ColumnValue::Null);
-        }
-        return Err("NULL value for non-nullable column".to_string());
-    }
-
-    match col_type {
-        ColumnType::Int32 => match value {
-            JsonValue::Number(n) => n
-                .as_i64()
-                .and_then(|v| i32::try_from(v).ok())
-                .map(ColumnValue::Int32)
-                .ok_or_else(|| "Expected INT32 number".to_string()),
-            _ => Err("Expected INT32 number".to_string()),
-        },
-        ColumnType::Int64 => match value {
-            JsonValue::Number(n) => n
-                .as_i64()
-                .map(ColumnValue::Int64)
-                .ok_or_else(|| "Expected INT64 number".to_string()),
-            _ => Err("Expected INT64 number".to_string()),
-        },
-        ColumnType::Float32 => match value {
-            JsonValue::Number(n) => n
-                .as_f64()
-                .map(|v| ColumnValue::Float32(v as f32))
-                .ok_or_else(|| "Expected FLOAT32 number".to_string()),
-            _ => Err("Expected FLOAT32 number".to_string()),
-        },
-        ColumnType::Float64 => match value {
-            JsonValue::Number(n) => n
-                .as_f64()
-                .map(ColumnValue::Float64)
-                .ok_or_else(|| "Expected FLOAT64 number".to_string()),
-            _ => Err("Expected FLOAT64 number".to_string()),
-        },
-        ColumnType::String => match value {
-            JsonValue::String(s) => Ok(ColumnValue::String(s.clone())),
-            _ => Err("Expected STRING value".to_string()),
-        },
-        ColumnType::Bool => match value {
-            JsonValue::Bool(b) => Ok(ColumnValue::Bool(*b)),
-            _ => Err("Expected BOOL value".to_string()),
-        },
-        ColumnType::Date => match value {
-            JsonValue::Number(n) => n
-                .as_i64()
-                .and_then(|v| i32::try_from(v).ok())
-                .map(ColumnValue::Date)
-                .ok_or_else(|| "Expected DATE as days-since-epoch integer".to_string()),
-            JsonValue::String(s) => parse_date(s)
-                .map(ColumnValue::Date)
-                .ok_or_else(|| "Expected DATE string in YYYY-MM-DD format".to_string()),
-            _ => Err("Expected DATE value".to_string()),
-        },
-        ColumnType::DateTime => match value {
-            JsonValue::Number(n) => n
-                .as_i64()
-                .map(ColumnValue::DateTime)
-                .ok_or_else(|| "Expected DATETIME as millis-since-epoch integer".to_string()),
-            JsonValue::String(s) => parse_datetime(s)
-                .map(ColumnValue::DateTime)
-                .ok_or_else(|| "Expected DATETIME string in ISO format".to_string()),
-            _ => Err("Expected DATETIME value".to_string()),
-        },
-    }
-}
-
-/// Validate a JSON row against schema and convert it to typed column values.
-fn convert_row_for_schema(
-    schema: &Schema,
-    row: &HashMap<String, JsonValue>,
-) -> Result<HashMap<String, ColumnValue>, String> {
-    for key in row.keys() {
-        if schema.get_column_index(key).is_none() {
-            return Err(format!("Unknown column '{}'", key));
-        }
-    }
-
-    let mut converted = HashMap::new();
-    for i in 0..schema.len() {
-        if let Some((col_name, col_type, nullable)) = schema.get_column_info(i) {
-            let value = row
-                .get(col_name)
-                .ok_or_else(|| format!("Missing value for column '{}'", col_name))?;
-            let converted_value = json_to_column_value_typed(value, col_type, nullable)
-                .map_err(|e| format!("Column '{}': {}", col_name, e))?;
-            converted.insert(col_name.to_string(), converted_value);
-        }
-    }
-
-    Ok(converted)
-}
-
-/// Parse an ISO 8601 date string (YYYY-MM-DD) to days since epoch.
-fn parse_date(s: &str) -> Option<i32> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let year: i32 = parts[0].parse().ok()?;
-    let month: u32 = parts[1].parse().ok()?;
-    let day: u32 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    Some(days_from_ymd(year, month, day))
-}
-
-/// Parse an ISO 8601 datetime string to milliseconds since epoch.
-fn parse_datetime(s: &str) -> Option<i64> {
-    let (date_part, time_part) = if s.contains('T') {
-        let parts: Vec<&str> = s.splitn(2, 'T').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        (parts[0], parts[1])
-    } else if s.contains(' ') {
-        let parts: Vec<&str> = s.splitn(2, ' ').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        (parts[0], parts[1])
-    } else {
-        return parse_date(s).map(|d| (d as i64) * 86_400_000);
-    };
-
-    let days = parse_date(date_part)?;
-    let time_part = time_part.trim_end_matches('Z');
-    let (time_str, ms) = if time_part.contains('.') {
-        let parts: Vec<&str> = time_part.splitn(2, '.').collect();
-        let ms_str = parts.get(1)?;
-        let ms: u32 = if ms_str.len() >= 3 {
-            ms_str[..3].parse().ok()?
-        } else {
-            format!("{:0<3}", ms_str).parse().ok()?
-        };
-        (parts[0], ms)
-    } else {
-        (time_part, 0)
-    };
-
-    let time_parts: Vec<&str> = time_str.split(':').collect();
-    if time_parts.len() < 2 {
-        return None;
-    }
-    let hour: u32 = time_parts[0].parse().ok()?;
-    let minute: u32 = time_parts[1].parse().ok()?;
-    let second: u32 = time_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-
-    let time_ms =
-        (hour as i64) * 3_600_000 + (minute as i64) * 60_000 + (second as i64) * 1000 + (ms as i64);
-
-    Some((days as i64) * 86_400_000 + time_ms)
-}
-
-/// Convert (year, month, day) to days since Unix epoch.
-fn days_from_ymd(year: i32, month: u32, day: u32) -> i32 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
-    let yoe = (y - era * 400) as u32;
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146097 + doe as i32) - 719468
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::{AggSpec, ViewKindSpec};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn test_convert_row_for_schema_success() {
-        let schema = Schema::new(vec![
-            ("id".to_string(), ColumnType::Int32, false),
-            ("name".to_string(), ColumnType::String, false),
-            ("value".to_string(), ColumnType::Float64, false),
-        ]);
-
-        let mut row = HashMap::new();
-        row.insert("id".to_string(), json!(1));
-        row.insert("name".to_string(), json!("Alice"));
-        row.insert("value".to_string(), json!(42.5));
-
-        let converted = convert_row_for_schema(&schema, &row).expect("row should convert");
-        assert_eq!(converted.get("id"), Some(&ColumnValue::Int32(1)));
-        assert_eq!(
-            converted.get("name"),
-            Some(&ColumnValue::String("Alice".to_string()))
-        );
-        assert_eq!(converted.get("value"), Some(&ColumnValue::Float64(42.5)));
+    struct Probe {
+        messages: Arc<Mutex<Vec<ServerMessage>>>,
     }
 
-    #[test]
-    fn test_convert_row_for_schema_rejects_unknown_column() {
-        let schema = Schema::new(vec![("id".to_string(), ColumnType::Int32, false)]);
-
-        let mut row = HashMap::new();
-        row.insert("id".to_string(), json!(1));
-        row.insert("extra".to_string(), json!(123));
-
-        let err = convert_row_for_schema(&schema, &row).unwrap_err();
-        assert!(err.contains("Unknown column 'extra'"));
+    impl Actor for Probe {
+        type Context = Context<Self>;
     }
 
-    #[test]
-    fn test_convert_row_for_schema_rejects_missing_column() {
-        let schema = Schema::new(vec![
-            ("id".to_string(), ColumnType::Int32, false),
-            ("name".to_string(), ColumnType::String, false),
-        ]);
+    impl Handler<BroadcastMessage> for Probe {
+        type Result = ();
 
-        let mut row = HashMap::new();
-        row.insert("id".to_string(), json!(1));
-
-        let err = convert_row_for_schema(&schema, &row).unwrap_err();
-        assert!(err.contains("Missing value for column 'name'"));
+        fn handle(&mut self, message: BroadcastMessage, _ctx: &mut Self::Context) {
+            self.messages.lock().unwrap().push(message.0);
+        }
     }
 
-    #[test]
-    fn test_json_to_column_value_typed_respects_nullability() {
-        let err =
-            json_to_column_value_typed(&JsonValue::Null, ColumnType::Int32, false).unwrap_err();
-        assert!(err.contains("NULL value for non-nullable column"));
+    #[actix::test]
+    async fn actor_builds_pipeline_and_streams_updates() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let requester = Probe {
+            messages: received.clone(),
+        }
+        .start()
+        .recipient();
+        let engine = TableEngineActor::new().start();
 
-        let v = json_to_column_value_typed(&JsonValue::Null, ColumnType::Int32, true).unwrap();
-        assert_eq!(v, ColumnValue::Null);
-    }
-
-    #[test]
-    fn test_app_state_initial_demo_table_clears_seed_changes() {
-        let state = AppState::new();
-        let tables = state.tables.lock().unwrap();
-        let demo = tables.get("demo").expect("demo table should exist");
-
-        assert_eq!(demo.table.len(), 2);
-        assert_eq!(demo.table.changeset().len(), 0);
-        assert_eq!(demo.row_ids, vec![1, 2]);
-        assert_eq!(demo.next_row_id, 3);
-    }
-
-    #[test]
-    fn test_app_state_mutations_use_stable_row_ids() {
-        let state = AppState::new();
-
-        let insert_response = state
-            .insert_row(
-                "demo",
-                HashMap::from([
-                    ("region".to_string(), json!("North")),
-                    ("product".to_string(), json!("Premium")),
-                    ("amount".to_string(), json!(300.25)),
+        engine
+            .send(SetPipeline {
+                conn: 42,
+                table_name: "demo".into(),
+                pipeline_generation: 9,
+                nodes: vec![
+                    ViewNodeSpec {
+                        id: "filtered".into(),
+                        source_id: "base".into(),
+                        kind: ViewKindSpec::Filter {
+                            predicate: "amount >= 150".into(),
+                        },
+                    },
+                    ViewNodeSpec {
+                        id: "totals".into(),
+                        source_id: "filtered".into(),
+                        kind: ViewKindSpec::Group {
+                            group_by: vec!["region".into()],
+                            aggs: vec![AggSpec {
+                                alias: "total".into(),
+                                op: "sum".into(),
+                                column: "amount".into(),
+                            }],
+                        },
+                    },
+                ],
+                requester: requester.clone(),
+            })
+            .await
+            .unwrap();
+        engine
+            .send(Insert {
+                table_name: "demo".into(),
+                row: HashMap::from([
+                    ("region".into(), json!("West")),
+                    ("product".into(), json!("Premium")),
+                    ("amount".into(), json!(300.0)),
                 ]),
-            )
-            .expect("insert should succeed");
-        let (insert_seq, inserted_row_id) = match insert_response {
-            ServerMessage::RowInserted {
-                seq, index, row_id, ..
-            } => {
-                assert_eq!(index, 2);
-                (seq, row_id)
-            }
-            _ => panic!("expected row inserted response"),
-        };
-        assert_eq!(insert_seq, 3);
-        assert_eq!(inserted_row_id, 3);
-
-        let update_response = state
-            .update_cell("demo", 2, "amount", &json!(250.5))
-            .expect("update should succeed");
-        let update_seq = match update_response {
-            ServerMessage::CellUpdated { seq, row_id: 2, .. } => seq,
-            _ => panic!("expected row updated response"),
-        };
-        assert_eq!(update_seq, 4);
-
-        let delete_response = state.delete_row("demo", 1).expect("delete should succeed");
-        let delete_seq = match delete_response {
-            ServerMessage::RowDeleted { seq, row_id: 1, .. } => seq,
-            _ => panic!("expected row deleted response"),
-        };
-        assert_eq!(delete_seq, 5);
-
-        let tables = state.tables.lock().unwrap();
-        let demo = tables.get("demo").expect("demo table should exist");
-        assert_eq!(demo.table.len(), 2);
-        assert_eq!(demo.table.changeset().len(), 0);
-        assert_eq!(demo.table.changeset().total_len(), delete_seq as usize);
-        assert_eq!(demo.row_ids, vec![2, 3]);
-        assert_eq!(
-            demo.table.get_value(0, "region").unwrap(),
-            ColumnValue::String("East".to_string())
-        );
-        assert_eq!(
-            demo.table.get_value(0, "amount").unwrap(),
-            ColumnValue::Float64(250.5)
-        );
-        assert_eq!(
-            demo.table.get_value(1, "product").unwrap(),
-            ColumnValue::String("Premium".to_string())
-        );
-    }
-
-    #[test]
-    fn test_query_table_returns_json_from_core_table() {
-        let state = AppState::new();
-        state
-            .insert_row(
-                "demo",
-                HashMap::from([
-                    ("region".to_string(), json!("North")),
-                    ("product".to_string(), json!("Premium")),
-                    ("amount".to_string(), json!(300.25)),
-                ]),
-            )
+                requester,
+            })
+            .await
             .unwrap();
 
-        let response = state.query_table("demo").expect("query should succeed");
-        let ServerMessage::TableData { columns, rows, .. } = response else {
-            panic!("expected table data response");
+        actix::clock::sleep(Duration::from_millis(10)).await;
+        let messages = received.lock().unwrap();
+        let totals: Vec<_> = messages
+            .iter()
+            .filter(|message| {
+                matches!(message, ServerMessage::ViewData { node_id, .. } if node_id == "totals")
+            })
+            .collect();
+        assert_eq!(totals.len(), 2, "initial snapshot plus mutation snapshot");
+        let ServerMessage::ViewData {
+            pipeline_generation,
+            rows,
+            ..
+        } = totals[1]
+        else {
+            unreachable!()
         };
-
-        assert_eq!(columns, vec!["region", "product", "amount"]);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2].row_id, 3);
-        assert_eq!(rows[2].row.get("product"), Some(&json!("Premium")));
-        assert_eq!(rows[2].row.get("amount"), Some(&json!(300.25)));
+        assert_eq!(*pipeline_generation, 9);
+        assert!(rows
+            .iter()
+            .any(|row| { row.row["region"] == json!("West") && row.row["total"] == json!(300.0) }));
     }
 
-    #[test]
-    fn test_app_state_rejects_unknown_row_id() {
-        let state = AppState::new();
-
-        let update_err = state
-            .update_cell("demo", 999, "amount", &json!(250.5))
-            .unwrap_err();
-        assert!(update_err.contains("Row '999' not found"));
-
-        let delete_err = state.delete_row("demo", 999).unwrap_err();
-        assert!(delete_err.contains("Row '999' not found"));
-    }
-
-    #[test]
-    fn test_app_state_survives_poisoned_tables_mutex() {
-        // A panic in one handler must not take down the entire server by
-        // poisoning the Mutex — subsequent requests must continue to work.
-        let state = AppState::new();
-        let tables = state.tables.clone();
-
-        let _ = std::thread::spawn(move || {
-            let _guard = tables.lock().unwrap();
-            panic!("simulate handler panic while holding lock");
-        })
-        .join();
-
-        assert!(
-            state.tables.is_poisoned(),
-            "sanity: the mutex should be poisoned after the panicking thread"
-        );
-
-        let result = state.query_table("demo");
-        assert!(
-            result.is_ok(),
-            "query_table must succeed on poisoned mutex, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_app_state_survives_poisoned_subscribers_mutex() {
-        let state = AppState::new();
-        let subs = state.subscribers.clone();
-
-        let _ = std::thread::spawn(move || {
-            let _guard = subs.lock().unwrap();
-            panic!("simulate handler panic while holding subscribers lock");
-        })
-        .join();
-
-        assert!(state.subscribers.is_poisoned());
-
-        // broadcast must not panic on poisoned subscribers mutex
-        state.broadcast(
-            "demo",
-            ServerMessage::Error {
-                message: "test".to_string(),
-            },
-        );
-    }
-
-    #[test]
-    fn test_inserted_row_id_also_appears_in_subsequent_snapshot() {
-        // Precondition for the snapshot/delta consistency hazard.
-        //
-        // `insert_row` returns the `RowInserted` that is broadcast to every
-        // subscriber. If a client subscribes, then this insert commits, then the
-        // client's `Query` snapshot is taken, the SAME row_id is present in BOTH
-        // the broadcast `RowInserted` AND the `TableData` snapshot.
-        //
-        // The wire protocol carries `seq` to reconcile this overlap. This test
-        // documents that the dual-channel overlap is real at the server
-        // boundary, so clients must use `seq` rather than row_id guesses or
-        // delivery order to merge snapshot and delta streams.
-        let state = AppState::new();
-
-        let broadcast = state
-            .insert_row(
-                "demo",
-                HashMap::from([
-                    ("region".to_string(), json!("North")),
-                    ("product".to_string(), json!("Premium")),
-                    ("amount".to_string(), json!(300.25)),
-                ]),
-            )
-            .expect("insert should succeed");
-
-        let broadcast_row_id = match broadcast {
-            ServerMessage::RowInserted { row_id, .. } => row_id,
-            other => panic!("expected RowInserted, got {:?}", other),
-        };
-
-        let snapshot = state.query_table("demo").expect("query should succeed");
-        let ServerMessage::TableData { rows, .. } = snapshot else {
-            panic!("expected TableData");
-        };
-
-        let occurrences = rows.iter().filter(|r| r.row_id == broadcast_row_id).count();
-
-        // The broadcast row_id appears in the snapshot. In the live system the
-        // client ALSO receives the broadcast `RowInserted` for this same row_id:
-        // two channels carry the same row, reconciled by `seq`.
-        assert_eq!(
-            occurrences, 1,
-            "row {} from the RowInserted broadcast is also present in the snapshot",
-            broadcast_row_id
-        );
-    }
-
-    #[test]
-    fn test_app_state_clears_retained_changes_but_preserves_seq() {
-        let state = AppState::new();
-
-        let insert = state
-            .insert_row(
-                "demo",
-                HashMap::from([
-                    ("region".to_string(), json!("North")),
-                    ("product".to_string(), json!("Premium")),
-                    ("amount".to_string(), json!(300.25)),
-                ]),
-            )
-            .expect("insert should succeed");
-
-        let (insert_seq, row_id) = match insert {
-            ServerMessage::RowInserted { seq, row_id, .. } => (seq, row_id),
-            other => panic!("expected RowInserted, got {:?}", other),
-        };
-
-        {
-            let tables = lock_unpoisoned(&state.tables);
-            let demo = tables.get("demo").expect("demo table should exist");
-            assert_eq!(demo.table.changeset().len(), 0);
-            assert_eq!(demo.table.changeset().total_len(), insert_seq as usize);
+    #[actix::test]
+    async fn actor_preserves_base_protocol_and_reports_pipeline_errors() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let requester = Probe {
+            messages: received.clone(),
         }
+        .start()
+        .recipient();
+        let engine = TableEngineActor::new().start();
 
-        let update = state
-            .update_cell("demo", row_id, "amount", &json!(450.0))
-            .expect("update should succeed");
-        let update_seq = match update {
-            ServerMessage::CellUpdated { seq, .. } => seq,
-            other => panic!("expected CellUpdated, got {:?}", other),
-        };
+        engine
+            .send(SubscribeBase {
+                table_name: "demo".into(),
+                conn: 5,
+                requester: requester.clone(),
+            })
+            .await
+            .unwrap();
+        engine
+            .send(Query {
+                table_name: "demo".into(),
+                requester: requester.clone(),
+            })
+            .await
+            .unwrap();
+        engine
+            .send(SetPipeline {
+                conn: 5,
+                table_name: "demo".into(),
+                pipeline_generation: 2,
+                nodes: vec![ViewNodeSpec {
+                    id: "bad".into(),
+                    source_id: "base".into(),
+                    kind: ViewKindSpec::Filter {
+                        predicate: "amount >>> 2".into(),
+                    },
+                }],
+                requester,
+            })
+            .await
+            .unwrap();
 
-        assert_eq!(update_seq, insert_seq + 1);
-        let snapshot = state.query_table("demo").expect("query should succeed");
-        let ServerMessage::TableData { seq, .. } = snapshot else {
-            panic!("expected TableData");
-        };
-        assert_eq!(seq, update_seq);
-
-        let delete = state
-            .delete_row("demo", row_id)
-            .expect("delete should succeed");
-        let delete_seq = match delete {
-            ServerMessage::RowDeleted { seq, .. } => seq,
-            other => panic!("expected RowDeleted, got {:?}", other),
-        };
-
-        assert_eq!(delete_seq, update_seq + 1);
-        let tables = lock_unpoisoned(&state.tables);
-        let demo = tables.get("demo").expect("demo table should exist");
-        assert_eq!(demo.table.changeset().len(), 0);
-        assert_eq!(demo.table.changeset().total_len(), delete_seq as usize);
+        actix::clock::sleep(Duration::from_millis(10)).await;
+        let messages = received.lock().unwrap();
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::Subscribed {
+                protocol_version: 2,
+                ..
+            }
+        )));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, ServerMessage::TableData { .. })));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::ViewError {
+                pipeline_generation: 2,
+                node_id,
+                ..
+            } if node_id == "bad"
+        )));
     }
 }

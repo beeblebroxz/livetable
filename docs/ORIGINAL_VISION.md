@@ -203,6 +203,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 - [x] CSV/JSON serialization with type inference
 - [x] Python bindings via PyO3
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)
+- [x] Protocol v2 server-computed view pipelines (per-connection filter/sort/group DAGs with generation-scoped snapshots)
 
 ### Planned
 - [x] RIGHT and FULL OUTER joins

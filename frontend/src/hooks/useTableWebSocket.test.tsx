@@ -4,6 +4,8 @@ import {
   useTableWebSocket,
   SEQ_GAP_REQUERY_MS,
   MAX_PENDING_DELTAS,
+  SUPPORTED_PROTOCOL_VERSION,
+  parseServerMessage,
 } from './useTableWebSocket';
 import { FakeWebSocket } from '../test/fakeWebSocket';
 
@@ -532,11 +534,63 @@ describe('useTableWebSocket', () => {
       socket.receive({
         type: 'Subscribed',
         table_name: 'demo',
-        protocol_version: 1,
+        protocol_version: SUPPORTED_PROTOCOL_VERSION,
       });
     });
 
     expect(warnSpy).not.toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+
+  it('parses protocol-v2 view data with generation and nullable row ids', () => {
+    const message = parseServerMessage(JSON.stringify({
+      type: 'ViewData',
+      table_name: 'demo',
+      pipeline_generation: 7,
+      node_id: 'regional-totals',
+      source_id: 'ranked',
+      kind: 'group',
+      seq: 42,
+      columns: ['region', 'total'],
+      rows: [
+        { row_id: null, row: { region: 'West', total: 500 } },
+      ],
+    }));
+
+    expect(message).toMatchObject({
+      type: 'ViewData',
+      pipeline_generation: 7,
+      node_id: 'regional-totals',
+      seq: 42,
+    });
+  });
+
+  it('rejects malformed protocol-v2 view messages', () => {
+    const missingGeneration = parseServerMessage(JSON.stringify({
+      type: 'ViewData',
+      table_name: 'demo',
+      node_id: 'f',
+      source_id: 'base',
+      kind: 'filter',
+      seq: 1,
+      columns: ['amount'],
+      rows: [],
+    }));
+    const unsafeRowId = parseServerMessage(JSON.stringify({
+      type: 'ViewData',
+      table_name: 'demo',
+      pipeline_generation: 1,
+      node_id: 'f',
+      source_id: 'base',
+      kind: 'filter',
+      seq: 1,
+      columns: ['amount'],
+      rows: [
+        { row_id: Number.MAX_SAFE_INTEGER + 1, row: { amount: 500 } },
+      ],
+    }));
+
+    expect(missingGeneration).toBeNull();
+    expect(unsafeRowId).toBeNull();
   });
 });

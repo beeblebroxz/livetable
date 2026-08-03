@@ -1,18 +1,21 @@
 # Server-Computed View Pipeline — Design
 
 **Date:** 2026-06-28
-**Status:** Draft for review
+**Status:** Implemented 2026-08-02
 **Goal:** Make the "Forward Propagation" browser demo run on LiveTable's real
 Rust engine instead of a client-side JavaScript reimplementation.
 
-## Problem
+## Original problem
 
-`frontend/src/pages/CascadeDemo.tsx` advertises "live base rows flow through
-editable derived tables on every tick," but it reimplements filter / sort /
+`frontend/src/pages/CascadeDemo.tsx` advertised "live base rows flow through
+editable derived tables on every tick," but reimplemented filter / sort /
 group-by in ~340 lines of TypeScript. None of the Rust engine's incremental
-forward propagation (`ReadableTable` DAG, `tick()`/`sync()`, `AggregateView`,
-etc.) runs. The WebSocket protocol can only carry a single flat table, so the
-derivations *must* be faked client-side today.
+forward propagation ran, and the WebSocket protocol could carry only a single
+flat table.
+
+Protocol v2 now resolves this: `TableEngineActor` owns the real per-connection
+view DAG, `ViewData` streams each node, and `usePipeline` drives the cascade
+demo with generation-aware server snapshots. The local evaluator was removed.
 
 The core engine's incremental propagation is now verified correct (differential
 fuzz over filter / sort / group / join / computed, single-change and batched;
@@ -85,9 +88,12 @@ state, but cross-tab edits would be surprising for this demo.)
 ## Wire protocol (additive)
 
 New `ClientMessage`:
-- `SetPipeline { table_name, nodes: [ViewSpec] }` — defines/replaces this
-  connection's pipeline. Re-sent (debounced ~250ms) on any expression edit,
-  since a view's predicate/keys are fixed at construction (rebuild on edit).
+- `SetPipeline { table_name, pipeline_generation, nodes: [ViewSpec] }` —
+  defines/replaces this connection's pipeline. `pipeline_generation` is a
+  client-selected `u32`, incremented for every complete definition and echoed
+  by all pipeline responses. Re-sent (debounced ~250ms) on any expression
+  edit, since a view's predicate/keys are fixed at construction (rebuild on
+  edit).
 
 `ViewSpec` (tagged union; server parses into real engine constructs):
 ```
@@ -103,13 +109,15 @@ wrapped in a closure for `FilterView::new`. Sort → `Vec<SortKey>`. Group →
 `sum|avg|min|max|count|median|pXX|percentile(x)` → `AggregateFunction`.
 
 New `ServerMessage`:
-- `ViewData { table_name, node_id, source_id, kind, seq, columns, rows }` — one
-  per node whose output changed on a tick. `rows` carry an optional `row_id`
-  (present for base/filter/sort, absent for group aggregates) so the demo can
-  target edit/delete. The base table is streamed as node `"base"` so the client
+- `ViewData { table_name, pipeline_generation, node_id, source_id, kind, seq,
+  columns, rows }` — one per node whose output changed on a tick. `rows` use a
+  nullable `row_id` (present for base rows, null for derived rows without a
+  stable identity) so the demo can target base edit/delete without an unsafe
+  integer sentinel. The base table is streamed as node `"base"` so the client
   handles one uniform message type.
-- `ViewError { table_name, node_id, message }` — bad expression / unknown
-  column. The client already renders a rose error box.
+- `ViewError { table_name, pipeline_generation, node_id, message }` — bad
+  expression / unknown column, scoped to the definition that failed. The
+  client already renders a rose error box.
 
 `PROTOCOL_VERSION` bumps; the client's `SUPPORTED_PROTOCOL_VERSION` bumps to match.
 
@@ -123,15 +131,18 @@ its single thread:
    (head filter from the base changeset; sort/group via version-checked refresh;
    parent-before-child; min-cursor compaction),
 3. for each node whose `version()` advanced, snapshots its rows and pushes
-   `ViewData{ node_id, seq = view.version() }` to that connection's subscriber,
+   `ViewData{ pipeline_generation, node_id, seq = view.version() }` to that
+   connection's subscriber,
 4. still broadcasts the base `RowInserted`/etc. to plain base subscribers (the
    editor page).
 
 `SetPipeline` tears down the old view chain, builds the new one (errors →
 `ViewError`), registers the head with the `TickableTable`, and emits initial
-`ViewData` for every node. Per-connection `seq` = `ReadableTable::version()`
-(own counter + parent version), monotonic, so the client drops stale `ViewData`
-— mirroring the existing base-table `seq` discipline.
+`ViewData` for every node. Per-node `seq` = `ReadableTable::version()` (own
+counter + parent version), monotonic only within a pipeline generation. The
+client first compares `pipeline_generation`, then drops stale `seq` values
+within the active generation. This is required because rebuilding a view can
+reset its own version counter.
 
 ## Frontend changes
 
@@ -143,7 +154,8 @@ its single thread:
   StrictMode bugs disappear). Edit/delete controls on the base node send
   `UpdateCell`/`DeleteRow` by `row_id`.
 - **`usePipeline` hook** — sends `SetPipeline`, holds `Record<nodeId,
-  {columns, rows, seq}>`, applies `ViewData`/`ViewError`, drops stale `seq`.
+  {columns, rows, seq}>`, applies `ViewData`/`ViewError`, drops older
+  generations and stale `seq` values within the active generation.
   Expression edits debounced ~250ms (fixing the un-debounced keystroke tick
   inflation).
 - Default pipeline + the three expression boxes use **real engine syntax**.

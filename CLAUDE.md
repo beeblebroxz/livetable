@@ -94,7 +94,8 @@ cd frontend && npm install && npm run dev
 - **readable.rs** - `ReadableTable` trait: the read surface shared by `Table` and every view, enabling views-over-views (DAG composition)
 - **view.rs** + **view/** - Zero-copy views, one file per type: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`, `AggregateView`, `TickableTable`; view.rs holds shared typed join-key machinery; tests in view/tests.rs
 - **python_bindings.rs** - PyO3 bindings exposing Rust types as Python classes
-- **websocket.rs** + **messages.rs** - Real-time sync via Actix-web WebSocket server
+- **engine.rs** + **pipeline_spec.rs** - Single-threaded server table owner and bounded wire-spec → real-view construction
+- **websocket.rs** + **messages.rs** - Actix transport and protocol-v2 real-time sync
 
 ### Key Patterns
 - Views use `Rc<RefCell<>>` for shared table access without data duplication
@@ -106,6 +107,9 @@ cd frontend && npm install && npm run dev
 - WebSocket reconciliation: every `TableData` and delta carries a monotonic `seq` (the table's `Changeset::total_len`, read under the same lock as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. This closes a snapshot/delta race where a concurrent insert during subscribe could otherwise be applied twice. Keep `seq` populated when adding new server→client messages.
 - WebSocket gap recovery: deltas only apply contiguously (`seq == applied + 1`); if a gap persists for `SEQ_GAP_REQUERY_MS` the client re-sends `Query` and re-baselines from the fresh snapshot (`useTableWebSocket.ts`). The pending-delta buffer is capped at `MAX_PENDING_DELTAS` (oldest evicted; the resulting gap heals via re-query). Cell edits are server-authoritative: on blur the input snaps back to the last confirmed value and only the `CellUpdated` broadcast echo moves it forward, so rejected updates (e.g. null into a non-nullable column) self-heal.
 - WebSocket `Subscribed` carries `protocol_version` (`messages::PROTOCOL_VERSION`); the client warns on mismatch with `SUPPORTED_PROTOCOL_VERSION`. Bump both on breaking wire changes.
+- WebSocket protocol v2 pipeline messages carry a client-selected `pipeline_generation` on `SetPipeline`, `ViewData`, and `ViewError`. Reconcile derived snapshots by `(pipeline_generation, node_id, seq)`: a newer generation replaces all older pipeline state, while `seq` is only compared within the same generation.
+- `ViewData` uses `WireViewRow { row_id: Option<u64>, row }`; derived rows without stable identity serialize `row_id: null`. Never use `u64::MAX` as a JavaScript sentinel. Pipeline `count` is `COUNT(column)` and every aggregate spec therefore requires a source `column`.
+- Run `pipeline_spec::validate_pipeline_spec()` before allocating views. It enforces ordered/acyclic sources, unique non-reserved node IDs, required node fields, and protocol resource limits.
 - `Table::from_json`/`from_csv` infer each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null/empty → STRING); values are then converted against the inferred schema, not in isolation. JSON rejects incompatible mixes (number + string) at inference with a clear error; CSV falls back to STRING since every CSV value is a string at heart.
 - Iterator mutation guards: every Py iterator (table and all six views) captures a version at `__iter__` and raises `RuntimeError` from `__next__` if it changes. View iterators use `ReadableTable::version()` (own sync counter + parent version), so both parent mutations and `sync()`/`refresh()` trip the guard.
 - JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
@@ -117,7 +121,8 @@ cd frontend && npm install && npm run dev
 
 ### Frontend (frontend/src/)
 - React 18 + TypeScript + Vite + Tailwind CSS
-- `hooks/useTableWebSocket.ts` - WebSocket connection management
+- `hooks/useTableWebSocket.ts` - Flat-table WebSocket connection management
+- `hooks/usePipeline.ts` - Debounced, generation-aware server view-pipeline connection management
 - `components/LiveTable.tsx` - Real-time table rendering with TanStack Table
 
 ## Critical Notes
