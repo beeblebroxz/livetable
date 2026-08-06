@@ -136,10 +136,6 @@ mod integration_tests {
         assert!((total1 - 99.95).abs() < 0.01); // Gadget: 5 * 19.99 = 99.95
         assert!((total2 - 74.85).abs() < 0.01); // Doohickey: 15 * 4.99 = 74.85
 
-        // Create a filter view on top of the computed view
-        // Note: We'd need to refactor FilterView to work with ComputedView, not just Table
-        // For now, test that the basic workflow works
-
         // Verify full row includes computed column
         let row = computed_view.borrow().get_row(0).unwrap();
         assert_eq!(row.get("product").unwrap().as_string(), Some("Widget"));

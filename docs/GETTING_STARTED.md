@@ -1,223 +1,166 @@
-# Getting Started with LiveTable Rust Python Bindings
+# Getting Started with LiveTable Python
 
-Welcome! Your Python playground is all set up and ready to go! 🎉
+LiveTable's Python package is a PyO3 extension built from the Rust core. Python
+3.8 or newer, Rust, and a working C/Rust build toolchain are required.
 
-## 🚀 Quick Start (30 seconds)
+## Install from this repository
+
+From the repository root:
 
 ```bash
-# Option 1: Use the launcher (easiest!)
-./run.sh
-
-# Option 2: Run directly
-python3 quickstart.py      # Learn basics in 5 minutes
-python3 playground.py      # Interactive examples
-python3 scratch.py         # Your blank canvas
+cd impl
+./install.sh
 ```
 
-## 📁 Files Ready for You
+The script builds a wheel with Maturin and installs it with `pip3`. For a manual
+or virtual-environment build, see
+[PYTHON_BINDINGS_README.md](PYTHON_BINDINGS_README.md#building-from-source).
 
-| File | Purpose | When to Use |
-|------|---------|-------------|
-| **quickstart.py** | 5-minute tutorial | First time using livetable |
-| **playground.py** | Interactive examples + challenges | Learning and experimenting |
-| **scratch.py** | Blank template | Quick tests and experiments |
-| **test_python_bindings.py** | Full test suite | See all features in action |
-| **run.sh** | Launcher menu | Easy access to everything |
+Verify the import:
 
-## 🎯 Recommended Path
-
-### 1. Start Here (5 minutes)
 ```bash
-python3 quickstart.py
-```
-This will show you the basics:
-- Creating tables
-- Adding/querying data
-- Filtering with lambdas
-- Joining tables
-
-### 2. Explore Examples (15 minutes)
-```bash
-python3 playground.py
-```
-This has:
-- Working examples you can modify
-- Challenges to try
-- Performance tests
-- Experiment zone
-
-### 3. Start Building (your time!)
-```bash
-# Edit scratch.py with your favorite editor
-code scratch.py    # VS Code
-vim scratch.py     # Vim
-nano scratch.py    # Nano
-
-# Run it
-python3 scratch.py
+python3 -c "import livetable; print(livetable.ColumnType.INT32)"
 ```
 
-## 💡 Quick Reference
+## Create a typed table
 
-### Create a Table
 ```python
+from datetime import date, datetime
 import livetable
 
 schema = livetable.Schema([
     ("id", livetable.ColumnType.INT32, False),
     ("name", livetable.ColumnType.STRING, False),
-    ("age", livetable.ColumnType.INT32, True),  # nullable
+    ("age", livetable.ColumnType.INT32, True),
+    ("joined", livetable.ColumnType.DATE, False),
+    ("updated_at", livetable.ColumnType.DATETIME, True),
 ])
 
-table = livetable.Table("users", schema)
+users = livetable.Table("users", schema)
+users.append_row({
+    "id": 1,
+    "name": "Alice",
+    "age": 30,
+    "joined": date(2026, 8, 3),
+    "updated_at": datetime(2026, 8, 3, 9, 30),
+})
 ```
 
-### Add Data
+Every field is validated against its schema. Use `None` only for nullable
+columns.
+
+Supported column types are `INT32`, `INT64`, `FLOAT32`, `FLOAT64`, `STRING`,
+`BOOL`, `DATE`, and `DATETIME`.
+
+## Read and mutate rows
+
 ```python
-table.append_row({"id": 1, "name": "Alice", "age": 30})
-table.append_row({"id": 2, "name": "Bob", "age": None})  # NULL age
+users.append_rows([
+    {"id": 2, "name": "Bob", "age": None, "joined": date.today(), "updated_at": None},
+    {"id": 3, "name": "Carol", "age": 41, "joined": date.today(), "updated_at": None},
+])
+
+print(users[0])
+print(users[-1])
+print(users[0:2])
+print(users["name"])
+
+users.set_value(1, "age", 28)
+users.insert_row(1, {
+    "id": 4,
+    "name": "Dan",
+    "age": 22,
+    "joined": date.today(),
+    "updated_at": None,
+})
+users.delete_row(1)
 ```
 
-### Query Data
-```python
-# Get a row
-row = table.get_row(0)
-print(row)  # {'id': 1, 'name': 'Alice', 'age': 30}
+## Build views
 
-# Get a specific value
-name = table.get_value(0, "name")
-print(name)  # Alice
-```
-
-### Filter (with Python lambdas!)
 ```python
-adults = table.filter(lambda row: row.get("age") and row["age"] >= 18)
-print(f"Found {len(adults)} adults")
-```
-
-### Project (select columns)
-```python
-summary = table.select(["name", "age"])
-```
-
-### Computed Columns
-```python
-with_status = table.add_computed_column(
+adults = users.filter(lambda row: row["age"] is not None and row["age"] >= 18)
+names = users.select(["name", "age"])
+with_status = users.add_computed_column(
     "status",
-    lambda row: "Adult" if row.get("age") and row["age"] >= 18 else "Minor"
+    lambda row: "known" if row["age"] is not None else "unknown",
 )
+ranked = users.sort("age", descending=True)
 ```
 
-### Join Tables
-```python
-joined = livetable.JoinView(
-    "user_orders",
-    users,
-    orders,
-    "id",        # column in users
-    "user_id",   # column in orders
-    livetable.JoinType.LEFT
-)
-```
-
-## 📚 Available Data Types
+For expressions that do not need a Python callback:
 
 ```python
-livetable.ColumnType.INT32      # 32-bit integer
-livetable.ColumnType.INT64      # 64-bit integer
-livetable.ColumnType.FLOAT32    # 32-bit float
-livetable.ColumnType.FLOAT64    # 64-bit float (Python's float)
-livetable.ColumnType.STRING     # String
-livetable.ColumnType.BOOL       # Boolean
+indices = users.filter_expr("age IS NOT NULL AND age >= 18")
 ```
 
-## 🎮 Interactive Mode
+`filter_expr` returns base-row indices, while `filter` returns a `FilterView`.
 
-Want to experiment in a REPL?
+## Join and aggregate
+
+```python
+orders_schema = livetable.Schema([
+    ("order_id", livetable.ColumnType.INT32, False),
+    ("user_id", livetable.ColumnType.INT32, False),
+    ("amount", livetable.ColumnType.FLOAT64, False),
+])
+orders = livetable.Table("orders", orders_schema)
+
+joined = users.join(orders, left_on="id", right_on="user_id", how="left")
+
+by_user = orders.group_by("user_id", agg=[
+    ("total", "amount", "sum"),
+    ("average", "amount", "avg"),
+    ("count", "amount", "count"),
+    ("p95", "amount", "p95"),
+])
+```
+
+Joins support LEFT, INNER, RIGHT, FULL, and composite keys. Grouping supports
+SUM, COUNT, AVG, MIN, MAX, MEDIAN, and percentile operations.
+
+## Propagate changes
+
+Stateful views are snapshots with incremental sync metadata. Simplified table
+methods register them for `tick()`:
+
+```python
+large_orders = orders.filter(lambda row: row["amount"] >= 500)
+ranked_orders = large_orders.sort("amount", descending=True)
+
+orders.append_row({"order_id": 10, "user_id": 1, "amount": 900.0})
+orders.tick()
+```
+
+Views may parent other views. Registering happens in creation order, so a
+root-to-leaf chain updates in one tick. Explicit view constructors expose
+`sync()` or `refresh()` where appropriate.
+
+## Import, export, and pandas
+
+```python
+csv_text = users.to_csv()
+json_text = users.to_json()
+
+from_csv = livetable.Table.from_csv("csv_users", csv_text)
+from_json = livetable.Table.from_json("json_users", json_text)
+
+frame = users.to_pandas()
+from_frame = livetable.Table.from_pandas("frame_users", frame)
+```
+
+Pandas is optional and imported only when those methods are called.
+
+## Next steps
 
 ```bash
-./run.sh
-# Choose option 4: Python REPL
-
-# Or directly:
-python3 -i -c "import livetable"
-```
-
-Then try:
-```python
->>> schema = livetable.Schema([("id", livetable.ColumnType.INT32, False)])
->>> table = livetable.Table("test", schema)
->>> table.append_row({"id": 1})
->>> table.get_row(0)
-{'id': 1}
-```
-
-## 📖 Full Documentation
-
-- [PYTHON_BINDINGS_README.md](PYTHON_BINDINGS_README.md) - Complete API reference
-- [IMPLEMENTATION_COMPLETE.md](IMPLEMENTATION_COMPLETE.md) - Technical details
-
-## 🎯 Example Project Ideas
-
-Try building:
-
-1. **Contact Manager**
-   - Table: contacts (id, name, email, phone)
-   - Filter by name
-   - Search by email
-
-2. **Task Tracker**
-   - Table: tasks (id, title, priority, done)
-   - Filter: incomplete tasks
-   - Computed: days_until_due
-
-3. **Product Catalog**
-   - Table: products (id, name, price, stock)
-   - Table: categories (id, name)
-   - Join: products with categories
-   - Filter: in_stock items
-
-4. **Student Grades**
-   - Table: students (id, name, class)
-   - Table: grades (student_id, subject, score)
-   - Join: students with grades
-   - Computed: average score
-
-5. **Blog System**
-   - Table: posts (id, title, author_id, views)
-   - Table: authors (id, name, email)
-   - Join: posts with authors
-   - Filter: popular posts (views > 1000)
-
-## 🔥 Performance Tips
-
-The Rust backend is FAST:
-- ✅ Use filters instead of manual iteration
-- ✅ Views are cheap (zero-copy)
-- ✅ Joins are optimized (O(N+M))
-- ✅ Computed columns calculated on-demand
-
-Try the performance test in playground.py to see!
-
-## 🆘 Need Help?
-
-1. **Check the examples**: Most questions answered in `playground.py`
-2. **Read the API docs**: See `PYTHON_BINDINGS_README.md`
-3. **Run the tests**: `python3 test_python_bindings.py` shows all features
-
-## 🎉 You're All Set!
-
-Pick a file and start experimenting:
-
-```bash
-# Beginner? Start here
+cd examples
 python3 quickstart.py
-
-# Want to explore? Try this
+python3 demo_reactive_propagation.py --tick
 python3 playground.py
-
-# Ready to build? Use this
-python3 scratch.py
 ```
 
-Happy coding with Rust-powered tables! 🚀
+- [Python API reference](PYTHON_BINDINGS_README.md)
+- [Join details](JOIN_FEATURE.md)
+- [WebSocket/React demo](WEBSOCKET_PROTOCOL.md)
+- [Testing](../tests/README.md)

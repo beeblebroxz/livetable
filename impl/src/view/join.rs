@@ -106,7 +106,7 @@ impl JoinView {
     /// * `right_table` - Right table (matched rows included)
     /// * `left_key` - Column name in left table to join on
     /// * `right_key` - Column name in right table to join on
-    /// * `join_type` - Type of join (Left or Inner)
+    /// * `join_type` - Type of join (Left, Inner, Right, or Full)
     ///
     /// # Returns
     ///
@@ -138,7 +138,7 @@ impl JoinView {
     /// * `right_table` - Right table (matched rows included)
     /// * `left_keys` - Column names in left table to join on
     /// * `right_keys` - Column names in right table to join on
-    /// * `join_type` - Type of join (Left or Inner)
+    /// * `join_type` - Type of join (Left, Inner, Right, or Full)
     ///
     /// # Returns
     ///

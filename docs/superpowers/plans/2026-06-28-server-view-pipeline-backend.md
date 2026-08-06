@@ -8,12 +8,12 @@
 
 **Tech Stack:** Rust, actix / actix-web-actors, serde/serde_json, PyO3 (unaffected), existing `crate::view`, `crate::expr`, `crate::table`.
 
-## Status (updated 2026-08-02)
+## Status (updated 2026-08-03)
 
-**Implementation complete.** Protocol v2, bounded pipeline validation,
-`TableEngine`, the single-threaded Actix owner, `usePipeline`, and the migrated
-cascade demo are implemented in the workspace. No commit was created because
-that was not requested.
+**Implementation complete and committed.** Protocol v2, bounded pipeline
+validation, `TableEngine`, the single-threaded Actix owner, `usePipeline`, the
+migrated cascade demo, and both integration-test layers landed in `845028a`
+(`Implement protocol v2 server view pipelines`).
 
 Prior commits (newest first):
 - `5785552` Task 2 — `pipeline_spec` (spec → real views; `count` requires a column)
@@ -21,10 +21,10 @@ Prior commits (newest first):
 - `b97b0c9` this backend plan · `bb9a1ea` design spec · `efe8eac`+`07a5735` core forward-prop fixes + differential fuzz
 
 Verification completed: full Rust server/core/fuzz/doc-test suite, Clippy with
-server features and warnings denied, 22 frontend tests, frontend lint/build,
-and a real WebSocket smoke (`base`→filter→sort→group plus insert propagation).
-The engine differential test also checks 500 randomized mutation ticks against
-an independent shadow model.
+server features and warnings denied, 23 frontend tests, frontend lint/build,
+and an automated real-WebSocket test (`base`→filter→sort→group plus
+insert/update/delete propagation). The engine differential test also checks 500
+randomized mutation ticks against an independent shadow model.
 
 **Gotchas already learned:**
 - Server modules (`messages`/`websocket`/`server`/`engine`/`pipeline_spec`) are
@@ -32,7 +32,7 @@ an independent shadow model.
   (plain `cargo test --lib` silently skips them and won't even recompile them).
 - `count` is `COUNT(col)` (non-null count); the engine has no row-count
   aggregate. The frontend's default group spec must use `count(amount)`, not
-  `count()`. Carry this into the (not-yet-written) frontend plan.
+  `count()`. The implemented cascade parser and default spec follow this rule.
 - The finalized protocol scopes every pipeline response with a client-selected
   `pipeline_generation: u32`; node `seq` is monotonic only within a generation
   because rebuilding a view resets its own counter.
@@ -339,7 +339,7 @@ mod tests {
 
 - [x] **Step 5: Add a differential engine test** mirroring `forward_prop_fuzz`: build a filter→sort→group pipeline via `set_pipeline`, apply random insert/update/delete through engine methods + `tick_and_collect`, and assert each node snapshot equals a fresh `clone`-built pipeline. (Reuse the multiset/ordered comparison from `forward_prop_fuzz.rs`.) Keep it small (10 trials × 50 steps) since the engine path is thin over the already-fuzzed views.
 
-- [ ] **Step 6: Run, verify pass; commit.**
+- [x] **Step 6: Run, verify pass; commit.** Completed in consolidated commit `845028a`.
 
 ```bash
 git add impl/src/engine.rs impl/src/lib.rs
@@ -370,7 +370,7 @@ git commit -m "Add TableEngine: per-connection server-side view pipelines"
 
 - [x] **Step 4: Run tests** (`cargo test --lib websocket` + the adapted existing tests). Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add impl/src/websocket.rs && git commit -m "Route WebSocket through TableEngineActor; add SetPipeline + ViewData streaming"`
+- [x] **Step 5: Commit.** Completed in consolidated commit `845028a`.
 
 ---
 
@@ -384,7 +384,7 @@ git commit -m "Add TableEngine: per-connection server-side view pipelines"
 - [x] **Step 2: Full Rust suite + fuzz.** Run: `cd impl && env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib && cargo test --test forward_prop_fuzz`. Expected: all green.
 - [x] **Step 3: Manual smoke** — run the server, connect a `wscat`/script client, send `Subscribe` + `SetPipeline`, then `InsertRow`, and confirm `ViewData` for `base`/`f`/`s`/`g` arrives with the new row reflected; send `UpdateCell` crossing the filter boundary and confirm the row leaves the filter node and the group total drops.
 - [x] **Step 4: Update docs** per the CLAUDE.md checklist; add the new protocol messages and `PROTOCOL_VERSION = 2` note to CLAUDE.md's WebSocket section.
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "Wire up server view pipeline; update docs"`
+- [x] **Step 5: Commit.** Completed in consolidated commit `845028a`.
 
 ---
 
@@ -395,4 +395,7 @@ git commit -m "Add TableEngine: per-connection server-side view pipelines"
 **Frontend integration is complete:** `usePipeline` performs generation/sequence
 reconciliation and the cascade demo renders and edits the server-owned DAG.
 
-**Open risk to validate during Task 4:** actix actor with `!Send` state must be started on a single arbiter and reached only via its `Addr`; confirm `TableEngineActor::start()` compiles without a `Send` bound and that cross-arbiter messaging from connection actors works (it should — `Addr` is `Send + Sync`, actor state stays on its arbiter). If actix rejects the non-`Send` actor in the multi-worker server, fall back to a dedicated single OS thread owning `TableEngine` with a `std::sync::mpsc` command channel and `Addr`s for replies (same logic, no actix actor).
+**Resolved Task-4 risk:** the `!Send` engine compiles and runs inside
+`TableEngineActor`, while connection actors communicate through its `Addr`.
+Actor tests, a manual smoke, and the real-server WebSocket integration test all
+exercise this ownership boundary successfully.

@@ -8,7 +8,7 @@ Comprehensive test suite for the livetable Rust-powered table system.
 tests/
 ├── pytest.ini                  # Pytest configuration
 ├── README.md                   # This file
-├── run_all.sh                  # Run all tests (Rust + Python)
+├── run_all.sh                  # Standard Rust/Python/frontend checks
 ├── python/                     # Python unit tests
 │   ├── test_table_operations.py    # CRUD operations
 │   ├── test_views.py              # Views and filtering
@@ -19,7 +19,7 @@ tests/
 
 ## Running Tests
 
-### All Tests (Recommended)
+### Standard Local Checks
 
 ```bash
 cd tests
@@ -32,6 +32,10 @@ This runs:
 3. Python unit tests
 4. Integration tests
 5. Frontend lint, Vitest, and production build
+
+The script intentionally keeps the long randomized fuzz suite and the
+real-server WebSocket test separate. Run those with the commands below before a
+protocol or propagation release.
 
 ### Python Tests Only
 
@@ -60,6 +64,12 @@ pytest -s
 ```bash
 cd ../impl
 env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib --features server
+
+# Randomized forward-propagation tests
+cargo test --test forward_prop_fuzz
+
+# Real TCP/WebSocket protocol-v2 integration test
+cargo test --features server --test protocol_v2_websocket
 ```
 
 ### Rust Lint Only
@@ -119,7 +129,14 @@ Located in Rust source files with `#[cfg(test)]` modules:
 - **table.rs** - Table operations
 - **view.rs** - Views and incremental propagation
 - **websocket.rs** - WebSocket protocol and JSON conversion
+- **engine.rs** - Server table ownership, stable row IDs, and per-connection pipelines
+- **pipeline_spec.rs** - Protocol pipeline validation and view construction
 - **lib.rs** - Integration workflow
+
+Rust integration tests under `../impl/tests/`:
+
+- **forward_prop_fuzz.rs** - Differential randomized view propagation
+- **protocol_v2_websocket.rs** - Real Actix server and WebSocket boundary
 
 ## Test Coverage
 
@@ -127,7 +144,7 @@ Located in Rust source files with `#[cfg(test)]` modules:
 
 ✅ Table creation and schemas
 ✅ CRUD operations (Create, Read, Update, Delete)
-✅ All column types (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL)
+✅ All column types (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
 ✅ Nullable columns
 ✅ FilterView with Python lambdas
 ✅ ProjectionView (column selection)
@@ -137,6 +154,7 @@ Located in Rust source files with `#[cfg(test)]` modules:
 ✅ `tick()` view registration and changeset compaction
 ✅ View chaining
 ✅ WebSocket row mutation semantics and snapshot/delta sequencing
+✅ Protocol-v2 pipeline snapshots across a real TCP/WebSocket connection
 ✅ Real-world workflows
 ✅ Performance with 1000+ rows
 
@@ -204,10 +222,10 @@ It runs:
 1. Rust `clippy` with `-D warnings` for the core library
 2. Rust `clippy` with `-D warnings` for the `server` feature
 3. Rust `clippy` with `-D warnings` for the `python` feature
-4. Rust tests with the `server` feature enabled
-   The workflow exercises the core library plus server/WebSocket paths.
-5. Python package build plus pytest suite on Python 3.12
-6. Frontend lint, Vitest, and production build
+4. Rust library tests with the `server` feature enabled
+5. The protocol-v2 real-WebSocket integration test
+6. Python package build plus pytest suite on Python 3.12
+7. Frontend lint, Vitest, and production build
 
 ### Toolchain Split
 
@@ -225,7 +243,7 @@ For performance benchmarks (separate from unit tests):
 
 ```bash
 cd ../benchmarks
-python3 benchmark.py
+python3 benchmark_vs_pandas.py
 ```
 
 Or Rust benchmarks:
@@ -264,8 +282,8 @@ When adding new features:
 1. Write Rust unit tests in the source file
 2. Write Python unit tests in `python/test_*.py`
 3. Add integration test if it's a complex feature
-4. Run all tests before submitting PR
-5. Aim for >80% code coverage
+4. Run the standard checks plus any relevant fuzz/protocol integration target before submitting a PR
+5. Add focused regression coverage for every corrected failure mode
 
 ## Questions?
 

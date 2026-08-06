@@ -1,5 +1,9 @@
 # RIGHT/FULL OUTER Joins + tick() Integration — Implementation Plan
 
+**Status:** Implemented. This file preserves the original execution plan; its
+unchecked step boxes are historical and are not the current feature status.
+See `docs/JOIN_FEATURE.md` and the join tests for the implemented behavior.
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add RIGHT and FULL OUTER join types to JoinView and integrate JoinView with tick() auto-propagation.

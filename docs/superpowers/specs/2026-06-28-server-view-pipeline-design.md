@@ -28,7 +28,7 @@ wire so the demo becomes truthful.
    via `TickableTable::tick()` on every mutation (single change per tick — the
    path the differential fuzz verifies).
 2. **Per-node snapshot wire format** — after each tick, every changed node
-   streams a full `ViewData{ view_id, seq, columns, rows }`. Simplest and
+   streams a full `ViewData{ node_id, seq, columns, rows }`. Simplest and
    robust (sidesteps view-row identity for sort/group); indistinguishable from
    deltas at demo scale. Engine stays incremental internally.
 3. **Insert + edit + delete** interactions — so a viewer can watch a row cross
@@ -88,14 +88,14 @@ state, but cross-tab edits would be surprising for this demo.)
 ## Wire protocol (additive)
 
 New `ClientMessage`:
-- `SetPipeline { table_name, pipeline_generation, nodes: [ViewSpec] }` —
+- `SetPipeline { table_name, pipeline_generation, nodes: [ViewNodeSpec] }` —
   defines/replaces this connection's pipeline. `pipeline_generation` is a
   client-selected `u32`, incremented for every complete definition and echoed
   by all pipeline responses. Re-sent (debounced ~250ms) on any expression
   edit, since a view's predicate/keys are fixed at construction (rebuild on
   edit).
 
-`ViewSpec` (tagged union; server parses into real engine constructs):
+`ViewNodeSpec` (tagged union; server parses into real engine constructs):
 ```
 { id, kind:"filter", source_id, predicate:"amount >= 500 AND region != 'West'" }
 { id, kind:"sort",   source_id, keys:[{column:"amount", descending:true}] }

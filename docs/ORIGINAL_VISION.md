@@ -56,14 +56,19 @@ The system can dynamically choose good layout strategies based on the relative r
 
 A **Column** is an array-like random-access data container indexed by an integer index. Each Column has a type that specifies the type of every value stored in it:
 
-### Supported Types
+### Original Type Goals
 - **B-bit integers**: Signed or unsigned fixed point values (B >= 1, with M <= B digits right of the decimal point)
 - **32-bit or 64-bit floating point**
 - **Strings**: Fixed-length, bounded-length, or variable-length; unicode or binary
 - **Boolean**
-- **Date/Time** (planned)
+- **Date/Time**
 - **Nested Column**: A Column which contains another Column
 - **Any Table**: With a Schema specifying the type
+
+The current implementation intentionally supports a narrower concrete set:
+INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, and DATETIME. Arbitrary
+bit-width/fixed-point integers, nested columns, binary strings, and table-valued
+columns remain original design ideas rather than implemented APIs.
 
 ### NULL Support
 
@@ -159,6 +164,10 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 
 ## Serialization
 
+The current implementation provides in-memory CSV and JSON import/export with
+schema inference. The compression, chunked random-access, and parallel-formatting
+items below remain original future ideas.
+
 - Serialization must "pipe" through compression, and perhaps even to Sandra writing, to avoid taking too much contiguous memory
 - Format could support random-access decompression in chunks
 - Sorting the string table before serializing might compress better
@@ -192,7 +201,7 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 ### Completed
 - [x] Sequence layer (ArraySequence, TieredVectorSequence backed by tiered-vector crate)
 - [x] StorageHint API for selecting storage backend (`fast_reads` / `fast_updates`)
-- [x] Column layer with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL)
+- [x] Column layer with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
 - [x] Table layer (Root tables with CRUD operations)
 - [x] Views: FilterView, ProjectionView, ComputedView, JoinView (LEFT/INNER/RIGHT/FULL), SortedView
 - [x] AggregateView with GROUP BY and incremental updates (SUM, COUNT, AVG, MIN, MAX, MEDIAN, PERCENTILE)
@@ -204,15 +213,17 @@ Parallel group-by can be challenging because threads may fight over the hash tab
 - [x] Python bindings via PyO3
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)
 - [x] Protocol v2 server-computed view pipelines (per-connection filter/sort/group DAGs with generation-scoped snapshots)
-
-### Planned
 - [x] RIGHT and FULL OUTER joins
 - [x] Multi-column joins (composite key support)
-- [x] Date/Time column types (DATE and DATETIME)
-- [ ] Materialized Views (cached for faster reads)
 - [x] Bulk/Batch operations (`append_rows`)
 - [x] Python iterator protocol (`for row in table`)
 - [x] Pandas DataFrame interop (`to_pandas`, `from_pandas`)
+
+### Planned
+- [ ] Materialized Views (cached for faster reads)
+- [ ] Persistence and recovery
+- [ ] Parallel view execution
+- [ ] SQL/query-planning layer
 
 ---
 

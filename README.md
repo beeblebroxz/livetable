@@ -18,19 +18,14 @@ python3 demo_reactive_propagation.py # Watch changes flow through views
 
 ## Why LiveTable?
 
-LiveTable excels at **row-level operations** and **reactive views** - areas where pandas struggles:
-
-| Operation | LiveTable | Pandas | Speedup |
-|-----------|-----------|--------|---------|
-| Row iteration (`for row in table`) | 2.8ms | 68ms | **25x faster** |
-| Random access (`get_row(i)`) | 0.3ms | 10ms | **33x faster** |
-| Aggregations (small data) | 0.02ms | 0.03ms | 1.5x faster |
-
-*Benchmarks on 10,000 rows. See `benchmarks/benchmark_vs_pandas.py`*
+LiveTable is designed for **typed row-level operations** and **reactive
+views**. Performance is workload- and environment-dependent; use the checked-in
+benchmarks for current measurements rather than treating historical numbers as
+guarantees. See [Performance and Benchmarking](docs/PERFORMANCE_COMPARISON.md).
 
 **Key advantages:**
 - **Zero-copy views** - FilterView, JoinView, etc. don't duplicate data
-- **Reactive updates** - Views auto-update when source table changes
+- **Reactive updates** - `tick()` incrementally synchronizes registered views
 - **Type safety** - Schema-enforced types catch errors early
 - **Pythonic API** - Natural Python syntax with indexing, slicing, and iteration
 
@@ -71,7 +66,10 @@ Views don't copy data - they reference the source table and compute on demand:
              └──► AggregateView
 ```
 
-When the source table changes, views receive **changesets** describing what changed. Smart views (like AggregateView) update incrementally - if you add one row, it adjusts the running totals rather than re-scanning everything.
+When the source table changes, views receive **changesets** describing what
+changed. Calling `tick()` synchronizes registered views in topological order.
+Stateful views such as `AggregateView` update incrementally when the change can
+be replayed safely and fall back to a rebuild when needed.
 
 ### String Interning
 
@@ -81,7 +79,9 @@ For columns with repeated values (status codes, categories, country names), enab
 table = livetable.Table("events", schema, use_string_interning=True)
 ```
 
-Each unique string is stored once; the column holds 4-byte IDs instead of full strings. This can dramatically reduce memory for high-cardinality categorical data.
+Each unique string is stored once; the column holds 4-byte IDs instead of full
+strings. This can reduce memory for low-cardinality or otherwise highly
+repetitive text.
 
 ## Data Types
 
@@ -150,7 +150,7 @@ In Rust, any view can parent any other view — every view implements the
 # Lambda filter
 high_scorers = table.filter(lambda row: row["score"] >= 90)
 
-# Expression filter (2x faster)
+# Expression filter (evaluated in Rust without a Python callback)
 indices = table.filter_expr("score >= 90 AND name != 'Test'")
 # Supports: =, !=, <, >, <=, >=, AND, OR, NOT, IS NULL, IS NOT NULL
 ```
@@ -231,6 +231,7 @@ from datetime import date
 schema = livetable.Schema([
     ("id", livetable.ColumnType.INT32, False),
     ("name", livetable.ColumnType.STRING, False),
+    ("department", livetable.ColumnType.STRING, False),
     ("score", livetable.ColumnType.FLOAT64, True),  # Nullable
     ("joined", livetable.ColumnType.DATE, False),
 ])
@@ -240,10 +241,10 @@ table = livetable.Table("students", schema)
 # table = livetable.Table("orderbook", schema, storage="fast_updates")
 
 # Add data
-table.append_row({"id": 1, "name": "Alice", "score": 95.5, "joined": date(2024, 9, 1)})
+table.append_row({"id": 1, "name": "Alice", "department": "Science", "score": 95.5, "joined": date(2024, 9, 1)})
 table.append_rows([
-    {"id": 2, "name": "Bob", "score": 87.0, "joined": date(2024, 9, 1)},
-    {"id": 3, "name": "Charlie", "score": None, "joined": date(2024, 9, 15)},
+    {"id": 2, "name": "Bob", "department": "Arts", "score": 87.0, "joined": date(2024, 9, 1)},
+    {"id": 3, "name": "Charlie", "department": "Science", "score": None, "joined": date(2024, 9, 15)},
 ])
 
 # Query with Pythonic syntax
@@ -261,6 +262,10 @@ sorted_table = table.sort("score", descending=True)
 print(f"Top student: {sorted_table[0]['name']}")
 
 # Join tables
+enrollment_schema = livetable.Schema([
+    ("student_id", livetable.ColumnType.INT32, False),
+    ("course", livetable.ColumnType.STRING, False),
+])
 enrollments = livetable.Table("enrollments", enrollment_schema)
 joined = table.join(enrollments, left_on="id", right_on="student_id")
 
@@ -294,7 +299,7 @@ pip install target/wheels/livetable-*.whl
 ## Testing
 
 ```bash
-# Run all tests (recommended)
+# Run the standard local checks
 cd tests && ./run_all.sh
 
 # Individual verification steps
@@ -302,7 +307,8 @@ cd impl && cargo clippy --all-targets -- -D warnings
 cd impl && cargo clippy --all-targets --features server -- -D warnings
 cd impl && env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo clippy --all-targets --features python -- -D warnings
 cd impl && cargo test --lib --features server
-cd tests && uv run pytest -c pytest.ini
+cd impl && cargo test --features server --test protocol_v2_websocket
+cd tests && pytest -c pytest.ini
 cd frontend && npm run lint && npm run test && npm run build
 ```
 
@@ -328,6 +334,8 @@ npm install && npm run dev
 
 The current demo client connects to `ws://<current-host>:8080/ws` by default. Set
 `VITE_LIVETABLE_WS_URL=ws://host:port/ws` when starting Vite to override it.
+See [WebSocket Protocol v2](docs/WEBSOCKET_PROTOCOL.md) for message schemas and
+reconciliation rules.
 
 ## Project Structure
 
@@ -345,6 +353,8 @@ livetable/
 │   │   ├── changeset.rs        # Incremental change tracking
 │   │   ├── expr.rs             # Expression parser for filter_expr()
 │   │   ├── interner.rs         # String interning engine
+│   │   ├── engine.rs           # Server table owner + per-connection pipelines
+│   │   ├── pipeline_spec.rs    # Bounded protocol spec validation/building
 │   │   ├── messages.rs         # WebSocket wire protocol types
 │   │   ├── websocket.rs        # WebSocket server (actix)
 │   │   ├── server.rs           # HTTP server setup
@@ -368,6 +378,15 @@ livetable/
 - **Views**: Zero-copy DAG with incremental change propagation
 - **Type System**: Strongly typed columns with NULL support
 - **Memory**: Optional string interning for categorical data
+
+## Documentation
+
+- [Quick start](QUICK_START.md)
+- [Python API reference](docs/PYTHON_BINDINGS_README.md)
+- [Rust API guide](docs/API_GUIDE.md)
+- [Join semantics](docs/JOIN_FEATURE.md)
+- [WebSocket protocol v2](docs/WEBSOCKET_PROTOCOL.md)
+- [Test matrix](tests/README.md)
 
 ## License
 

@@ -1,25 +1,26 @@
 # LiveTable Rust - Python Bindings
 
-🎉 **Python APIs for the Rust-powered table implementation!**
+Python APIs for the Rust-powered table implementation.
 
-This package exposes the high-performance Rust implementation of LiveTable tables to Python, giving you blazing-fast table operations with a natural Pythonic API.
+This package exposes LiveTable tables and views through a Pythonic PyO3 API.
 
-## ✅ Status: FULLY WORKING
+## Status
 
-All major features are implemented and tested!
+The documented API is implemented and tested. The package is version `0.1.0`
+and should still be treated as alpha for compatibility purposes.
 
 ## Installation
 
 ### From Source
 
 ```bash
-# Install maturin if you haven't already
-pip install maturin
-
-# Build and install the package
-maturin build --release
-pip install target/wheels/livetable-0.1.0-*.whl
+# From the repository root
+cd impl
+./install.sh
 ```
+
+See [Building from Source](#building-from-source) for a virtual-environment or
+manual Maturin workflow.
 
 ### Quick Test
 
@@ -106,7 +107,6 @@ Create filtered views using Python lambda functions:
 # Filter with lambda
 adults = table.filter(lambda row: row.get("age") and row["age"] >= 18)
 
-# Views are live - they reflect changes to the underlying table
 print(f"Found {len(adults)} adults")
 
 for i in range(len(adults)):
@@ -114,9 +114,12 @@ for i in range(len(adults)):
     print(f"{row['name']}: {row['age']} years old")
 ```
 
+`FilterView` maintains an index. After parent mutations, call `table.tick()`
+for views created through `table.filter()`, or call `adults.sync()` directly.
+
 ### ✅ Expression-Based Filtering
 
-For faster filtering, use string expressions instead of lambdas (2x faster):
+Use string expressions to evaluate predicates in Rust without a Python callback:
 
 ```python
 # Expression-based filter - returns list of matching row indices
@@ -141,7 +144,8 @@ for idx in indices:
     print(f"{row['name']}: {row['score']}")
 ```
 
-**Performance:** Expression filtering is ~2x faster than lambda filtering because the expression is parsed and evaluated entirely in Rust without Python callback overhead.
+Measure both forms on representative data; relative performance depends on
+expression complexity and Python/Rust boundary costs.
 
 ### ✅ Projection Views
 
@@ -692,10 +696,12 @@ Create a new table.
 - `get_value(row: int, column: str)` - Get single value
 - `set_value(row: int, column: str, value)` - Set single value
 - `get_row(index: int) -> dict` - Get full row as dictionary
-- `table[index]` - Same as `get_row(index)` (indexing support)
+- `table[index]` - Row indexing, including negative indices
+- `table[start:stop:step]` - Row slicing
+- `table["column"]` - Read one entire column as a list
 - `display()` - Get formatted table info
 - `filter(predicate: callable) -> FilterView` - Create filtered view
-- `filter_expr(expression: str) -> list[int]` - Filter using expression (2x faster)
+- `filter_expr(expression: str) -> list[int]` - Evaluate an expression in Rust and return base-row indices
 - `select(columns: list[str]) -> ProjectionView` - Create projection
 - `add_computed_column(name: str, fn: callable) -> ComputedView` - Add computed column
 - `sort(by, descending=None) -> SortedView` - Sort by column(s)
@@ -714,6 +720,10 @@ Create a new table.
 - `Table.from_pandas(name: str, df: pandas.DataFrame) -> Table` - Import from DataFrame (static method)
 - `tick() -> int` - Sync all registered views with pending changes, returns count synced
 - `registered_view_count() -> int` - Number of views registered for tick() propagation
+- `has_pending_changes() -> bool` - Whether the root changeset has entries
+- `pending_changes_count() -> int` - Current changeset entry count
+- `uses_string_interning() -> bool` - Whether string interning is enabled
+- `interner_stats() -> dict | None` - String interner statistics when enabled
 
 ### FilterView
 
@@ -729,6 +739,8 @@ Filtered view of a table.
 - `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get value
 - `refresh()` - Rebuild filter (if table changed)
+- `sync() -> bool` - Incrementally apply parent changes when possible
+- `last_synced_generation() -> int` - Last consumed root changeset generation
 
 ### ProjectionView
 
@@ -806,6 +818,24 @@ Enum for join types:
 - `JoinType.RIGHT` - All rows from right, matched from left
 - `JoinType.FULL` - All rows from both tables (full outer join)
 
+### SortOrder, SortKey, and SortedView
+
+```python
+key = livetable.SortKey.ascending("name")
+key = livetable.SortKey.descending("score", nulls_first=False)
+view = livetable.SortedView("ranked", table, [key])
+```
+
+`SortOrder.ASCENDING` and `SortOrder.DESCENDING` are available for the explicit
+`SortKey(column, order, nulls_first=False)` constructor.
+
+**SortedView methods:**
+- `len()`, `is_empty()`, and `name()`
+- `get_row(index)`, `get_value(row, column)`, indexing, slicing, and iteration
+- `get_parent_index(view_index)` - Map sorted position to parent position
+- `sync() -> bool` - Incremental synchronization when possible
+- `refresh()` - Full rebuild
+
 ### AggregateFunction
 
 Enum for aggregation types:
@@ -847,19 +877,19 @@ GROUP BY view with aggregations.
 
 ## Performance
 
-The Rust backend provides significant performance improvements over pure Python:
-
-- **10-100x faster** operations (based on benchmarks)
-- **Zero-copy views** - FilterView, ProjectionView don't duplicate data
-- **Sub-nanosecond access** for individual operations
-- **Efficient joins** - O(N+M) complexity
+The Rust core avoids Python object overhead internally, but end-to-end results
+depend on workload and binding costs. Run the checked-in benchmarks and see
+[Performance and Benchmarking](PERFORMANCE_COMPARISON.md); no fixed speedup is
+guaranteed.
 
 ## Complete Example
 
-See [test_python_bindings.py](test_python_bindings.py) for a comprehensive example covering all features.
+See [examples/test_python_bindings.py](../examples/test_python_bindings.py) for
+a compact feature demonstration. The pytest suite under `tests/python/` is the
+authoritative behavioral coverage.
 
 ```bash
-python3 test_python_bindings.py
+python3 examples/test_python_bindings.py
 ```
 
 ## Building from Source
@@ -873,11 +903,14 @@ python3 test_python_bindings.py
 ### Build Steps
 
 ```bash
+# From the repository root
+cd impl
+
 # Install maturin
 pip install maturin
 
 # Build release wheel
-maturin build --release
+env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin build --release
 
 # Install
 pip install target/wheels/livetable-*.whl
@@ -885,12 +918,13 @@ pip install target/wheels/livetable-*.whl
 # Or for development (requires virtualenv)
 python3 -m venv .venv
 source .venv/bin/activate
-maturin develop
+env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop
 ```
 
-### For Python 3.14
+### ABI forward compatibility
 
-Python 3.14 requires forward compatibility flag:
+Use the forward-compatibility flag for local Python versions newer than the
+PyO3 version's maximum recognized interpreter:
 
 ```bash
 env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin build --release
@@ -899,7 +933,6 @@ env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin build --release
 ## Implementation Details
 
 - **Language**: Rust with PyO3 bindings
-- **Lines of code**: ~700 lines of bindings
 - **PyO3 version**: 0.22
 - **Rust features**: `Rc<RefCell<>>` for shared ownership, type-safe conversions
 
@@ -942,19 +975,8 @@ order_id = row["right_order_id"] # From right table (prefixed!)
 amount = row["right_amount"]     # From right table (prefixed!)
 ```
 
-## Comparison with Pure Python
+## Implemented additions
 
-| Feature | Python (livetable) | Rust (livetable) |
-|---------|--------------|-----------------|
-| Speed | Baseline | 10-100x faster |
-| Memory | High (Python objects) | Low (Rust structs) |
-| Type Safety | Runtime | Compile-time + Runtime |
-| API | Pythonic | Pythonic (same!) |
-| Installation | `import table` | `pip install livetable` |
-
-## Future Enhancements
-
-Potential additions:
 - [x] ~~GroupBy/Aggregation support~~ ✅ **DONE!**
 - [x] ~~CSV/JSON Serialization~~ ✅ **DONE!**
 - [x] ~~Iterator protocol support~~ ✅ **DONE!**
@@ -966,6 +988,11 @@ Potential additions:
 - [x] ~~Storage hints (fast_reads/fast_updates)~~ ✅ **DONE!**
 - [x] ~~Percentile/Median aggregations (P25, P50, P75, P90, P95, P99)~~ ✅ **DONE!**
 - [x] ~~RIGHT and FULL OUTER joins~~ ✅ **DONE!**
+
+Current project-level gaps include persistence, parallel view execution, SQL
+query planning, and a published API compatibility policy. The optional
+WebSocket server is documented separately in
+[WEBSOCKET_PROTOCOL.md](WEBSOCKET_PROTOCOL.md).
 
 ## Contributing
 

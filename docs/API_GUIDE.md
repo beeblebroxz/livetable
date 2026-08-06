@@ -1,722 +1,343 @@
 # LiveTable Rust API Guide
 
-Complete guide to using the LiveTable high-performance table database system in Rust.
+This guide describes the public Rust API in `impl/src`. For the PyO3 API, see
+[PYTHON_BINDINGS_README.md](PYTHON_BINDINGS_README.md). For the optional Actix
+server, see [WEBSOCKET_PROTOCOL.md](WEBSOCKET_PROTOCOL.md).
 
----
+LiveTable is currently version `0.1.0`. Treat the API as alpha: the implemented
+surface is tested, but compatibility is not yet guaranteed across releases.
 
-## Table of Contents
+## Add the crate
 
-1. [Quick Start](#quick-start)
-2. [Core Concepts](#core-concepts)
-3. [API Reference](#api-reference)
-4. [Examples](#examples)
-5. [Performance Tuning](#performance-tuning)
-6. [Best Practices](#best-practices)
-
----
-
-## Quick Start
-
-### Installation
-
-Add to your `Cargo.toml`:
+From another local Rust project:
 
 ```toml
 [dependencies]
-livetable = { path = "path/to/livetable" }
+livetable = { path = "path/to/livetable/impl" }
 ```
 
-### Basic Usage
+The core library has no default features. Enable `server` for the Actix server
+modules or `python` when building the extension through Maturin.
+
+## Basic table usage
 
 ```rust
-use livetable::{Table, Schema, ColumnType, ColumnValue};
+use livetable::{ColumnType, ColumnValue, Schema, Table};
 use std::collections::HashMap;
 
-// Create a schema
+fn main() -> Result<(), String> {
 let schema = Schema::new(vec![
     ("id".to_string(), ColumnType::Int32, false),
     ("name".to_string(), ColumnType::String, false),
+    ("score".to_string(), ColumnType::Float64, true),
 ]);
-
-// Create a table
-let mut table = Table::new("users".to_string(), schema);
-
-// Add data
-let mut row = HashMap::new();
-row.insert("id".to_string(), ColumnValue::Int32(1));
-row.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
-table.append_row(row).unwrap();
-
-// Query data
-let value = table.get_value(0, "name").unwrap();
-assert_eq!(value.as_string(), Some("Alice"));
-```
-
----
-
-## Core Concepts
-
-### 1. Sequences
-
-Sequences are the low-level storage layer. Two implementations:
-
-- **ArraySequence**: Simple contiguous array
-  - O(1) random access (fastest)
-  - O(N) insert/delete
-  - Minimal memory overhead
-
-- **TieredVectorSequence**: Chunked storage with indirection
-  - O(1) random access (small overhead)
-  - O(sqrt(N)) insert/delete
-  - ~2*sqrt(N) memory overhead
-
-### 2. Columns
-
-Typed containers built on sequences. Support 6 types:
-
-- `Int32` / `Int64` - Signed integers
-- `Float32` / `Float64` - Floating point
-- `String` - UTF-8 strings
-- `Bool` - Boolean values
-- `Null` - For nullable columns
-
-### 3. Tables
-
-Collections of columns with a schema. Provide:
-
-- Row-level operations
-- Type safety
-- Nullable support
-- Iterator support
-
-### 4. Views
-
-Read-only derived tables:
-
-- **FilterView** - Filter rows by predicate
-- **ProjectionView** - Select specific columns
-- **ComputedView** - Add calculated columns
-
----
-
-## API Reference
-
-### Schema
-
-#### Constructor
-
-```rust
-pub fn new(columns: Vec<(String, ColumnType, bool)>) -> Self
-```
-
-Creates a schema with column definitions. Each tuple is:
-- `String` - Column name
-- `ColumnType` - Data type
-- `bool` - Nullable (true = nullable)
-
-#### Methods
-
-```rust
-pub fn len(&self) -> usize
-pub fn is_empty(&self) -> bool
-pub fn get_column_names(&self) -> Vec<&str>
-pub fn get_column_index(&self, name: &str) -> Option<usize>
-pub fn get_column_info(&self, index: usize) -> Option<(&str, ColumnType, bool)>
-```
-
-### Table
-
-#### Constructors
-
-```rust
-pub fn new(name: String, schema: Schema) -> Self
-pub fn new_with_options(name: String, schema: Schema, use_tiered_vector: bool) -> Self
-```
-
-Create a table. Use `new_with_options` with `use_tiered_vector=true` for better insert/delete performance.
-
-#### Query Methods
-
-```rust
-pub fn len(&self) -> usize
-pub fn is_empty(&self) -> bool
-pub fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String>
-pub fn get_row(&self, row: usize) -> Result<HashMap<String, ColumnValue>, String>
-pub fn iter_rows(&self) -> TableRowIterator
-```
-
-#### Mutation Methods
-
-```rust
-pub fn append_row(&mut self, row: HashMap<String, ColumnValue>) -> Result<(), String>
-pub fn insert_row(&mut self, index: usize, row: HashMap<String, ColumnValue>) -> Result<(), String>
-pub fn delete_row(&mut self, index: usize) -> Result<HashMap<String, ColumnValue>, String>
-pub fn set_value(&mut self, row: usize, column: &str, value: ColumnValue) -> Result<(), String>
-```
-
-### FilterView
-
-```rust
-pub fn new<F>(name: String, parent: Rc<RefCell<Table>>, predicate: F) -> Self
-where
-    F: Fn(&HashMap<String, ColumnValue>) -> bool + 'static
-```
-
-Create a filtered view. The predicate function receives each row and returns true/false.
-
-```rust
-pub fn len(&self) -> usize
-pub fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String>
-pub fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String>
-pub fn refresh(&mut self)  // Call after parent table changes
-```
-
-### ProjectionView
-
-```rust
-pub fn new(
-    name: String,
-    parent: Rc<RefCell<Table>>,
-    columns: Vec<String>
-) -> Result<Self, String>
-```
-
-Create a projection (column selection) view.
-
-```rust
-pub fn len(&self) -> usize
-pub fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String>
-pub fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String>
-pub fn columns(&self) -> &[String]
-```
-
-### ComputedView
-
-```rust
-pub fn new<F>(
-    name: String,
-    parent: Rc<RefCell<Table>>,
-    computed_col_name: String,
-    compute_func: F,
-) -> Self
-where
-    F: Fn(&HashMap<String, ColumnValue>) -> ColumnValue + 'static
-```
-
-Create a view with a computed column.
-
-```rust
-pub fn len(&self) -> usize
-pub fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String>
-pub fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String>
-```
-
-### ColumnValue
-
-Enum representing all supported types:
-
-```rust
-pub enum ColumnValue {
-    Int32(i32),
-    Int64(i64),
-    Float32(f32),
-    Float64(f64),
-    String(String),
-    Bool(bool),
-    Null,
-}
-```
-
-#### Helper Methods
-
-```rust
-pub fn as_i32(&self) -> Option<i32>
-pub fn as_i64(&self) -> Option<i64>
-pub fn as_f32(&self) -> Option<f32>
-pub fn as_f64(&self) -> Option<f64>
-pub fn as_string(&self) -> Option<&str>
-pub fn as_bool(&self) -> Option<bool>
-pub fn is_null(&self) -> bool
-```
-
----
-
-## Examples
-
-### Example 1: Basic CRUD Operations
-
-```rust
-use livetable::{Table, Schema, ColumnType, ColumnValue};
-use std::collections::HashMap;
-
-let schema = Schema::new(vec![
-    ("id".to_string(), ColumnType::Int32, false),
-    ("name".to_string(), ColumnType::String, false),
-    ("active".to_string(), ColumnType::Bool, false),
-]);
-
-let mut table = Table::new("users".to_string(), schema);
-
-// CREATE
-let mut row = HashMap::new();
-row.insert("id".to_string(), ColumnValue::Int32(1));
-row.insert("name".to_string(), ColumnValue::String("Alice".to_string()));
-row.insert("active".to_string(), ColumnValue::Bool(true));
-table.append_row(row).unwrap();
-
-// READ
-let value = table.get_value(0, "name").unwrap();
-println!("Name: {}", value.as_string().unwrap());
-
-// UPDATE
-table.set_value(0, "active", ColumnValue::Bool(false)).unwrap();
-
-// DELETE
-let deleted = table.delete_row(0).unwrap();
-```
-
-### Example 2: Nullable Columns
-
-```rust
-let schema = Schema::new(vec![
-    ("id".to_string(), ColumnType::Int32, false),
-    ("email".to_string(), ColumnType::String, true),  // Nullable
-]);
-
-let mut table = Table::new("users".to_string(), schema);
+let mut table = Table::new("students".to_string(), schema);
 
 let mut row = HashMap::new();
 row.insert("id".to_string(), ColumnValue::Int32(1));
-row.insert("email".to_string(), ColumnValue::Null);  // No email
-table.append_row(row).unwrap();
-
-// Check for null
-let email = table.get_value(0, "email").unwrap();
-if email.is_null() {
-    println!("No email provided");
-}
-```
-
-### Example 3: FilterView
-
-```rust
-use std::rc::Rc;
-use std::cell::RefCell;
-use livetable::FilterView;
-
-let table = Rc::new(RefCell::new(Table::new("products".to_string(), schema)));
-
-// Add products...
-
-// Filter for expensive items
-let expensive = FilterView::new(
-    "expensive".to_string(),
-    table.clone(),
-    |row| {
-        if let Some(ColumnValue::Float64(price)) = row.get("price") {
-            *price > 100.0
-        } else {
-            false
-        }
-    }
+row.insert(
+    "name".to_string(),
+    ColumnValue::String("Alice".to_string()),
 );
-
-println!("Expensive items: {}", expensive.len());
-```
-
-### Example 4: ProjectionView
-
-```rust
-let public_view = ProjectionView::new(
-    "public".to_string(),
-    table.clone(),
-    vec!["id".to_string(), "name".to_string()],  // Exclude sensitive columns
-).unwrap();
-
-// Can only access projected columns
-let row = public_view.get_row(0).unwrap();
-assert!(row.contains_key("id"));
-assert!(row.contains_key("name"));
-assert!(!row.contains_key("password"));  // Excluded
-```
-
-### Example 5: ComputedView
-
-```rust
-let with_total = ComputedView::new(
-    "with_total".to_string(),
-    table.clone(),
-    "total".to_string(),
-    |row| {
-        let price = match row.get("price") {
-            Some(ColumnValue::Float64(p)) => *p,
-            _ => 0.0,
-        };
-        let qty = match row.get("quantity") {
-            Some(ColumnValue::Int32(q)) => *q as f64,
-            _ => 0.0,
-        };
-        ColumnValue::Float64(price * qty)
-    }
-);
-
-let total = with_total.get_value(0, "total").unwrap();
-```
-
-### Example 6: Iteration
-
-```rust
-// Iterate over all rows
-for (i, row) in table.iter_rows().enumerate() {
-    println!("Row {}: {:?}", i, row);
-}
-
-// Or manually
-for i in 0..table.len() {
-    let row = table.get_row(i).unwrap();
-    // Process row...
-}
-```
-
-### Example 7: Performance Optimization
-
-```rust
-// For insert-heavy workloads, use TieredVector
-let mut table = Table::new_with_options(
-    "logs".to_string(),
-    schema,
-    true  // use_tiered_vector
-);
-
-// Now inserts in the middle are O(sqrt(N)) instead of O(N)
-for i in 0..10000 {
-    table.insert_row(table.len() / 2, row.clone()).unwrap();
-}
-```
-
----
-
-## Performance Tuning
-
-### Choosing Storage Backend
-
-#### Use Array-based (default) when:
-- ✅ Read-heavy workloads (99%+ reads)
-- ✅ Append-only operations
-- ✅ Memory constrained
-- ✅ Want fastest possible random access
-
-#### Use TieredVector when:
-- ✅ Frequent random inserts/deletes
-- ✅ Large tables (> 10,000 rows) with mixed operations
-- ✅ Can tolerate ~10-20% memory overhead
-- ✅ Need predictable insert performance
-
-### Performance Characteristics
-
-| Operation | Array | TieredVector |
-|-----------|-------|--------------|
-| Random Access | 500 ps | 2-40 ns |
-| Append | ~280 ns | ~560 ns |
-| Insert (middle) | O(N) | O(sqrt(N)) |
-| Delete | O(N) | O(sqrt(N)) |
-| Memory | Minimal | +O(sqrt(N)) |
-
-### Tips
-
-1. **Batch Operations**: Group multiple inserts/deletes
-   ```rust
-   // Good
-   for row in rows {
-       table.append_row(row)?;
-   }
-   ```
-
-2. **Reuse HashMaps**: Avoid allocating for each row
-   ```rust
-   let mut row = HashMap::new();
-   for i in 0..n {
-       row.clear();
-       row.insert("id".to_string(), ColumnValue::Int32(i));
-       table.append_row(row.clone())?;
-   }
-   ```
-
-3. **Use Views Wisely**: Views add overhead
-   - Refresh FilterView only when needed
-   - Chain views sparingly
-   - Consider materializing frequently-accessed views
-
-4. **Pattern Matching**: Use `match` for type extraction
-   ```rust
-   // Good
-   match value {
-       ColumnValue::Int32(i) => println!("{}", i),
-       ColumnValue::String(s) => println!("{}", s),
-       _ => {}
-   }
-
-   // Less efficient
-   if let Some(i) = value.as_i32() {
-       println!("{}", i);
-   } else if let Some(s) = value.as_string() {
-       println!("{}", s);
-   }
-   ```
-
----
-
-## Best Practices
-
-### 1. Error Handling
-
-Always handle `Result` types:
-
-```rust
-// Good
-match table.append_row(row) {
-    Ok(()) => println!("Success"),
-    Err(e) => eprintln!("Error: {}", e),
-}
-
-// Or use ? operator
+row.insert("score".to_string(), ColumnValue::Float64(95.5));
 table.append_row(row)?;
-```
 
-### 2. Schema Design
-
-```rust
-// Good: Clear names, appropriate types
-let schema = Schema::new(vec![
-    ("user_id".to_string(), ColumnType::Int64, false),
-    ("email".to_string(), ColumnType::String, false),
-    ("age".to_string(), ColumnType::Int32, true),  // Optional
-]);
-
-// Avoid: Unclear names, wrong types
-let schema = Schema::new(vec![
-    ("id".to_string(), ColumnType::String, false),  // IDs should be numeric
-    ("data".to_string(), ColumnType::String, false),  // Too generic
-]);
-```
-
-### 3. View Ownership
-
-Use `Rc<RefCell<>>` for shared table access:
-
-```rust
-use std::rc::Rc;
-use std::cell::RefCell;
-
-let table = Rc::new(RefCell::new(Table::new(...)));
-
-// Multiple views can reference the same table
-let view1 = FilterView::new(..., table.clone(), ...);
-let view2 = ProjectionView::new(..., table.clone(), ...);
-
-// Modify table through RefCell
-{
-    let mut t = table.borrow_mut();
-    t.append_row(row)?;
-}
-
-// Refresh views if needed
-view1.refresh();
-```
-
-### 4. Type Safety
-
-Leverage Rust's type system:
-
-```rust
-// Extract values safely
-let value = table.get_value(0, "age")?;
-if let ColumnValue::Int32(age) = value {
-    if age >= 18 {
-        println!("Adult");
-    }
-}
-
-// Or use helper methods
-if let Some(age) = value.as_i32() {
-    println!("Age: {}", age);
+assert_eq!(table.len(), 1);
+assert_eq!(table.get_value(0, "name")?.as_string(), Some("Alice"));
+Ok(())
 }
 ```
 
-### 5. Memory Management
+Rows are `HashMap<String, ColumnValue>`. A mutation is schema-validated before
+it is committed; missing non-nullable columns, unknown columns, and incompatible
+values return an error.
+
+## Types and schemas
+
+`ColumnType` supports:
+
+| Variant | Stored value |
+|---------|--------------|
+| `Int32` | `i32` |
+| `Int64` | `i64` |
+| `Float32` | `f32` |
+| `Float64` | `f64` |
+| `String` | UTF-8 `String` |
+| `Bool` | `bool` |
+| `Date` | days since 1970-01-01 |
+| `DateTime` | milliseconds since 1970-01-01 |
+
+Nullability belongs to the schema. `ColumnValue::Null` is the value used for a
+nullable cell; it is not a separate column type.
+
+Useful `Schema` methods:
 
 ```rust
-// Good: Drop large tables when done
-{
-    let mut temp_table = Table::new(...);
-    // Use table...
-}  // Table dropped here, memory freed
-
-// Good: Clear views you no longer need
-drop(expensive_view);
+schema.len();
+schema.is_empty();
+schema.get_column_names();
+schema.get_column_index("score");
+schema.get_column_info(2);
+schema.get_column_type("score");
+schema.is_column_nullable("score");
 ```
 
-### 6. Testing
+## Storage backends
+
+The default `Table::new` uses `StorageHint::FastReads` (`ArraySequence`). Use a
+tiered vector for frequent middle inserts/deletes:
 
 ```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
+use livetable::{StorageHint, Table};
 
-    #[test]
-    fn test_table_operations() {
-        let schema = Schema::new(vec![
-            ("id".to_string(), ColumnType::Int32, false),
-        ]);
-        let mut table = Table::new("test".to_string(), schema);
-
-        let mut row = HashMap::new();
-        row.insert("id".to_string(), ColumnValue::Int32(42));
-        table.append_row(row).unwrap();
-
-        assert_eq!(table.len(), 1);
-        assert_eq!(
-            table.get_value(0, "id").unwrap().as_i32(),
-            Some(42)
-        );
-    }
-}
-```
-
----
-
-## Common Patterns
-
-### Pattern 1: ETL Pipeline
-
-```rust
-// Extract from source
-let raw_data = load_csv("data.csv");
-
-// Transform with computed view
-let transformed = ComputedView::new(
-    "transformed".to_string(),
-    raw_data.clone(),
-    "normalized_price".to_string(),
-    |row| {
-        // Normalization logic
-        ColumnValue::Float64(normalize(row))
-    }
-);
-
-// Load with filtering
-let valid_only = FilterView::new(
-    "valid".to_string(),
-    raw_data.clone(),
-    |row| validate(row)
+let table = Table::with_hint(
+    "orderbook".to_string(),
+    schema,
+    StorageHint::FastUpdates,
 );
 ```
 
-### Pattern 2: Data Validation
+| Hint | Backend | Random access | Middle insert/delete |
+|------|---------|---------------|----------------------|
+| `FastReads` | `ArraySequence` | O(1) | O(N) |
+| `FastUpdates` | `TieredVectorSequence` | O(1) | O(√N) |
+
+`Table::with_hint_and_interning` additionally enables string interning. It is
+most useful when string values repeat frequently.
+
+## Table API
+
+Important query and mutation methods:
 
 ```rust
-let errors = FilterView::new(
-    "errors".to_string(),
+table.len();
+table.is_empty();
+table.name();
+table.schema();
+table.get_row(index)?;
+table.get_value(index, "column")?;
+table.set_value(index, "column", value)?;
+table.append_row(row)?;
+table.append_rows(rows)?;
+table.insert_row(index, row)?;
+table.delete_row(index)?;
+```
+
+The table also provides numeric reductions:
+
+```rust
+table.sum("score")?;
+table.count_non_null("score")?;
+table.avg("score")?;
+table.min("score")?;
+table.max("score")?;
+```
+
+`filter_expr` evaluates a SQL-like expression in Rust and returns matching base
+row indices:
+
+```rust
+let indices = table.filter_expr("score >= 90 AND name != 'Test'")?;
+```
+
+Supported expression features are `=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`,
+`OR`, `NOT`, parentheses, `IS NULL`, and `IS NOT NULL`. Comparisons with NULL
+are false.
+
+## Serialization
+
+```rust
+let csv = table.to_csv();
+let json = table.to_json()?;
+
+let csv_table = Table::from_csv("csv" , &csv)?;
+let json_table = Table::from_json("json", &json)?;
+```
+
+Imports infer each column by scanning all rows. Numeric types widen as needed;
+dates widen to datetimes; all-null columns default to string. JSON rejects
+incompatible mixed types, while CSV may fall back to string.
+
+## Views and composition
+
+Every table and view implements `ReadableTable`. A view parent is therefore an
+`Rc<RefCell<dyn ReadableTable>>`, which permits view-over-view DAGs without
+copying the source rows. The following focused fragments use `?` and assume a
+surrounding function that returns `Result<(), String>`.
+
+### Filter, projection, and computed views
+
+```rust
+use livetable::{ColumnValue, ComputedView, FilterView, ProjectionView, Table};
+use std::{cell::RefCell, rc::Rc};
+
+let table = Rc::new(RefCell::new(table));
+
+let filtered = Rc::new(RefCell::new(FilterView::new(
+    "passing".to_string(),
     table.clone(),
-    |row| {
-        // Validation rules
-        match (row.get("email"), row.get("age")) {
-            (Some(ColumnValue::String(e)), Some(ColumnValue::Int32(a))) => {
-                !e.contains('@') || *a < 0
-            }
-            _ => true,  // Missing required fields
-        }
-    }
-);
+    |row| row.get("score").and_then(ColumnValue::as_f64).unwrap_or(0.0) >= 90.0,
+)));
 
-if errors.len() > 0 {
-    println!("Found {} validation errors", errors.len());
-}
+let projected = ProjectionView::new(
+    "names".to_string(),
+    filtered.clone(),
+    vec!["name".to_string(), "score".to_string()],
+)?;
+
+let computed = ComputedView::new(
+    "graded".to_string(),
+    filtered.clone(),
+    "passed".to_string(),
+    |_| ColumnValue::Bool(true),
+);
 ```
 
-### Pattern 3: Reporting
+`ProjectionView` and `ComputedView` read through to their parent and need no
+sync. `FilterView` tracks an index and offers `sync()` for incremental updates
+or `refresh()` for a full rebuild.
+
+### Sorting
 
 ```rust
-// Create summary views
-let summary = ComputedView::new(
-    "summary".to_string(),
-    sales.clone(),
-    "profit_margin".to_string(),
-    |row| {
-        let revenue = row.get("revenue").unwrap().as_f64().unwrap();
-        let cost = row.get("cost").unwrap().as_f64().unwrap();
-        ColumnValue::Float64((revenue - cost) / revenue * 100.0)
-    }
-);
+use livetable::{SortKey, SortedView};
 
-// Filter high performers
-let top_performers = FilterView::new(
-    "top".to_string(),
-    sales.clone(),
-    |row| {
-        if let Some(ColumnValue::Float64(margin)) = row.get("profit_margin") {
-            *margin > 20.0
-        } else {
-            false
-        }
-    }
-);
+let sorted = Rc::new(RefCell::new(SortedView::new(
+    "ranked".to_string(),
+    filtered.clone(),
+    vec![SortKey::descending("score"), SortKey::ascending("name")],
+)?));
 ```
 
----
+`SortKey::new(column, order, nulls_first)` provides explicit null ordering.
+`SortedView::sync()` updates the sorted index; `refresh()` rebuilds it.
 
-## Limitations & Roadmap
+### Aggregation
 
-### Current Limitations
+```rust
+use livetable::{AggregateFunction, AggregateView};
 
-1. **No GroupBy/Aggregations** (yet)
-   - Workaround: Manual aggregation in application code
+let grouped = Rc::new(RefCell::new(AggregateView::new(
+    "by_department".to_string(),
+    table.clone(),
+    vec!["department".to_string()],
+    vec![
+        ("total".to_string(), "salary".to_string(), AggregateFunction::Sum),
+        ("count".to_string(), "salary".to_string(), AggregateFunction::Count),
+        (
+            "p95".to_string(),
+            "salary".to_string(),
+            AggregateFunction::Percentile(0.95),
+        ),
+    ],
+)?));
+```
 
-2. **Manual View Refresh**
-   - Views don't auto-update when parent changes
-   - Must call `refresh()` on FilterView
+Supported functions are `Sum`, `Count`, `Avg`, `Min`, `Max`, `Median`, and
+`Percentile(f64)`. Count is non-null count of its source column. NaN aggregate
+values are excluded like NULL; NaN group keys form one canonical group and
+`-0.0` groups with `0.0`.
 
-3. **Single-threaded**
-   - No parallel operations
-   - Future: Rayon integration
+### Joins
 
-### Planned Features
+```rust
+use livetable::{JoinType, JoinView};
 
-- ✨ GroupBy and aggregations
-- ✨ Join operations
-- ✨ Sorting and indexing
-- ✨ Persistence (save/load)
-- ✨ SQL-like query interface
-- ✨ Parallel operations
+let joined = Rc::new(RefCell::new(JoinView::new(
+    "user_orders".to_string(),
+    users.clone(),
+    orders.clone(),
+    "id".to_string(),
+    "user_id".to_string(),
+    JoinType::Left,
+)?));
 
----
+let composite = JoinView::new_multi(
+    "monthly_targets".to_string(),
+    sales.clone(),
+    targets.clone(),
+    vec!["year".to_string(), "month".to_string()],
+    vec!["year".to_string(), "month".to_string()],
+    JoinType::Full,
+)?;
+```
 
-## API Stability
+LiveTable implements `Left`, `Inner`, `Right`, and `Full` joins. NULL and NaN
+keys do not match. Right-side output columns are prefixed with `right_`.
+`JoinView::sync()` incrementally consumes changes from both parents;
+`refresh()` performs a complete rebuild. See [JOIN_FEATURE.md](JOIN_FEATURE.md)
+for details.
 
-Current version: **0.1.0** (Alpha)
+## Automatic propagation with `TickableTable`
 
-- Core APIs (Table, Schema, Sequence, Column) are stable
-- View APIs may change as we add auto-propagation
-- No breaking changes to storage format planned
+Register stateful views in topological order, mutate the root, then call
+`tick()`. It synchronizes registered views before compacting the root
+changeset.
 
----
+```rust
+use livetable::TickableTable;
 
-## Getting Help
+let tickable = TickableTable::new(table.clone());
+tickable.register_filter(&filtered);
+tickable.register_sorted(&sorted);
+tickable.register_aggregate(&grouped);
 
-- **Examples**: See `examples/` directory
-- **Tests**: Check `src/*/tests` modules
-- **Benchmarks**: Run `cargo bench`
-- **Documentation**: Run `cargo doc --open`
+table.borrow_mut().append_row(new_row)?;
+let live_views = tickable.tick();
+```
 
----
+For joins, register the same `Rc<RefCell<JoinView>>` with
+`register_join_as_left` on the left root and `register_join_as_right` on the
+right root. Registration uses weak references, so dropped views are pruned on a
+later tick.
 
-## Performance Comparison
+The incremental fast path is optimized for one mutation per tick. A stateful
+view falls back to a full rebuild when a multi-change batch cannot be replayed
+safely.
 
-LiveTable Rust vs Python implementation:
+## Changesets and versions
 
-- **10-1000x faster** across most operations
-- **Sub-nanosecond** random access (500 picoseconds!)
-- **Better scaling** characteristics
-- **Lower memory** usage (3-6x less)
+Root mutations append `TableChange` entries and increment `Table::version()`.
+`Changeset::total_len()` is an absolute monotonic change count even after
+compaction. Stateful views keep their own cursor; composed views include parent
+versions so staleness flows through the DAG.
 
-See [PERFORMANCE_COMPARISON.md](PERFORMANCE_COMPARISON.md) for detailed benchmarks.
+Prefer `TickableTable::tick()` over manually clearing a changeset. Clearing or
+compacting changes before registered views synchronize can force a rebuild or
+lose the incremental path.
+
+## Optional server API
+
+With the `server` feature, the crate exports:
+
+- `messages`: protocol-v2 wire types.
+- `pipeline_spec`: bounded wire-spec validation and view construction.
+- `engine`: the single-threaded table/pipeline owner.
+- `websocket`: the Actix actor transport.
+- `server`: HTTP/WebSocket server construction.
+
+Run it with:
+
+```bash
+cd impl
+cargo run --bin livetable-server --features server
+```
+
+The server is an in-memory demo service, not a persistence or authentication
+layer. See [WEBSOCKET_PROTOCOL.md](WEBSOCKET_PROTOCOL.md).
+
+## Verification
+
+From the repository root:
+
+```bash
+cd impl
+cargo test --lib
+cargo test --lib --features server
+cargo test --test forward_prop_fuzz
+cargo test --features server --test protocol_v2_websocket
+cargo doc --no-deps
+```
+
+Python builds should additionally set `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`
+as documented in [PYTHON_BINDINGS_README.md](PYTHON_BINDINGS_README.md).

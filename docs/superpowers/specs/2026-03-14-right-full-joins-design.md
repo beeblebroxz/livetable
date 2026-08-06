@@ -1,7 +1,7 @@
 # Design: RIGHT and FULL OUTER Joins + tick() Integration
 
 **Date:** 2026-03-14
-**Status:** Approved
+**Status:** Implemented
 **Scope:** Add RIGHT and FULL OUTER join types to JoinView, integrate JoinView with tick() auto-propagation
 
 ---

@@ -215,7 +215,7 @@ Next steps:
 1. Watch reactive propagation: python3 demo_reactive_propagation.py
 2. Experiment in the playground: python3 playground.py
 3. Try real-time streaming: python3 streaming_publisher.py (with WebSocket server)
-4. Read the full guide: docs/PYTHON_BINDINGS_README.md
+4. Read the full guide: ../docs/PYTHON_BINDINGS_README.md
 
 Happy coding with Rust-powered tables! 🚀
 """)

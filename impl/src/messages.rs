@@ -105,8 +105,8 @@ pub enum ClientMessage {
 /// Messages sent from server to client
 ///
 /// `TableData` and every incremental delta carry a `seq`: the table's total
-/// change count (`Changeset::total_len`) captured under the same lock as the
-/// snapshot or mutation it describes. Because that counter is monotonic, a
+/// change count (`Changeset::total_len`) captured in the same serialized engine
+/// operation as the snapshot or mutation it describes. Because that counter is monotonic, a
 /// client can reconcile a snapshot with concurrently-broadcast deltas: any
 /// delta whose `seq` is <= the snapshot's `seq` is already reflected in the
 /// snapshot and must be dropped, while a delta with a greater `seq` is newer

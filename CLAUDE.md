@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LiveTable is a high-performance columnar table system written in Rust with Python bindings via PyO3. It provides 10-100x faster operations compared to pure Python implementations through zero-copy views and lazy evaluation.
+LiveTable is a high-performance columnar table system written in Rust with Python bindings via PyO3. It focuses on typed row operations, zero-copy view DAGs, and incremental change propagation; benchmark claims must be tied to the checked-in harnesses and a recorded environment.
 
 ## Original Design Vision
 
@@ -29,6 +29,7 @@ Key principles from the original vision:
 2. **CLAUDE.md** - Python API Usage section (this file)
 3. **docs/PYTHON_BINDINGS_README.md** - Full API reference and examples
 4. **docs/ORIGINAL_VISION.md** - Mark implemented features as complete
+5. **docs/WEBSOCKET_PROTOCOL.md** - Wire changes, sequencing, and limits (server feature only)
 
 **Checklist for new features:**
 - [ ] Add to README.md Features section
@@ -59,11 +60,14 @@ cd impl && cargo build --bin livetable-server --features server
 ## Test Commands
 
 ```bash
-# Run all tests (Rust + Python + Integration)
+# Run standard Rust/Python/frontend checks
 cd tests && ./run_all.sh
 
 # Rust tests only
-cd impl && env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib
+cd impl && cargo test --lib --features server
+
+# Real WebSocket protocol integration test
+cd impl && cargo test --features server --test protocol_v2_websocket
 
 # Python tests only
 cd tests && pytest python/ -v
@@ -103,13 +107,14 @@ cd frontend && npm install && npm run dev
 - Chained views set `last_processed_change_count = usize::MAX` (no root-changeset cursor) — neutral in tick()'s min-cursor compaction folds. Keep that sentinel when adding cursor consumers.
 - Python lambdas are converted to Rust closures for filter/computed operations
 - Join operations use O(N+M) algorithm
-- WebSocket protocol: `UpdateCell`, `AddRow`, `DeleteRow` messages with broadcast to all clients
-- WebSocket reconciliation: every `TableData` and delta carries a monotonic `seq` (the table's `Changeset::total_len`, read under the same lock as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. This closes a snapshot/delta race where a concurrent insert during subscribe could otherwise be applied twice. Keep `seq` populated when adding new server→client messages.
+- WebSocket base protocol: `Subscribe`, `Query`, `InsertRow`, `UpdateCell`, and `DeleteRow`; successful mutations broadcast `RowInserted`, `CellUpdated`, and `RowDeleted` to base subscribers
+- WebSocket reconciliation: every `TableData` and delta carries a monotonic `seq` (the table's `Changeset::total_len`, captured in the same serialized engine operation as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. This closes a snapshot/delta race where an insert around subscribe could otherwise be applied twice. Keep `seq` populated when adding new server→client messages.
 - WebSocket gap recovery: deltas only apply contiguously (`seq == applied + 1`); if a gap persists for `SEQ_GAP_REQUERY_MS` the client re-sends `Query` and re-baselines from the fresh snapshot (`useTableWebSocket.ts`). The pending-delta buffer is capped at `MAX_PENDING_DELTAS` (oldest evicted; the resulting gap heals via re-query). Cell edits are server-authoritative: on blur the input snaps back to the last confirmed value and only the `CellUpdated` broadcast echo moves it forward, so rejected updates (e.g. null into a non-nullable column) self-heal.
 - WebSocket `Subscribed` carries `protocol_version` (`messages::PROTOCOL_VERSION`); the client warns on mismatch with `SUPPORTED_PROTOCOL_VERSION`. Bump both on breaking wire changes.
-- WebSocket protocol v2 pipeline messages carry a client-selected `pipeline_generation` on `SetPipeline`, `ViewData`, and `ViewError`. Reconcile derived snapshots by `(pipeline_generation, node_id, seq)`: a newer generation replaces all older pipeline state, while `seq` is only compared within the same generation.
+- WebSocket protocol v2 pipeline messages carry a client-selected `pipeline_generation` on `SetPipeline`, `ViewData`, and `ViewError`. Reconcile responses by `(pipeline_generation, node_id, seq)`: ignore non-current generations and compare `seq` only within one generation/node. The current `usePipeline` retains an old snapshot until current-generation data for that node ID arrives; changing/removing node IDs requires explicitly clearing or filtering snapshot state.
 - `ViewData` uses `WireViewRow { row_id: Option<u64>, row }`; derived rows without stable identity serialize `row_id: null`. Never use `u64::MAX` as a JavaScript sentinel. Pipeline `count` is `COUNT(column)` and every aggregate spec therefore requires a source `column`.
 - Run `pipeline_spec::validate_pipeline_spec()` before allocating views. It enforces ordered/acyclic sources, unique non-reserved node IDs, required node fields, and protocol resource limits.
+- The canonical wire reference is `docs/WEBSOCKET_PROTOCOL.md`; update it whenever message shapes, limits, generation rules, or sequence semantics change.
 - `Table::from_json`/`from_csv` infer each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null/empty → STRING); values are then converted against the inferred schema, not in isolation. JSON rejects incompatible mixes (number + string) at inference with a clear error; CSV falls back to STRING since every CSV value is a string at heart.
 - Iterator mutation guards: every Py iterator (table and all six views) captures a version at `__iter__` and raises `RuntimeError` from `__next__` if it changes. View iterators use `ReadableTable::version()` (own sync counter + parent version), so both parent mutations and `sync()`/`refresh()` trip the guard.
 - JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
@@ -178,7 +183,7 @@ filtered = table.filter(lambda row: row["score"] >= 90)
 projected = table.select(["name", "score"])
 computed = table.add_computed_column("grade", lambda row: "A" if row["score"] >= 90 else "B")
 
-# Expression-based filtering (2x faster than lambda)
+# Expression-based filtering (runs in Rust without a Python callback)
 indices = table.filter_expr("score >= 90 AND name != 'Test'")
 # Supports: =, !=, <, >, <=, >=, AND, OR, NOT, IS NULL, IS NOT NULL
 
