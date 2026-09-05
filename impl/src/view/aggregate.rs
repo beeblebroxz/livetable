@@ -50,6 +50,58 @@ pub struct AggregateView {
     last_parent_version: u64,
 }
 
+/// Temporary identities for a batch with multiple insertions/deletions. Old
+/// rows keep their pre-batch index as identity; inserted rows get fresh IDs.
+/// Replay aggregates against these identities, then remap the index hashes
+/// once, before MIN/MAX rescans. No source rows or aggregate values are copied.
+struct BatchRowMapping {
+    event_rows: Vec<usize>,
+    final_positions: Vec<usize>,
+}
+
+impl BatchRowMapping {
+    fn new(final_len: usize, changes: &[TableChange]) -> Option<Self> {
+        let mut initial_len = final_len;
+        for change in changes.iter().rev() {
+            match change {
+                TableChange::RowInserted { .. } => initial_len = initial_len.checked_sub(1)?,
+                TableChange::RowDeleted { .. } => initial_len = initial_len.checked_add(1)?,
+                _ => {}
+            }
+        }
+        let mut identities: Vec<usize> = (0..initial_len).collect();
+        let mut next_id = initial_len;
+        let mut event_rows = Vec::with_capacity(changes.len());
+        for change in changes {
+            let row = match change {
+                TableChange::RowInserted { index, .. } => {
+                    if *index > identities.len() {
+                        return None;
+                    }
+                    let id = next_id;
+                    next_id += 1;
+                    identities.insert(*index, id);
+                    id
+                }
+                TableChange::RowDeleted { index, .. } => {
+                    identities.get(*index)?;
+                    identities.remove(*index)
+                }
+                TableChange::CellUpdated { row, .. } => *identities.get(*row)?,
+            };
+            event_rows.push(row);
+        }
+        let mut final_positions = vec![usize::MAX; next_id];
+        for (position, identity) in identities.into_iter().enumerate() {
+            final_positions[identity] = position;
+        }
+        Some(Self {
+            event_rows,
+            final_positions,
+        })
+    }
+}
+
 impl AggregateView {
     pub fn new(
         name: String,
@@ -456,7 +508,9 @@ impl AggregateView {
     }
 
     pub(crate) fn root_changeset_cursor(&self) -> usize {
-        self.parent.borrow().root_changeset_cursor(self.last_processed_change_count)
+        self.parent
+            .borrow()
+            .root_changeset_cursor(self.last_processed_change_count)
     }
 
     pub fn len(&self) -> usize {
@@ -586,7 +640,9 @@ impl IncrementalView for AggregateView {
                 }
                 let row = row_after_update(changes, index, |i| self.parent.borrow().get_row(i));
                 match row {
-                    Ok(row) => { updated_rows.insert(index, row); }
+                    Ok(row) => {
+                        updated_rows.insert(index, row);
+                    }
                     Err(_) => {
                         self.rebuild_index();
                         return true;
@@ -594,6 +650,29 @@ impl IncrementalView for AggregateView {
                 }
             }
         }
+        // A sort move emits delete + insert. Rehashing all row indices after
+        // each event makes even a small batch slower than a rebuild. Simulate
+        // bounded batches with cheap vector shifts and rehash just once.
+        // The doubled bound also covers 256 sort updates emitting 512 events.
+        let batch_rows = if changes.len() <= MAX_FILTER_REPLAY_CHANGES * 2
+            && changes
+                .iter()
+                .filter(|c| c.shifts_indices())
+                .take(2)
+                .count()
+                == 2
+        {
+            let prepared = BatchRowMapping::new(self.parent.borrow().len(), changes);
+            match prepared {
+                Some(mapping) => Some(mapping),
+                None => {
+                    self.rebuild_index();
+                    return true;
+                }
+            }
+        } else {
+            None
+        };
         let mut modified = false;
         // MIN/MAX (and sorted_values) recalcs are DEFERRED to the end of the
         // batch. `recalculate_group_column_min_max` reads the parent at the
@@ -604,25 +683,33 @@ impl IncrementalView for AggregateView {
         let mut pending_recalc: HashSet<(GroupKey, String)> = HashSet::new();
 
         for (change_index, change) in changes.iter().enumerate() {
+            let row_id = batch_rows.as_ref().map_or_else(
+                || change.row_index(),
+                |mapping| mapping.event_rows[change_index],
+            );
             match change {
                 TableChange::RowInserted { index, data } => {
                     // Adjust existing row indices
-                    self.adjust_indices_for_insert(*index);
+                    if batch_rows.is_none() {
+                        self.adjust_indices_for_insert(*index);
+                    }
                     // Add the new row to aggregates
-                    self.add_row_to_aggregates(*index, data);
+                    self.add_row_to_aggregates(row_id, data);
                     modified = true;
                 }
 
                 TableChange::RowDeleted { index, data } => {
                     // Remove from aggregates (records any MIN/MAX recalc needed)
-                    self.remove_row_from_aggregates(*index, data, &mut pending_recalc);
+                    self.remove_row_from_aggregates(row_id, data, &mut pending_recalc);
                     // Adjust remaining row indices
-                    self.adjust_indices_for_delete(*index);
+                    if batch_rows.is_none() {
+                        self.adjust_indices_for_delete(*index);
+                    }
                     modified = true;
                 }
 
                 TableChange::CellUpdated {
-                    row,
+                    row: _,
                     column,
                     old_value,
                     new_value,
@@ -632,8 +719,8 @@ impl IncrementalView for AggregateView {
                         let new_row = &updated_rows[&change_index];
                         let mut old_row = new_row.clone();
                         old_row.insert(column.clone(), old_value.clone());
-                        self.remove_row_from_aggregates(*row, &old_row, &mut pending_recalc);
-                        self.add_row_to_aggregates(*row, new_row);
+                        self.remove_row_from_aggregates(row_id, &old_row, &mut pending_recalc);
+                        self.add_row_to_aggregates(row_id, new_row);
                         modified = true;
                     } else {
                         // Check if aggregated column changed
@@ -641,7 +728,7 @@ impl IncrementalView for AggregateView {
                             self.aggregations.iter().any(|(_, src, _)| src == column);
                         if affects_aggregation {
                             // Update the aggregate values
-                            if let Some(key) = self.row_to_group.get(row).cloned() {
+                            if let Some(key) = self.row_to_group.get(&row_id).cloned() {
                                 let mut needs_recalc = false;
 
                                 // Remove old value
@@ -666,6 +753,35 @@ impl IncrementalView for AggregateView {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        if let Some(mapping) = batch_rows {
+            let positions = &mapping.final_positions;
+            // Temporary inserted-and-deleted rows often leave the permutation
+            // unchanged. In that case even the final rehash is unnecessary.
+            if positions
+                .iter()
+                .enumerate()
+                .any(|(id, &pos)| pos != usize::MAX && pos != id)
+            {
+                self.row_to_group = std::mem::take(&mut self.row_to_group)
+                    .into_iter()
+                    .map(|(id, key)| {
+                        debug_assert_ne!(
+                            positions[id],
+                            usize::MAX,
+                            "deleted identity still in aggregate"
+                        );
+                        (positions[id], key)
+                    })
+                    .collect();
+                for state in self.groups.values_mut() {
+                    state.row_indices = std::mem::take(&mut state.row_indices)
+                        .into_iter()
+                        .map(|id| positions[id])
+                        .collect();
                 }
             }
         }
@@ -744,7 +860,6 @@ impl AggregateView {
             }
         }
     }
-
 }
 
 impl ReadableTable for AggregateView {

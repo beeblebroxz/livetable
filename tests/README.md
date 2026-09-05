@@ -71,6 +71,9 @@ cargo test --test forward_prop_fuzz
 # Filter pipeline correctness, bounded work, history, and compaction contracts
 cargo test --features server --test filter_pipeline
 
+# Sorted-coordinate replay, move batches, downstream consumers, and bounded reads
+cargo test --features server --test sorted_pipeline
+
 # Real TCP/WebSocket protocol-v2 integration test
 cargo test --features server --test protocol_v2_websocket
 ```

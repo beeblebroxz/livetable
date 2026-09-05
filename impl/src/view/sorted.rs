@@ -1,7 +1,8 @@
 //! SortedView — multi-key sorted view with incremental re-sort.
 
-use crate::changeset::{IncrementalView, TableChange};
+use crate::changeset::{Changeset, IncrementalView, TableChange};
 use crate::column::{ColumnType, ColumnValue};
+use crate::filter_changes::{row_after_update, MAX_FILTER_REPLAY_CHANGES};
 use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -60,7 +61,9 @@ impl SortKey {
 /// A SortedView presents rows from the parent table in sorted order.
 ///
 /// The view maintains a sorted index mapping from view positions to parent table
-/// row indices. Sorting is performed on construction and after refresh/sync.
+/// row indices, its inverse, and cached sort-key columns (not complete rows).
+/// Small batches replay against those historical keys and emit changes in
+/// sorted coordinates. Refresh, large batches, or missing history rebuild.
 ///
 /// # Features
 ///
@@ -127,6 +130,11 @@ pub struct SortedView {
     sort_keys: Vec<SortKey>,
     /// Sorted index: sorted_index[view_pos] = parent_row_index
     sorted_index: Vec<usize>,
+    /// Inverse permutation: parent_to_view[parent_row] = view_pos.
+    parent_to_view: Vec<usize>,
+    /// Only sort-key columns, in parent order at the last processed event.
+    sort_values: Vec<Vec<ColumnValue>>,
+    output_changes: Changeset,
     /// Last synced generation from the parent's changeset.
     last_synced_generation: u64,
     /// Number of changes already processed (absolute index). `usize::MAX`
@@ -183,6 +191,9 @@ impl SortedView {
             parent,
             sort_keys,
             sorted_index: Vec::new(),
+            parent_to_view: Vec::new(),
+            sort_values: Vec::new(),
+            output_changes: Changeset::new(),
             last_synced_generation: generation,
             last_processed_change_count: change_count,
             sync_count: 0,
@@ -208,7 +219,7 @@ impl SortedView {
             .collect();
 
         // Pre-extract values for each sort key column
-        let sort_values: Vec<Vec<ColumnValue>> = sort_col_indices
+        self.sort_values = sort_col_indices
             .iter()
             .map(|&col_idx| {
                 (0..len)
@@ -221,19 +232,15 @@ impl SortedView {
             })
             .collect();
 
-        // Sort using pre-extracted values (reference, no clone needed)
-        self.sorted_index.sort_by(|&a, &b| {
-            for (key_idx, key) in sort_keys.iter().enumerate() {
-                let val_a = &sort_values[key_idx][a];
-                let val_b = &sort_values[key_idx][b];
-
-                let cmp = Self::compare_values(val_a, val_b, key);
-                if cmp != Ordering::Equal {
-                    return cmp;
-                }
-            }
-            Ordering::Equal
-        });
+        // Sort using cached values and the same parent-index tie break used
+        // by incremental insertion. Only sort columns are materialized.
+        let sort_values = &self.sort_values;
+        self.sorted_index
+            .sort_by(|&a, &b| Self::compare_indices(sort_values, &sort_keys, a, b));
+        self.parent_to_view.resize(len, 0);
+        for (position, &row) in self.sorted_index.iter().enumerate() {
+            self.parent_to_view[row] = position;
+        }
 
         if let Some(cs) = table.changeset() {
             self.last_synced_generation = cs.generation();
@@ -243,6 +250,7 @@ impl SortedView {
         }
         self.last_parent_version = table.version();
         drop(table);
+        self.output_changes.invalidate();
         self.sync_count += 1;
     }
 
@@ -278,15 +286,18 @@ impl SortedView {
             (false, false) => {}
         }
 
+        // NaN cannot compare Equal to every number: that breaks transitivity
+        // and makes a rebuild disagree with incremental binary insertion.
+        // All NaNs tie after numbers ascending; signed zeros remain equal.
         let base_cmp = match (val_a, val_b) {
             (ColumnValue::Int32(a), ColumnValue::Int32(b)) => a.cmp(b),
             (ColumnValue::Int64(a), ColumnValue::Int64(b)) => a.cmp(b),
-            (ColumnValue::Float32(a), ColumnValue::Float32(b)) => {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
-            }
-            (ColumnValue::Float64(a), ColumnValue::Float64(b)) => {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
-            }
+            (ColumnValue::Float32(a), ColumnValue::Float32(b)) => a
+                .partial_cmp(b)
+                .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan())),
+            (ColumnValue::Float64(a), ColumnValue::Float64(b)) => a
+                .partial_cmp(b)
+                .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan())),
             (ColumnValue::String(a), ColumnValue::String(b)) => a.cmp(b),
             (ColumnValue::Bool(a), ColumnValue::Bool(b)) => a.cmp(b),
             (ColumnValue::Date(a), ColumnValue::Date(b)) => a.cmp(b),
@@ -320,42 +331,33 @@ impl SortedView {
         }
     }
 
-    /// Find the insertion position for a new value using binary search.
-    /// The new row's sort-key values are pre-extracted once before the search
-    /// (was previously re-fetched O(log N) times inside the closure).
-    fn find_insertion_position(&self, parent_index: usize) -> usize {
-        let table = self.parent.borrow();
-
-        // Hoist: read new-row values once, not per binary-search step.
-        let new_vals: Vec<ColumnValue> = self
-            .sort_keys
-            .iter()
-            .map(|key| {
-                table
-                    .get_value(parent_index, &key.column)
-                    .unwrap_or(ColumnValue::Null)
-            })
-            .collect();
-
-        let result = self.sorted_index.binary_search_by(|&existing_idx| {
-            for (key_idx, key) in self.sort_keys.iter().enumerate() {
-                let val_existing = table
-                    .get_value(existing_idx, &key.column)
-                    .unwrap_or(ColumnValue::Null);
-                let val_new = &new_vals[key_idx];
-
-                let cmp = Self::compare_values(&val_existing, val_new, key);
-                if cmp != Ordering::Equal {
-                    return cmp;
-                }
+    fn compare_indices(
+        values: &[Vec<ColumnValue>],
+        keys: &[SortKey],
+        a: usize,
+        b: usize,
+    ) -> Ordering {
+        for (index, key) in keys.iter().enumerate() {
+            let cmp = Self::compare_values(&values[index][a], &values[index][b], key);
+            if cmp != Ordering::Equal {
+                return cmp;
             }
-            // For equal values, maintain stable sort by comparing parent indices
-            existing_idx.cmp(&parent_index)
-        });
+        }
+        a.cmp(&b)
+    }
 
-        match result {
-            Ok(pos) => pos,
-            Err(pos) => pos,
+    /// Compare cached historical keys, never the already-advanced live parent.
+    fn find_insertion_position(&self, parent_index: usize) -> usize {
+        self.sorted_index
+            .binary_search_by(|&existing| {
+                Self::compare_indices(&self.sort_values, &self.sort_keys, existing, parent_index)
+            })
+            .unwrap_or_else(|position| position)
+    }
+
+    fn repair_inverse(&mut self, range: std::ops::Range<usize>) {
+        for position in range {
+            self.parent_to_view[self.sorted_index[position]] = position;
         }
     }
 
@@ -421,22 +423,15 @@ impl SortedView {
         };
 
         if changes.is_empty() {
+            // A filter can advance its ancestor version without emitting any
+            // rows. Preserve retained history, but restore a coherent baseline
+            // for our children (including nested sorted views).
+            self.last_parent_version = parent.version();
             return false;
         }
 
         let changes: Vec<TableChange> = changes.to_vec();
         drop(parent);
-
-        // `find_insertion_position` reads the LIVE parent for an inserted/updated
-        // row's sort key. That is only valid when the parent matches the
-        // post-change state — i.e. a single change. In a multi-change batch the
-        // parent has advanced past intermediate changes, so its rows/indices no
-        // longer line up; fall back to a full rebuild, which is always correct.
-        // (Caught by the forward_prop_fuzz batched differential test.)
-        if changes.len() > 1 {
-            self.rebuild_index();
-            return true;
-        }
 
         let modified = self.apply_changes(&changes);
         let parent = self.parent.borrow();
@@ -465,17 +460,45 @@ impl SortedView {
     }
 
     pub(crate) fn root_changeset_cursor(&self) -> usize {
-        self.parent.borrow().root_changeset_cursor(self.last_processed_change_count)
+        self.parent
+            .borrow()
+            .root_changeset_cursor(self.last_processed_change_count)
     }
 }
 
 impl IncrementalView for SortedView {
     fn apply_changes(&mut self, changes: &[TableChange]) -> bool {
-        let mut modified = false;
-
-        for change in changes {
+        if changes.is_empty() {
+            return false;
+        }
+        if changes.len() > MAX_FILTER_REPLAY_CHANGES {
+            self.rebuild_index();
+            return true;
+        }
+        // A moved row is represented as delete(old row) + insert(new row).
+        // Recover full payloads before modifying any cached state; later
+        // updates/deletions in this batch may hide them from the live parent.
+        let mut updated_rows = HashMap::new();
+        for (index, change) in changes.iter().enumerate() {
+            if matches!(change, TableChange::CellUpdated { column, .. }
+                if self.sort_keys.iter().any(|key| key.column == *column))
+            {
+                let row = row_after_update(changes, index, |i| self.parent.borrow().get_row(i));
+                match row {
+                    Ok(row) => {
+                        updated_rows.insert(index, row);
+                    }
+                    Err(_) => {
+                        self.rebuild_index();
+                        return true;
+                    }
+                }
+            }
+        }
+        self.output_changes.clear();
+        for (change_index, change) in changes.iter().enumerate() {
             match change {
-                TableChange::RowInserted { index, .. } => {
+                TableChange::RowInserted { index, data } => {
                     // Tail-insert fast path: SortedView is 1:1 with parent,
                     // so `*index == sorted_index.len()` means the new row's
                     // parent index is past every existing one — no shift.
@@ -487,17 +510,29 @@ impl IncrementalView for SortedView {
                             }
                         }
                     }
-
+                    for (key, values) in self.sort_keys.iter().zip(&mut self.sort_values) {
+                        values.insert(
+                            *index,
+                            data.get(&key.column).cloned().unwrap_or(ColumnValue::Null),
+                        );
+                    }
                     // Find correct sorted position for the new row
                     let insert_pos = self.find_insertion_position(*index);
                     self.sorted_index.insert(insert_pos, *index);
-                    modified = true;
+                    self.parent_to_view.insert(*index, insert_pos);
+                    self.repair_inverse(insert_pos..self.sorted_index.len());
+                    self.output_changes.push(TableChange::RowInserted {
+                        index: insert_pos,
+                        data: data.clone(),
+                    });
                 }
 
-                TableChange::RowDeleted { index, .. } => {
-                    // Find the view position that points to this parent index
-                    let view_pos = self.sorted_index.iter().position(|&i| i == *index);
-
+                TableChange::RowDeleted { index, data } => {
+                    let view_pos = self.parent_to_view.remove(*index);
+                    self.sorted_index.remove(view_pos);
+                    for values in &mut self.sort_values {
+                        values.remove(*index);
+                    }
                     // Adjust indices and remove
                     for parent_idx in self.sorted_index.iter_mut() {
                         if *parent_idx > *index {
@@ -505,33 +540,71 @@ impl IncrementalView for SortedView {
                         }
                     }
 
-                    if let Some(pos) = view_pos {
-                        self.sorted_index.remove(pos);
-                        modified = true;
-                    }
+                    self.repair_inverse(view_pos..self.sorted_index.len());
+                    self.output_changes.push(TableChange::RowDeleted {
+                        index: view_pos,
+                        data: data.clone(),
+                    });
                 }
 
-                TableChange::CellUpdated { row, column, .. } => {
-                    // Check if the updated column is one of our sort keys
-                    let affects_sort = self.sort_keys.iter().any(|k| k.column == *column);
-
-                    if affects_sort {
-                        // The row's sort position may have changed
-                        // Remove from current position and re-insert at correct position
-                        if let Some(current_pos) = self.sorted_index.iter().position(|&i| i == *row)
-                        {
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    new_value,
+                } => {
+                    let current_pos = self.parent_to_view[*row];
+                    let mut new_pos = current_pos;
+                    if updated_rows.contains_key(&change_index) {
+                        // A column can appear in more than one SortKey.
+                        for (key, values) in self.sort_keys.iter().zip(&mut self.sort_values) {
+                            if key.column == *column {
+                                values[*row] = new_value.clone();
+                            }
+                        }
+                        let compare = |other| {
+                            Self::compare_indices(&self.sort_values, &self.sort_keys, other, *row)
+                        };
+                        let after_previous = current_pos == 0
+                            || compare(self.sorted_index[current_pos - 1]) == Ordering::Less;
+                        let before_next = current_pos + 1 == self.sorted_index.len()
+                            || compare(self.sorted_index[current_pos + 1]) == Ordering::Greater;
+                        if !after_previous || !before_next {
                             self.sorted_index.remove(current_pos);
-                            let new_pos = self.find_insertion_position(*row);
+                            new_pos = self.find_insertion_position(*row);
                             self.sorted_index.insert(new_pos, *row);
-                            modified = true;
+                            self.repair_inverse(
+                                current_pos.min(new_pos)..current_pos.max(new_pos) + 1,
+                            );
                         }
                     }
-                    // If update doesn't affect sort keys, no change needed
+                    if new_pos == current_pos {
+                        self.output_changes.push(TableChange::CellUpdated {
+                            row: current_pos,
+                            column: column.clone(),
+                            old_value: old_value.clone(),
+                            new_value: new_value.clone(),
+                        });
+                    } else {
+                        let data = updated_rows
+                            .remove(&change_index)
+                            .expect("prepared sort-key update");
+                        let mut old_data = data.clone();
+                        old_data.insert(column.clone(), old_value.clone());
+                        self.output_changes.push(TableChange::RowDeleted {
+                            index: current_pos,
+                            data: old_data,
+                        });
+                        self.output_changes.push(TableChange::RowInserted {
+                            index: new_pos,
+                            data,
+                        });
+                    }
                 }
             }
         }
 
-        modified
+        !self.output_changes.is_empty()
     }
 
     fn last_synced_generation(&self) -> u64 {
@@ -580,5 +653,11 @@ impl ReadableTable for SortedView {
 
     fn version(&self) -> u64 {
         self.sync_count.wrapping_add(self.parent.borrow().version())
+    }
+
+    fn changeset(&self) -> Option<&Changeset> {
+        // Live reads through a stale permutation are not a coherent baseline.
+        // A child constructed then must rebuild after its parent catches up.
+        (self.parent.borrow().version() == self.last_parent_version).then_some(&self.output_changes)
     }
 }

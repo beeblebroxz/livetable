@@ -4,8 +4,9 @@ LiveTable is designed for typed row operations, reactive views, and incremental
 updates. Performance depends heavily on data shape, storage backend, Python/Rust
 boundary costs, and whether an operation can use an incremental path.
 
-The [filter-to-aggregate benchmark](INCREMENTAL_FILTER_PIPELINE.md) records a
-focused before/after baseline with its harness and environment. There is no
+The [filter-to-aggregate benchmark](INCREMENTAL_FILTER_PIPELINE.md) and
+[filter-to-sort-to-aggregate benchmark](INCREMENTAL_SORTED_PIPELINE.md) record
+focused before/after baselines with their harnesses and environments. There is no
 library-wide baseline or performance threshold enforced in CI. Treat results
 as measurements of the recorded machine, commit, and workload, not guarantees.
 

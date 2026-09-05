@@ -5,9 +5,9 @@
 //! are held as `Rc<RefCell<dyn ReadableTable>>`; an `Rc<RefCell<Table>>`
 //! coerces implicitly at call sites.
 //!
-//! Root tables and synchronized filters expose changesets in their own row
-//! coordinates. Filters retain one bounded batch; a rebuild invalidates the
-//! previous history. Consumers refresh if their cursor is outside the retained
+//! Root tables and synchronized filters/sorts expose changesets in their own
+//! row coordinates. Filters/sorts retain one bounded batch; a rebuild invalidates
+//! the previous history. Consumers refresh if their cursor is outside the retained
 //! window. Other view types expose no output history and their children use
 //! version-checked rebuilds. Version still includes ancestors for stale-read
 //! and iterator guards; an unchanged output stream can skip downstream sync
@@ -63,7 +63,7 @@ pub trait ReadableTable {
     fn version(&self) -> u64;
 
     /// Incremental history in this table/view's own row coordinates. None
-    /// means unavailable (including a filter that has not synced its parent).
+    /// means unavailable (including a filter/sort that has not synced its parent).
     /// Consumers must refresh when history does not cover their cursor.
     fn changeset(&self) -> Option<&Changeset> {
         None

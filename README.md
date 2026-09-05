@@ -26,6 +26,7 @@ guarantees. See [Performance and Benchmarking](docs/PERFORMANCE_COMPARISON.md).
 **Key advantages:**
 - **Zero-copy views** - FilterView, JoinView, etc. don't duplicate data
 - **Reactive updates** - `tick()` incrementally synchronizes registered views
+- **Incremental sorted pipelines** - Small batches propagate through filter → sort → group
 - **Type safety** - Schema-enforced types catch errors early
 - **Pythonic API** - Natural Python syntax with indexing, slicing, and iteration
 
@@ -135,22 +136,27 @@ Views can derive from other views, forming a DAG over root tables:
 ```python
 big = table.filter(lambda row: row["amount"] >= 100)
 ranked = big.sort("amount", descending=True)          # sort the filtered rows
-by_region = big.group_by("region", agg=[("total", "amount", "sum")])
+by_region = ranked.group_by("region", agg=[("total", "amount", "sum")])
 
 table.append_row({"region": "S", "amount": 900.0})
-table.tick()   # root -> filter -> sorted/grouped, all updated in one call
+table.tick()   # root -> filter -> sort -> group, all updated in one call
 ```
 
 In Rust, any view can parent any other view — every view implements the
 `ReadableTable` trait (`FilterView`, `SortedView`, `AggregateView`, `JoinView`,
 `ProjectionView`, `ComputedView`, and `Table` itself).
 
-Filters publish changesets, allowing `table -> filter -> group_by` to update
-incrementally in both Rust and Python. Small batches evaluate only changed
+Filters and sorted views publish changesets, allowing
+`table -> filter -> sort -> group_by` to update incrementally in Rust and Python.
+Small batches evaluate only changed
 rows; an edit that stays outside the filter produces no downstream changes.
-Filters retain one batch of history and rebuild for batches over 256 changes
-or unavailable history. Other view types still use version-checked rebuilds
-for their children. See [the propagation contract and benchmarks](docs/INCREMENTAL_FILTER_PIPELINE.md).
+Each filter/sort retains one batch of history and rebuilds for more than 256
+input changes or unavailable history. Sorts cache only sort-key columns and
+index mappings, not complete source rows. Non-sort edits forward without a
+scan; row moves can still shift linear-time bookkeeping. Children of other
+view types use version-checked rebuilds. See the
+[filter contract](docs/INCREMENTAL_FILTER_PIPELINE.md) and
+[sorted pipeline contract and benchmarks](docs/INCREMENTAL_SORTED_PIPELINE.md).
 
 ### Filtering
 ```python

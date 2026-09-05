@@ -13,7 +13,7 @@
 //! - SortedView directly on root (incremental changeset path)
 //! - AggregateView directly on root (incremental running aggregates, including
 //!   MIN/MAX recalculation and MEDIAN/p90 sorted-values maintenance)
-//! - SortedView over a FilterView (chained, version-checked refresh)
+//! - SortedView over a FilterView (chained, incremental batch replay)
 //! - AggregateView over the chained sort (chained-of-chained)
 //!
 //! It also covers multi-consumer min-cursor changeset compaction (filter + the
@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 use livetable::{
     AggregateFunction, AggregateView, ColumnType, ColumnValue, ComputedView, FilterView, JoinType,
-    JoinView, ReadableTable, Schema, SortKey, SortedView, Table, TickableTable,
+    JoinView, ReadableTable, Schema, SortKey, SortedView, Table, TableChange, TickableTable,
 };
 
 type Row = HashMap<String, ColumnValue>;
@@ -92,6 +92,22 @@ fn aggs() -> Vec<(String, String, AggregateFunction)> {
 
 fn snapshot(v: &dyn ReadableTable) -> Vec<Row> {
     (0..v.len()).map(|i| v.get_row(i).unwrap()).collect()
+}
+
+/// Replaying the output stream must reproduce every column, not just sort
+/// order and the columns aggregated by downstream consumers.
+fn assert_sorted_replay(mut rows: Vec<Row>, cursor: usize, view: &SortedView) {
+    for change in view.changeset().unwrap().changes_from(cursor).expect("small batch history") {
+        match change {
+            TableChange::RowInserted { index, data } => rows.insert(*index, data.clone()),
+            TableChange::RowDeleted { index, data } => assert_eq!(rows.remove(*index), *data),
+            TableChange::CellUpdated { row, column, old_value, new_value } => {
+                assert_eq!(&rows[*row][column], old_value);
+                rows[*row].insert(column.clone(), new_value.clone());
+            }
+        }
+    }
+    assert_eq!(rows, snapshot(view));
 }
 
 /// A detached, independent table holding a copy of `base`'s current rows.
@@ -302,8 +318,11 @@ fn differential_chained_forward_prop_fuzz() {
         let mut next_id: i64 = 0;
 
         for step in 0..200usize {
+            let before = snapshot(&*p.sorted_chain.borrow());
+            let cursor = p.sorted_chain.borrow().changeset().unwrap().total_len();
             apply_random_op(&mut rng, &base, &mut next_id);
             p.tick.tick();
+            assert_sorted_replay(before, cursor, &p.sorted_chain.borrow());
             assert_pipeline_matches(trial, step, &base, &p);
         }
     }
@@ -318,6 +337,8 @@ fn differential_batched_forward_prop_fuzz() {
         let mut next_id: i64 = 0;
 
         for step in 0..150usize {
+            let before = snapshot(&*p.sorted_chain.borrow());
+            let cursor = p.sorted_chain.borrow().changeset().unwrap().total_len();
             // 1..=6 mutations applied before a single tick() — a multi-change
             // batch. The deferred end-of-batch MIN/MAX recalc must read row
             // indices that match the parent only after all batch shifts apply.
@@ -326,6 +347,7 @@ fn differential_batched_forward_prop_fuzz() {
                 apply_random_op(&mut rng, &base, &mut next_id);
             }
             p.tick.tick();
+            assert_sorted_replay(before, cursor, &p.sorted_chain.borrow());
             assert_pipeline_matches(trial, step, &base, &p);
         }
     }

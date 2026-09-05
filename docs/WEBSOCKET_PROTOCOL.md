@@ -191,10 +191,12 @@ required.
 
 ### View snapshots
 
-The engine can maintain `base -> filter -> group` incrementally. Internal
-filter changesets are separate from the wire protocol: `ViewData` still carries
+The engine can maintain `base -> filter -> sort -> group` incrementally for
+small batches. Internal filter/sort changesets (including delete/insert pairs
+for sorted row moves) are separate from the wire protocol: `ViewData` still carries
 full snapshots, and `seq` retains its existing generation/node-scoped meaning.
-Sort nodes do not emit changesets, so groups below a sort still rebuild.
+Large batches, missing history, or explicit refresh retain rebuild fallbacks.
+See [the internal sorted pipeline contract](INCREMENTAL_SORTED_PIPELINE.md).
 
 The server immediately sends a snapshot for the synthetic `base` node and each
 successfully built node. It sends new full snapshots for nodes whose version

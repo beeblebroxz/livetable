@@ -103,10 +103,12 @@ cd frontend && npm install && npm run dev
 
 ### Key Patterns
 - Views use `Rc<RefCell<>>` for shared table access without data duplication
-- View parents are `Rc<RefCell<dyn ReadableTable>>`. Tables and synchronized filters expose changesets in their own row coordinates; children of other views use version-checked full refresh. A view's `version()` includes its parents for staleness/iterator guards and is independent of its output changeset sequence. Always sync parents before children (tick registration order is topological).
+- View parents are `Rc<RefCell<dyn ReadableTable>>`. Tables and synchronized filters/sorts expose changesets in their own row coordinates; children of other views use version-checked full refresh. A view's `version()` includes its parents for staleness/iterator guards and is independent of its output changeset sequence. Always sync parents before children (tick registration order is topological).
 - Consumer cursors belong to their immediate parent's stream. Use `root_changeset_cursor()` / `root_changeset_cursors()` for tick compaction; they return `usize::MAX` for derived sources. Never compare a filter's output cursor with a root table's cursor. A consumer created while a filter is stale has no coherent baseline and must refresh after the parent syncs.
 - `filter_changes.rs` shares replay and output emission between native/Python filters. It reconstructs historical updated rows across later shifts/deletes and emits filter-coordinate events. Batches up to 256 changes replay; larger batches rebuild. One successful non-empty input batch is retained; a no-op sync preserves history, and rebuild uses `Changeset::invalidate()` to force even caught-up consumers to refresh. Python callbacks are evaluated before committing indices/history, so errors are retryable. See `docs/INCREMENTAL_FILTER_PIPELINE.md` and `impl/tests/filter_pipeline.rs`.
 - Aggregate group-key updates use the same historical-row reconstruction. SUM/COUNT/AVG updates do not trigger unused MIN/MAX rescans; requested extrema may rescan the affected group.
+- SortedView caches only sort keys in parent coordinates plus forward/inverse index mappings. Small batches (up to 256 input events) replay against historical keys, never live-parent comparisons. A moved row emits delete(old full row) + insert(new full row); stationary edits emit CellUpdated. Ties follow parent order, NaNs sort after numbers ascending (before descending), and signed zero ties are stable. History/invalidation follow the filter contract. See `docs/INCREMENTAL_SORTED_PIPELINE.md`.
+- Aggregate batches with multiple structural events (up to 512 total events) use temporary row identities and remap index hashes once before MIN/MAX rescans. This avoids rehashing all rows for each delete/insert pair emitted by a sort. It uses O(N+B) temporary index storage, not a table snapshot.
 - Python lambdas are converted to Rust closures for filter/computed operations
 - Join operations use O(N+M) algorithm
 - WebSocket base protocol: `Subscribe`, `Query`, `InsertRow`, `UpdateCell`, and `DeleteRow`; successful mutations broadcast `RowInserted`, `CellUpdated`, and `RowDeleted` to base subscribers
@@ -196,6 +198,10 @@ sorted_table = table.sort(["score", "name"], descending=[True, False])  # Multi-
 
 # Sorting (explicit SortedView constructor)
 sorted_view = livetable.SortedView("by_score", table, [livetable.SortKey.descending("score")])
+
+# Group below a sort; group_by registers the sort before its children for tick().
+by_name = sorted_view.group_by("name", agg=[("total", "score", "sum")])
+table.tick()  # table -> sort -> group
 
 # Joins (simplified API)
 joined = students.join(grades, on="id")                                    # Same column name

@@ -402,8 +402,8 @@ print(sorted_view[0]["amount"])  # 1500 (new top seller)
 ### ✅ View Composition (Views over Views)
 
 Views can derive from other views, forming a DAG over root tables. A
-`FilterView` exposes `sort()` and `group_by()` that chain on the filtered
-rows; chained views are auto-registered on the root table, so one `tick()`
+`FilterView` exposes `sort()` and `group_by()` that chain on the filtered rows;
+`SortedView` also exposes `group_by()`. Chained views are auto-registered on the root table, so one `tick()`
 propagates the whole chain (parents sync before children):
 
 ```python
@@ -416,7 +416,7 @@ table.append_rows([
 
 big = table.filter(lambda row: row["amount"] >= 100)
 ranked = big.sort("amount", descending=True)   # SortedView over the filter
-by_region = big.group_by("region", agg=[("total", "amount", "sum")])
+by_region = ranked.group_by("region", agg=[("total", "amount", "sum")])
 
 table.append_row({"region": "S", "amount": 900.0})
 table.tick()
@@ -431,17 +431,22 @@ as `table.group_by()`.
 
 At the Rust level composition is fully general: every view type implements
 the `ReadableTable` trait and can parent any other view (e.g., a `JoinView`
-whose left side is a `FilterView`). Tables and synchronized filters expose
-changesets. In particular, `filtered.group_by(...)` incrementally updates its
+whose left side is a `FilterView`). Tables and synchronized filters/sorts expose
+changesets. Both `filtered.group_by(...)` and `ranked.group_by(...)` update their
 aggregates without rescanning all filtered rows for a scalar SUM/COUNT/AVG
 update. Changes that stay outside the filter produce no downstream work.
 
-Filter history retains one successful non-empty input batch. Consumers that
-miss that window rebuild; explicit `filtered.refresh()` also invalidates their
+Filter/sort history retains one successful non-empty input batch. Consumers that
+miss that window rebuild; explicit `refresh()` also invalidates their
 baseline. When manually synchronizing, sync parents before children. After an
 explicit refresh without a root mutation, call the child's `sync()` directly.
-Other view types still expose no output history and their children rebuild
-when their parent version changes. See [the full contract](INCREMENTAL_FILTER_PIPELINE.md).
+Sorts replay up to 256 pending input events using cached sort-key columns and
+index mappings, not full rows. A changed sort key may move a row; ordinary
+non-sort edits forward without reordering or scanning the source. Moves emit
+delete/insert pairs internally and can still require linear-time bookkeeping.
+Other view types expose no output history and their children rebuild when
+their parent version changes. See the [filter contract](INCREMENTAL_FILTER_PIPELINE.md)
+and [sorted pipeline contract](INCREMENTAL_SORTED_PIPELINE.md).
 
 ### ✅ Serialization (CSV/JSON)
 
@@ -846,8 +851,26 @@ view = livetable.SortedView("ranked", table, [key])
 - `len()`, `is_empty()`, and `name()`
 - `get_row(index)`, `get_value(row, column)`, indexing, slicing, and iteration
 - `get_parent_index(view_index)` - Map sorted position to parent position
+- `group_by(by, agg) -> AggregateView` - Group sorted rows; `by` is a column name
+  or list, and `agg` contains `(result_name, source_column, function_string)` tuples,
+  using the same functions as `Table.group_by()`. The sort and its new child are
+  registered once each, parent first, for root `tick()` propagation. This also
+  registers a sort created with the explicit constructor (normally manual-sync).
 - `sync() -> bool` - Incremental synchronization when possible
 - `refresh()` - Full rebuild
+
+`sync()` returns true when it applies a non-sort cell edit too, not only when
+the permutation changes. Equal sort keys preserve parent order, including
+`-0.0` and `0.0` ties. Float NaNs compare equal to each other and sort after
+numbers ascending, before numbers descending; NULL placement is independent.
+The simplified `.sort()` API keeps its NULL-first default; explicit
+`SortKey` constructors default to NULL last.
+
+```python
+ranked = table.filter(lambda r: r["amount"] >= 100).sort("amount", descending=True)
+totals = ranked.group_by("region", agg=[("total", "amount", "sum")])
+table.tick()  # filter -> sort -> group
+```
 
 ### AggregateFunction
 

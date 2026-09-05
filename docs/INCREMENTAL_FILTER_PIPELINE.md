@@ -53,10 +53,11 @@ MIN/MAX can rescan the affected group, and percentile maintenance uses sorted
 vectors. The integer-group fast path lazily builds its row-to-group map on
 the first incremental update; benchmark warmup includes that cost.
 
-Sorted views can consume filter changes but still rebuild on multi-event
-input batches and do not emit changesets. Their children, including an
-aggregate below a sort, still use version-checked rebuilds. Other output-view
-types also retain that fallback. View versions still include ancestors for
+The subsequent [sorted pipeline milestone](INCREMENTAL_SORTED_PIPELINE.md)
+adds bounded sorted-coordinate output replay and aggregate index remapping.
+The benchmark below records the earlier filter-only milestone, before that
+extension. Other output-view types retain version-checked rebuilds for their
+children. View versions still include ancestors for
 staleness and iterator checks, independently of emitted changes.
 
 The WebSocket server continues to serialize full view snapshots. These
@@ -75,8 +76,8 @@ cargo run --release --example filter_pipeline_benchmark -- 10000 100000
 Environment: Apple M2, 24 GiB RAM, macOS 26.5.2 (25F84), aarch64,
 `rustc 1.91.1 (ed61e7d7e 2025-11-07)`, release profile, array storage.
 Recorded September 4, 2026. Before: `cdf3fc441f18c8948e2e50a24457908c6a5b6072`
-with the same added benchmark harness. After: the implementation in the commit
-containing this report.
+with the same added benchmark harness. After:
+`f49ea3c0a1205bab1e6f88ae4260145444a8a156` (the original filter milestone).
 
 The schema has Int64 IDs, eight possible string regions, and Float64 amounts.
 Half the rows pass the filter, producing four initial groups. Each aggregate

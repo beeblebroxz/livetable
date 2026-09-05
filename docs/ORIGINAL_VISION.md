@@ -208,8 +208,9 @@ items below remain original future ideas.
 - [x] String interning with reference counting
 - [x] Changesets and incremental view propagation
 - [x] Automatic view propagation via `tick()` method
-- [x] View-over-view composition (DAG): all views implement `ReadableTable`; tables and filters emit changesets so filter-to-aggregate chains update incrementally, while children of other views use version-checked refresh
+- [x] View-over-view composition (DAG): all views implement `ReadableTable`; tables, filters, and sorts emit changesets so filter-to-sort-to-aggregate chains update incrementally, while children of other views use version-checked refresh
 - [x] Shared Rust/Python filter replay for bounded mixed batches, with derived-coordinate changesets, bounded history, and rebuild invalidation
+- [x] Sorted-coordinate batch replay with cached keys, stable ties, row-move events, and Python SortedView.group_by(); aggregate index remapping batched for structural changes
 - [x] CSV/JSON serialization with type inference
 - [x] Python bindings via PyO3
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)

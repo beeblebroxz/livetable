@@ -900,7 +900,10 @@ impl PyTable {
             .borrow_mut()
             .push(RegisteredView::Sorted(Rc::downgrade(&inner)));
 
-        Ok(PySortedView { inner })
+        Ok(PySortedView {
+            inner,
+            table: self.clone(),
+        })
     }
 
     /// Join this table with another table.
@@ -1609,7 +1612,10 @@ impl PyFilterView {
             .borrow_mut()
             .push(RegisteredView::Sorted(Rc::downgrade(&inner)));
 
-        Ok(PySortedView { inner })
+        Ok(PySortedView {
+            inner,
+            table: self.table.clone(),
+        })
     }
 
     /// Group the filtered rows — returns an AggregateView chained on this
@@ -2235,6 +2241,8 @@ impl PySortKey {
 #[pyclass(name = "SortedView", unsendable)]
 pub struct PySortedView {
     inner: Rc<RefCell<RustSortedView>>,
+    /// Root registry for children created through group_by().
+    table: PyTable,
 }
 
 #[pymethods]
@@ -2248,6 +2256,7 @@ impl PySortedView {
 
         Ok(PySortedView {
             inner: Rc::new(RefCell::new(view)),
+            table,
         })
     }
 
@@ -2337,6 +2346,30 @@ impl PySortedView {
     /// Get the parent table row index for a given view position
     fn get_parent_index(&self, view_index: usize) -> Option<usize> {
         self.inner.borrow().get_parent_index(view_index)
+    }
+
+    /// Group sorted rows. Registers this sort (if explicitly constructed and
+    /// not yet registered) before its aggregate child for root tick().
+    fn group_by(
+        &self,
+        by: &Bound<'_, PyAny>,
+        agg: Vec<(String, String, String)>,
+    ) -> PyResult<PyAggregateView> {
+        let group_cols = extract_string_or_list(by)?;
+        let aggregations = parse_agg_specs(&agg)?;
+        let name = format!("{}_grouped", self.inner.borrow().name());
+        let view = RustAggregateView::new(name, self.inner.clone(), group_cols, aggregations)
+            .map_err(PyValueError::new_err)?;
+        let inner = Rc::new(RefCell::new(view));
+        let sorted = Rc::downgrade(&self.inner);
+        let mut registry = self.table.registered_views.borrow_mut();
+        if !registry.iter().any(|view| {
+            matches!(view, RegisteredView::Sorted(existing) if existing.ptr_eq(&sorted))
+        }) {
+            registry.push(RegisteredView::Sorted(sorted));
+        }
+        registry.push(RegisteredView::Aggregate(Rc::downgrade(&inner)));
+        Ok(PyAggregateView { inner })
     }
 
     /// Force a full refresh of the sorted index
