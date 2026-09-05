@@ -81,7 +81,7 @@ cd impl && cargo test --lib --features server
 cd impl && cargo test --features server --test filter_pipeline --test sorted_pipeline --test forward_prop_fuzz
 
 # Real WebSocket protocol integration test
-cd impl && cargo test --features server --test protocol_v2_websocket
+cd impl && cargo test --features server --test protocol_v3_websocket
 
 # Python tests only
 cd tests && pytest python/ -v
@@ -113,8 +113,8 @@ cd frontend && npm install && npm run dev
 - **view.rs** + **view/** - Shared-source views, one file per type: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`, `AggregateView`, `TickableTable`; view.rs holds shared typed join-key machinery; tests in view/tests.rs
 - **filter_changes.rs** - Shared historical-row reconstruction and filter replay for Rust/Python; also used by sort/aggregate consumers
 - **python_bindings.rs** - PyO3 bindings exposing Rust types as Python classes
-- **engine.rs** + **pipeline_spec.rs** - Single-threaded server table owner and bounded wire-spec → real-view construction
-- **websocket.rs** + **messages.rs** - Actix transport and protocol-v2 real-time sync
+- **engine.rs** + **engine/delivery.rs** + **pipeline_spec.rs** - Single-threaded server table owner, bounded wire-spec → real-view construction, and cursor-checked pipeline delivery
+- **websocket.rs** + **messages.rs** - Actix transport and protocol-v3 real-time sync
 
 ### Key Patterns
 - `ColumnData` selects `Sequence<T>` once per column; never reintroduce a per-cell enum or an interned-string placeholder buffer. `ColumnValue` stays at API/event boundaries. Numeric `get_f64()` must preserve NULL/type semantics and float bits.
@@ -130,12 +130,13 @@ cd frontend && npm install && npm run dev
 - Python filter/computed callbacks still execute Python; they are not compiled into native predicates. Filter callbacks are fallible and must return a bool.
 - Join construction/refresh costs O(N+M+R), where R is output size. Rust joins replay table/filter/sort history when available; parents without output history require version-checked rebuilds. Float join keys are bitwise, so -0.0 and +0.0 differ (unlike sorting/grouping).
 - WebSocket base protocol: `Subscribe`, `Query`, `InsertRow`, `UpdateCell`, and `DeleteRow`; successful mutations broadcast `RowInserted`, `CellUpdated`, and `RowDeleted` to base subscribers
-- WebSocket reconciliation: every `TableData` and delta carries a monotonic `seq` (the table's `Changeset::total_len`, captured in the same serialized engine operation as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. This closes a snapshot/delta race where an insert around subscribe could otherwise be applied twice. Keep `seq` populated when adding new server→client messages.
+- Flat-table WebSocket reconciliation: every `TableData` and flat-table delta carries a monotonic `seq` (the table's `Changeset::total_len`, captured in the same serialized engine operation as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. Pipeline delivery uses a separate sequence domain.
 - WebSocket gap recovery: deltas only apply contiguously (`seq == applied + 1`); if a gap persists for `SEQ_GAP_REQUERY_MS` the client re-sends `Query` and re-baselines from the fresh snapshot (`useTableWebSocket.ts`). The pending-delta buffer is capped at `MAX_PENDING_DELTAS` (oldest evicted; the resulting gap heals via re-query). Cell edits are server-authoritative: on blur the input snaps back to the last confirmed value and only the `CellUpdated` broadcast echo moves it forward, so rejected updates (e.g. null into a non-nullable column) self-heal.
 - WebSocket `Subscribed` carries `protocol_version` (`messages::PROTOCOL_VERSION`); the client warns on mismatch with `SUPPORTED_PROTOCOL_VERSION`. Bump both on breaking wire changes.
-- WebSocket protocol v2 pipeline messages carry a client-selected `pipeline_generation` on `SetPipeline`, `ViewData`, and `ViewError`. Reconcile responses by `(pipeline_generation, node_id, seq)`: ignore non-current generations and compare `seq` only within one generation/node. The current `usePipeline` retains an old snapshot until current-generation data for that node ID arrives; changing/removing node IDs requires explicitly clearing or filtering snapshot state.
+- Protocol-v3 pipeline state is scoped by connection/table/generation/node. `pipeline_generation` must increase when replacing an installed pipeline. Each node's delivery `seq` starts at zero and advances once per emitted delta or later snapshot, independently of view versions and changeset cursors. `usePipeline` clears old baselines and repairs on new generations, ignores wrong tables/unknown nodes/stale sockets, and uses own-property-safe node maps.
 - `ViewData` uses `WireViewRow { row_id: Option<u64>, row }`; derived rows without stable identity serialize `row_id: null`. Never use `u64::MAX` as a JavaScript sentinel. Pipeline `count` is `COUNT(column)` and every aggregate spec therefore requires a source `column`.
-- Pipeline delivery still sends full snapshots for the base and nodes whose inherited version changes, even for edits excluded by a filter. Internal filter/sort events are not wire deltas. Pipeline `seq` is a view version and may jump; do not apply the flat-table contiguous-delta rule to it. Pipeline delta delivery remains planned.
+- `ViewDelta` is an atomic ordered batch of 1–512 node-coordinate operations, accepted only on exactly `from_seq` (`seq == from_seq + 1`). Filters/sorts emit their retained output history; empty output sends nothing and keeps the delivery sequence unchanged. Missing/invalidated history falls back to snapshots. Groups retain inherited-version-triggered snapshots. The base journal captures IDs and coordinates at mutation time, before root compaction; it is bounded at 512 events and drained on collection. Never scan/diff full node snapshots to build a delta or clone all base row IDs on every tick.
+- `QueryView` returns a fresh snapshot and advances only that connection/node's sequence, even without a data change. One-second `PipelineStatus` checkpoints detect lost final/initial deliveries. The client requests repair on gaps, invalid operations, or missing baselines; it retains coherent rows, ignores further deltas while repairing, and retries at 3-second checks without buffering delta history. Do not advance snapshot baselines on failed reads. See `docs/PIPELINE_DELIVERY.md` and `docs/WEBSOCKET_PROTOCOL.md`.
 - Run `pipeline_spec::validate_pipeline_spec()` before allocating views. It enforces ordered/acyclic sources, unique non-reserved node IDs, required node fields, and protocol resource limits.
 - The canonical wire reference is `docs/WEBSOCKET_PROTOCOL.md`; update it whenever message shapes, limits, generation rules, or sequence semantics change.
 - `Table::from_json`/`from_csv` infer each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null/empty → STRING); values are then converted against the inferred schema, not in isolation. JSON rejects incompatible mixes (number + string) at inference with a clear error; CSV falls back to STRING since every CSV value is a string at heart.
@@ -151,7 +152,7 @@ cd frontend && npm install && npm run dev
 ### Frontend (frontend/src/)
 - React 18 + TypeScript + Vite + Tailwind CSS
 - `hooks/useTableWebSocket.ts` - Flat-table WebSocket connection management
-- `hooks/usePipeline.ts` - Debounced, generation-aware server view-pipeline connection management
+- `hooks/usePipeline.ts` + `lib/pipelineReconciliation.ts` - Generation-aware pipeline connection management, atomic deltas, and snapshot recovery
 - `components/LiveTable.tsx` - Real-time table rendering with TanStack Table
 
 ## Critical Notes

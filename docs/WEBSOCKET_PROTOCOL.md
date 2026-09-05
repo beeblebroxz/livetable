@@ -1,11 +1,14 @@
-# WebSocket Protocol v2
+# WebSocket Protocol v3
 
 LiveTable's optional Actix server exposes a JSON-over-WebSocket protocol for
 editing a base table and subscribing to connection-local, server-computed view
 pipelines.
 
-The wire version is `2` (`impl/src/messages.rs::PROTOCOL_VERSION`). The bundled
-React client expects the same version.
+The wire version is `3` (`impl/src/messages.rs::PROTOCOL_VERSION`). The bundled
+React client expects the same version. Upgrade server and client together:
+pipeline delivery sequences have changed meaning since v2, and clients must
+handle `ViewDelta`, `PipelineStatus`, and `QueryView`. Flat-table message shapes
+and change-count sequencing are unchanged.
 
 ## Running the server
 
@@ -47,7 +50,7 @@ The server registers the connection for base-table mutation broadcasts and
 replies:
 
 ```json
-{"type":"Subscribed","table_name":"demo","protocol_version":2}
+{"type":"Subscribed","table_name":"demo","protocol_version":3}
 ```
 
 `Subscribe` does not include a snapshot. Send `Query` as well when using the
@@ -146,6 +149,11 @@ the same table without affecting each other.
 Nodes must be in topological order. Each `source_id` must be `base` or the ID of
 an earlier node.
 
+`pipeline_generation` is a client-selected `u32`. It must strictly increase
+when replacing an installed pipeline on the same connection/table; reuse or
+regression is rejected without replacing the current pipeline. A new connection
+has no previous generation.
+
 ```json
 {
   "type": "SetPipeline",
@@ -191,18 +199,16 @@ required.
 
 ### View snapshots
 
-The engine can maintain `base -> filter -> sort -> group` incrementally for
-small batches. Internal filter/sort changesets (including delete/insert pairs
-for sorted row moves) are separate from the wire protocol: `ViewData` still carries
-full snapshots, and `seq` retains its existing generation/node-scoped meaning.
-Large batches, missing history, or explicit refresh retain rebuild fallbacks.
-See [the internal sorted pipeline contract](INCREMENTAL_SORTED_PIPELINE.md).
-
 The server immediately sends a snapshot for the synthetic `base` node and each
-successfully built node. It sends new full snapshots for nodes whose version
-changes after a base mutation, including the synthetic base node. Versions
-include ancestors, so even an edit excluded by a filter can cause a new full
-snapshot. Suppressing empty internal output is not wire-level suppression:
+successfully built node, each at delivery sequence zero. After mutations,
+base/filter/sort nodes send bounded deltas when history is available. Empty
+filter/sort output sends no node payload and does not advance its delivery
+sequence. Groups retain full snapshots when their inherited version changes;
+they may still send a snapshot after an excluded edit.
+
+Missing history, view rebuilds, and oversized deltas produce a new snapshot.
+Filters/sorts below a group may rebuild and therefore also use snapshots. See
+[the internal sorted pipeline contract](INCREMENTAL_SORTED_PIPELINE.md).
 
 ```json
 {
@@ -212,7 +218,7 @@ snapshot. Suppressing empty internal output is not wire-level suppression:
   "node_id": "totals",
   "source_id": "ranked",
   "kind": "group",
-  "seq": 9,
+  "seq": 0,
   "columns": ["region", "total", "p95"],
   "rows": [
     {"row_id": null, "row": {"region": "West", "total": 700.0, "p95": 700.0}}
@@ -223,6 +229,61 @@ snapshot. Suppressing empty internal output is not wire-level suppression:
 Only the synthetic `base` snapshot has stable `row_id` values. Derived rows use
 `null`, including filtered and sorted rows, because the current protocol does
 not expose derived-row identity.
+
+### Ordered node deltas
+
+```json
+{
+  "type": "ViewDelta",
+  "table_name": "demo",
+  "pipeline_generation": 7,
+  "node_id": "ranked",
+  "from_seq": 0,
+  "seq": 1,
+  "changes": [
+    {"type": "RowDeleted", "index": 2},
+    {"type": "RowInserted", "index": 0,
+     "row": {"row_id": null, "row": {"region": "West", "product": "Premium", "amount": 900.0}}},
+    {"type": "CellUpdated", "index": 1, "column": "product", "value": "Updated"}
+  ]
+}
+```
+
+Apply the entire batch atomically in listed order, only to a baseline with
+exactly `seq == from_seq`. Every index is in this node's coordinates **at that
+step**. Insertion allows `index == rows.length`; deletion/update require an
+existing row. Inserts include the complete row; updates must name an existing
+column. A sorted row move is a delete followed by an insert, not a stable-ID
+move event. NULL cell values serialize as JSON `null`.
+
+Base insertions carry stable base IDs. Derived insertions carry `row_id: null`.
+No derived identity is needed for this ordered, baseline-checked replay; editing
+and deleting still require a real base row ID. A delta contains 1–512 operations.
+
+### Node resynchronization
+
+```json
+{"type":"QueryView","table_name":"demo","pipeline_generation":7,"node_id":"ranked"}
+```
+
+Returns `ViewData` for that installed node, without rebuilding the pipeline.
+Only the requesting connection's node sequence advances, even if no rows have
+changed. This distinguishes the response from duplicates and older in-flight
+snapshots. A missing node, wrong connection, or stale generation returns
+`ViewError`; it cannot reset another pipeline's delivery state.
+
+The server sends inexpensive checkpoints approximately once per second:
+
+```json
+{"type":"PipelineStatus","table_name":"demo","pipeline_generation":7,
+ "sequences":{"base":12,"filtered":5,"ranked":6,"totals":12}}
+```
+
+These are the server's emitted delivery sequences, not acknowledgements of
+client receipt. Request a snapshot for any installed node whose watermark is
+ahead of the local baseline, or whose initial snapshot is missing. Checkpoints
+detect a dropped **final** delivery even when no later mutation reveals a gap.
+They contain no rows and do not advance any sequence.
 
 Pipeline errors are scoped to a generation and node:
 
@@ -253,30 +314,41 @@ absolute count.
 3. Apply post-snapshot deltas only in contiguous order.
 4. Re-query when a sequence gap persists.
 
-Pipeline responses require two keys:
+Pipeline sequencing is independent of that flat-table protocol:
 
-1. Discard `ViewData` and `ViewError` whose `pipeline_generation` is not the
-   client's current generation.
-2. Compare `seq` only within the same generation and node. Rebuilding a
-   pipeline resets view-local version counters.
+1. Scope all state to connection, table, generation, and node. Ignore wrong
+   tables, old generations, removed/unknown nodes, and obsolete socket callbacks.
+2. Initial snapshots start at zero. Every emitted delta or subsequent snapshot
+   advances that node's delivery sequence by one. It is **not** a view version
+   or changeset cursor, and is not comparable with another node or connection.
+3. Ignore duplicates/older messages (`seq <= applied`). Accept a newer snapshot
+   as a replacement baseline, even across gaps.
+4. Apply a delta only on exactly `from_seq`; `seq` must equal `from_seq + 1`.
+   Reject the whole batch on a bad index, column, or row shape. A mismatch,
+   malformed delivery, or missing baseline must never partially mutate rows.
+   Snapshots must match their declared columns and identity rules; duplicate
+   base IDs are rejected. Syntactically malformed frames discarded by the
+   parser are detected as missing deliveries by the next checkpoint.
+5. On a gap or invalid operation, send `QueryView`. The bundled hook keeps the
+   last coherent display, ignores further deltas for that node while repairing,
+   and waits for a newer snapshot. It does not accumulate a delta queue.
+6. Use checkpoints to detect missing initial/final deliveries. The hook retries
+   outstanding repairs at 3-second checks, at most once per node per check, and
+   clears them on a new snapshot, pipeline generation, disconnect, or unmount.
 
-For derived nodes, `seq` is the view version (including ancestors), not the
-filter/sort output changeset count. It can jump: pipeline snapshots do not use
-the contiguous `applied + 1` delta rule of the flat-table protocol.
+The hooks reconnect with exponential backoff. Pipeline expression changes are
+debounced by 250 ms. Sending a new definition clears old node baselines and
+repair state; reconnect sends a new generation and obtains fresh snapshots.
+Atomicity is per node/batch, not a simultaneous multi-node browser transaction.
 
-The bundled hooks implement these rules and reconnect with exponential backoff.
-Pipeline expression changes are debounced by 250 ms. The current `usePipeline`
-hook keeps the last snapshot for a node until current-generation data for that
-same node ID arrives. Callers that remove or rename node IDs should clear or
-filter the snapshot map; the bundled cascade demo uses stable IDs.
+### Remaining limits
 
-### Planned: pipeline delta delivery
-
-Pipeline-specific deltas and stable derived-row identity are not implemented.
-The next transport work must define identity, snapshot/delta baselines, ordering,
-gap recovery, and generation changes before internal view events can be sent
-directly. Existing flat-table mutation deltas do not provide that contract for
-derived nodes. No wire format change accompanied the incremental sort milestone.
+Groups still use snapshots; stable derived-row identity is not implemented.
+Client delta application shallow-copies the row array, so it still has O(N)
+reference-copy work, and sorted index maintenance can remain O(N). Full initial
+and recovery snapshots are not chunked. Checkpoints support eventual recovery
+after transient delivery loss, not durable replay or an acknowledgement log.
+See [delivery measurements](PIPELINE_DELIVERY.md) for the measured boundary.
 
 ## Resource limits
 
@@ -291,6 +363,8 @@ The server validates a complete definition before allocating views:
 | Sort keys per node | 16 |
 | Group keys per node | 16 |
 | Aggregates per node | 32 |
+| Operations per delta / retained pending base journal | 512 |
+| Entries per checkpoint / outstanding client node repairs | 33 (including base) |
 
 Node IDs may contain ASCII letters, digits, `_`, and `-`; `base` is reserved.
 Duplicate IDs, forward references, cycles, duplicate keys, and empty required
@@ -300,13 +374,17 @@ fields are rejected.
 
 ```bash
 cd impl
-cargo test --features server --test protocol_v2_websocket
+cargo test --features server --test protocol_v3_websocket
 cargo test --lib --features server websocket
+cargo test --lib --features server engine
 
 cd ../frontend
 npm run test
 ```
 
 The first command performs a real TCP/WebSocket handshake against an ephemeral
-Actix server and verifies subscribe, pipeline snapshots, insert, update, and
-delete propagation.
+Actix server and verifies subscribe, snapshots/deltas, insert/update/delete,
+checkpoint-based repair of a deliberately dropped final delivery, replacement
+generations, and independent connections. Engine tests compare reconstructed
+clients with fresh pipelines across randomized mixed batches; frontend tests
+cover duplicates, gaps, malformed batches, retries, stale sockets, and rendering.

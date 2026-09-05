@@ -12,6 +12,7 @@ use crate::messages::{ClientMessage, ServerMessage, ViewNodeSpec, PROTOCOL_VERSI
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+const PIPELINE_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 type JsonRow = HashMap<String, JsonValue>;
 
@@ -26,16 +27,7 @@ fn serialize_ws_message(message: &ServerMessage) -> String {
 }
 
 fn snapshot_message(table_name: &str, snapshot: NodeSnapshot) -> ServerMessage {
-    ServerMessage::ViewData {
-        table_name: table_name.to_string(),
-        pipeline_generation: snapshot.pipeline_generation,
-        node_id: snapshot.node_id,
-        source_id: snapshot.source_id,
-        kind: snapshot.kind,
-        seq: snapshot.seq,
-        columns: snapshot.columns,
-        rows: snapshot.rows,
-    }
+    snapshot.into_message(table_name)
 }
 
 /// The one outbound path to a WebSocket (or an actor-test probe).
@@ -98,6 +90,16 @@ struct SetPipeline {
 
 #[derive(Message)]
 #[rtype(result = "()")]
+struct QueryView {
+    conn: ConnId,
+    table_name: String,
+    pipeline_generation: u32,
+    node_id: String,
+    requester: ClientRecipient,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
 struct Disconnect {
     conn: ConnId,
 }
@@ -144,12 +146,12 @@ impl TableEngineActor {
 
     fn propagate_views(&mut self, table_name: &str) {
         let collected = self.engine.tick_and_collect(table_name);
-        for (conn, snapshots) in collected {
+        for (conn, messages) in collected {
             let Some(recipient) = self.connections.get(&conn) else {
                 continue;
             };
-            for snapshot in snapshots {
-                Self::send(recipient, snapshot_message(table_name, snapshot));
+            for message in messages {
+                Self::send(recipient, message);
             }
         }
     }
@@ -172,6 +174,16 @@ impl TableEngineActor {
 
 impl Actor for TableEngineActor {
     type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        ctx.run_interval(PIPELINE_STATUS_INTERVAL, |actor, _| {
+            for (conn, message) in actor.engine.pipeline_statuses() {
+                if let Some(recipient) = actor.connections.get(&conn) {
+                    Self::send(recipient, message);
+                }
+            }
+        });
+    }
 }
 
 impl Handler<SubscribeBase> for TableEngineActor {
@@ -287,6 +299,28 @@ impl Handler<Disconnect> for TableEngineActor {
     }
 }
 
+impl Handler<QueryView> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: QueryView, _ctx: &mut Self::Context) {
+        let response = self
+            .engine
+            .query_view(
+                message.conn,
+                &message.table_name,
+                message.pipeline_generation,
+                &message.node_id,
+            )
+            .unwrap_or_else(|error| ServerMessage::ViewError {
+                table_name: message.table_name,
+                pipeline_generation: message.pipeline_generation,
+                node_id: message.node_id,
+                message: error,
+            });
+        Self::send(&message.requester, response);
+    }
+}
+
 /// Cloneable application state shared by HTTP workers. The contained address
 /// routes every operation back to the one engine actor.
 pub struct AppState {
@@ -295,8 +329,17 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        Self::with_engine(TableEngine::new())
+    }
+
+    /// Start the actor with a pre-seeded engine, on the current Actix thread.
+    pub fn with_engine(engine: TableEngine) -> Self {
         Self {
-            engine: TableEngineActor::new().start(),
+            engine: TableEngineActor {
+                engine,
+                ..TableEngineActor::new()
+            }
+            .start(),
         }
     }
 }
@@ -390,6 +433,19 @@ impl TableWebSocket {
                     table_name,
                     pipeline_generation,
                     nodes,
+                    requester,
+                });
+            }
+            ClientMessage::QueryView {
+                table_name,
+                pipeline_generation,
+                node_id,
+            } => {
+                self.state.engine.do_send(QueryView {
+                    conn: self.conn_id,
+                    table_name,
+                    pipeline_generation,
+                    node_id,
                     requester,
                 });
             }
@@ -589,7 +645,7 @@ mod tests {
         assert!(messages.iter().any(|message| matches!(
             message,
             ServerMessage::Subscribed {
-                protocol_version: 2,
+                protocol_version: 3,
                 ..
             }
         )));

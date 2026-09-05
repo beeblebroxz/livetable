@@ -74,8 +74,10 @@ vectors. A sort's 256 input events can produce 512 output events, so a child
 filter/sort with the same 256-input bound can legitimately rebuild.
 
 Views other than filters and sorts still expose no output changeset. The
-WebSocket server still emits full `ViewData` snapshots. These measurements
-exclude Python callbacks, serialization, network delivery, and rendering.
+WebSocket server emitted full `ViewData` snapshots at this milestone; the subsequent
+[protocol-v3 delivery milestone](PIPELINE_DELIVERY.md) adds bounded base/filter/sort
+deltas with snapshot recovery. The measurements below still exclude Python
+callbacks, serialization, network delivery, and rendering.
 
 ## Reproducible benchmark
 

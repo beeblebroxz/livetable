@@ -28,6 +28,7 @@ guarantees. See [Performance and Benchmarking](docs/PERFORMANCE_COMPARISON.md).
 - **Shared-source views** - Views read source rows while caching indices, sort keys, or aggregate state as needed
 - **Reactive updates** - `tick()` incrementally synchronizes registered views
 - **Incremental sorted pipelines** - Small batches propagate through filter → sort → group
+- **Incremental browser delivery** - Protocol-v3 base/filter/sort deltas with snapshot recovery
 - **Type safety** - Schema-enforced types catch errors early
 - **Pythonic API** - Natural Python syntax with indexing, slicing, and iteration
 
@@ -178,7 +179,8 @@ In Rust, any view can parent any other view — every view implements the
 Filters and sorted views publish changesets, allowing
 `table -> filter -> sort -> group_by` to update incrementally in Rust and Python.
 Small batches evaluate only changed rows; an edit that stays outside the filter
-produces no downstream changes in these engine stages (wire snapshots are separate).
+produces no downstream changes in these engine stages. Protocol v3 also suppresses
+empty filter/sort deliveries; aggregate nodes still use snapshots.
 Each filter/sort retains one batch of history and rebuilds for more than 256
 input changes or unavailable history. Sorts cache only sort-key columns and
 index mappings, not complete source rows. Non-sort edits forward without a
@@ -356,7 +358,7 @@ cargo clippy --manifest-path impl/Cargo.toml --all-targets -- -D warnings
 cargo clippy --manifest-path impl/Cargo.toml --all-targets --features server -- -D warnings
 env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo clippy --manifest-path impl/Cargo.toml --all-targets --features python -- -D warnings
 cargo test --manifest-path impl/Cargo.toml --features server --lib --test filter_pipeline --test sorted_pipeline --test forward_prop_fuzz
-cargo test --manifest-path impl/Cargo.toml --features server --test protocol_v2_websocket
+cargo test --manifest-path impl/Cargo.toml --features server --test protocol_v3_websocket
 python3 -m pytest -c tests/pytest.ini
 (cd frontend && npm run lint && npm run test && npm run build)
 ```
@@ -365,10 +367,10 @@ See [tests/README.md](tests/README.md) for the full test matrix and toolchain sp
 
 ## React Frontend
 
-Real-time table editor with WebSocket sync. Protocol v2 also supports
+Real-time table editor with WebSocket sync. Protocol v3 also supports
 connection-local server-computed pipelines: the forward-propagation demo sends
-`SetPipeline` definitions and renders Rust-engine `ViewData` snapshots for the
-base, filter, sort, and group nodes. Expression rebuilds are debounced and
+`SetPipeline` definitions and renders Rust-engine snapshots plus ordered deltas
+for base/filter/sort nodes; group nodes retain snapshots. Expression rebuilds are debounced and
 generation-scoped so stale responses cannot overwrite newer definitions.
 
 ```bash
@@ -383,12 +385,13 @@ npm install && npm run dev
 
 The current demo client connects to `ws://<current-host>:8080/ws` by default. Set
 `VITE_LIVETABLE_WS_URL=ws://host:port/ws` when starting Vite to override it.
-See [WebSocket Protocol v2](docs/WEBSOCKET_PROTOCOL.md) for message schemas and
+See [WebSocket Protocol v3](docs/WEBSOCKET_PROTOCOL.md) for message schemas and
 reconciliation rules.
 
-Pipeline nodes still send full snapshots, including the pipeline's base node;
-internal filter/sort changesets are not transmitted as deltas. Pipeline delta
-delivery with resynchronization is planned, not implemented.
+Pipeline deltas have independent per-node delivery baselines. Missing history
+falls back to snapshots; generation-scoped `QueryView` and periodic checkpoints
+recover delivery gaps, including a lost final update. Derived rows still have
+no stable wire IDs. See [delivery design and measurements](docs/PIPELINE_DELIVERY.md).
 
 ## Project Structure
 
@@ -442,7 +445,7 @@ livetable/
 - [Filter propagation contract](docs/INCREMENTAL_FILTER_PIPELINE.md)
 - [Sorted pipeline contract and benchmarks](docs/INCREMENTAL_SORTED_PIPELINE.md)
 - [Join semantics](docs/JOIN_FEATURE.md)
-- [WebSocket protocol v2](docs/WEBSOCKET_PROTOCOL.md)
+- [WebSocket protocol v3](docs/WEBSOCKET_PROTOCOL.md)
 - [Test matrix](tests/README.md)
 
 ## License

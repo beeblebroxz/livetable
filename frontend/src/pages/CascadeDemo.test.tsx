@@ -4,7 +4,7 @@ import { FakeWebSocket } from '../test/fakeWebSocket';
 import { PIPELINE_DEBOUNCE_MS } from '../hooks/usePipeline';
 import { CascadeDemo } from './CascadeDemo';
 
-describe('CascadeDemo protocol-v2 integration', () => {
+describe('CascadeDemo protocol-v3 integration', () => {
   beforeEach(() => {
     FakeWebSocket.reset();
     vi.useFakeTimers();
@@ -60,7 +60,7 @@ describe('CascadeDemo protocol-v2 integration', () => {
       socket.receive({
         type: 'Subscribed',
         table_name: 'demo',
-        protocol_version: 2,
+        protocol_version: 3,
       });
       socket.receive({
         type: 'ViewData',
@@ -128,6 +128,20 @@ describe('CascadeDemo protocol-v2 integration', () => {
       column: 'amount',
       value: 600,
     });
+
+    await act(async () => {
+      socket.receive({ type: 'ViewDelta', table_name: 'demo', pipeline_generation: 1,
+        node_id: 'base', from_seq: 3, seq: 4,
+        changes: [{ type: 'CellUpdated', index: 0, column: 'amount', value: 600 }],
+      });
+      socket.receive({ type: 'ViewDelta', table_name: 'demo', pipeline_generation: 1,
+        node_id: 'high-value', from_seq: 4, seq: 5,
+        changes: [{ type: 'RowInserted', index: 0, row: { row_id: null, row: { region: 'West', product: 'Widget', amount: 600 } } }],
+      });
+    });
+    expect((screen.getByLabelText('Edit amount for row 1') as HTMLInputElement).value).toBe('600');
+    expect(screen.queryByText('$1,001')).toBeNull();
+    expect(screen.getAllByText('$600').length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getAllByRole('button', { name: 'Delete' })[1]);
     expect(socket.sentMessages[socket.sentMessages.length - 1]).toEqual({

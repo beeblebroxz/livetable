@@ -12,6 +12,22 @@ as measurements of the recorded machine, commit, and workload, not guarantees.
 
 ## Benchmark surfaces
 
+### Pipeline WebSocket delivery
+
+The [delivery report](PIPELINE_DELIVERY.md) compares snapshot-only protocol v2
+with protocol-v3 deltas at the actual localhost WebSocket boundary. The Node
+client uses the production delta reducer; timing ends at reconstructed client
+state, not React rendering. It reports JSON payload bytes and latency separately
+from periodic checkpoint traffic, with an identical seed/client harness on both
+implementations. Initial and recovery snapshots remain full-sized.
+
+```bash
+cargo build --manifest-path impl/Cargo.toml --release --features server --example pipeline_delivery_server
+node benchmarks/pipeline_delivery.mjs "$PWD/impl/target/release/examples/pipeline_delivery_server" 10000 100000
+```
+
+The harness needs Node 24+ and permission to bind an ephemeral localhost server.
+
 ### Column memory layout
 
 The [typed storage report](TYPED_COLUMN_STORAGE.md) explains native-width

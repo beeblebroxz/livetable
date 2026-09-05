@@ -17,6 +17,11 @@ export interface WireViewRecord {
   row: TableRow;
 }
 
+export type ViewChange =
+  | { type: 'RowInserted'; index: number; row: WireViewRecord }
+  | { type: 'RowDeleted'; index: number }
+  | { type: 'CellUpdated'; index: number; column: string; value: ScalarValue };
+
 export interface PipelineSnapshot {
   generation: number;
   nodeId: string;
@@ -65,9 +70,15 @@ export type ClientMessage =
       table_name: string;
       pipeline_generation: number;
       nodes: ViewNodeSpec[];
+    }
+  | {
+      type: 'QueryView';
+      table_name: string;
+      pipeline_generation: number;
+      node_id: string;
     };
 
-// `seq` is the server's monotonic change count. `TableData` reports the count
+// Flat-table `seq` is the server's monotonic change count. `TableData` reports the count
 // its snapshot was taken at; each delta reports the count after it was applied.
 // Clients drop any delta whose `seq` is <= the snapshot's `seq` (already
 // reflected) and apply the rest. See ServerMessage in impl/src/messages.rs.
@@ -87,6 +98,21 @@ export type ServerMessage =
       seq: number;
       columns: string[];
       rows: WireViewRecord[];
+    }
+  | {
+      type: 'ViewDelta';
+      table_name: string;
+      pipeline_generation: number;
+      node_id: string;
+      from_seq: number;
+      seq: number;
+      changes: ViewChange[];
+    }
+  | {
+      type: 'PipelineStatus';
+      table_name: string;
+      pipeline_generation: number;
+      sequences: Record<string, number>;
     }
   | {
       type: 'ViewError';

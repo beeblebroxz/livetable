@@ -245,6 +245,7 @@ items below remain original future ideas.
 - [x] Python bindings via PyO3
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)
 - [x] Protocol v2 server-computed view pipelines (per-connection filter/sort/group DAGs with generation-scoped snapshots)
+- [x] Protocol v3 base/filter/sort delta delivery, node-local baselines, snapshot fallback, and checkpoint-based resynchronization
 - [x] RIGHT and FULL OUTER joins
 - [x] Multi-column joins (composite key support)
 - [x] Bulk/Batch operations (`append_rows`)
@@ -253,7 +254,7 @@ items below remain original future ideas.
 
 ### Planned
 - [ ] General-purpose fully materialized row views (beyond existing key/group caches)
-- [ ] Pipeline WebSocket delta delivery and derived-row identity (currently full snapshots)
+- [ ] Aggregate WebSocket deltas and stable derived-row identity (groups still use snapshots)
 - [ ] Persistence and recovery
 - [ ] Parallel view execution
 - [ ] SQL/query-planning layer

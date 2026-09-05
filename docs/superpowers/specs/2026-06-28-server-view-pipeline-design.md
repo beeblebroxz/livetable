@@ -10,8 +10,9 @@ Use the [protocol reference](../../WEBSOCKET_PROTOCOL.md) for current message
 shapes, generation/sequence rules, and limits. Subsequent bounded mixed-batch
 [filter](../../INCREMENTAL_FILTER_PIPELINE.md) and
 [sorted](../../INCREMENTAL_SORTED_PIPELINE.md) propagation supersede the
-single-change-only verification note below. Full pipeline snapshots remain the
-wire format; pipeline deltas are planned separately.
+single-change-only verification note below. Subsequent
+[protocol-v3 delivery](../../PIPELINE_DELIVERY.md) adds base/filter/sort deltas
+with snapshot recovery; the original snapshot-only decisions remain below.
 
 ## Original problem
 

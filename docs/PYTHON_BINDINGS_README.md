@@ -458,8 +458,8 @@ whose left side is a `FilterView`). Tables and synchronized filters/sorts expose
 changesets. Both `filtered.group_by(...)` and `ranked.group_by(...)` update their
 aggregates without rescanning all filtered rows for a scalar SUM/COUNT/AVG
 update that does not move a sorted row or change group membership. Changes that
-stay outside the filter emit no downstream events; this does not suppress
-WebSocket snapshots, which are triggered by inherited versions. Python exposes
+stay outside the filter emit no downstream events. Protocol v3 also suppresses
+empty filter/sort wire deliveries; aggregate nodes still use snapshots. Python exposes
 only the chaining methods listed above, not arbitrary Rust DAG construction.
 
 Filter/sort history retains one successful non-empty input batch. Consumers that
@@ -1072,7 +1072,8 @@ amount = row["right_amount"]     # From right table (prefixed!)
 
 Current project-level gaps include persistence, parallel view execution, SQL
 query planning, and a published API compatibility policy. Pipeline delta
-delivery is planned, not implemented. The optional WebSocket server is documented in
+delivery is implemented for base/filter/sort nodes; groups retain snapshots and
+derived-row identity remains planned. The optional WebSocket server is documented in
 [WEBSOCKET_PROTOCOL.md](WEBSOCKET_PROTOCOL.md).
 
 ## Contributing

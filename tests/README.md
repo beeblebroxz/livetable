@@ -85,8 +85,8 @@ cargo test --features server --test filter_pipeline
 # Sorted-coordinate replay, move batches, downstream consumers, and bounded reads
 cargo test --features server --test sorted_pipeline
 
-# Real TCP/WebSocket protocol-v2 integration test
-cargo test --features server --test protocol_v2_websocket
+# Real TCP/WebSocket protocol-v3 integration test
+cargo test --features server --test protocol_v3_websocket
 ```
 
 ### Rust Lint Only
@@ -162,7 +162,8 @@ Rust integration tests under `../impl/tests/`:
 - **forward_prop_fuzz.rs** - Differential randomized view propagation
 - **filter_pipeline.rs** - Filter output coordinates, bounded work, history, and compaction
 - **sorted_pipeline.rs** - Sorted-coordinate replay, move batches, and bounded source reads
-- **protocol_v2_websocket.rs** - Real Actix server and WebSocket boundary
+- **protocol_v3_websocket.rs** - Real WebSocket deltas/snapshots, lost-final-update repair, and connection/generation isolation
+- **engine/delivery_tests.rs** - Reconstructed clients vs fresh pipelines across mixed batches, bounded-history fallback, and node recovery
 
 ## Test Coverage
 
@@ -180,7 +181,8 @@ Rust integration tests under `../impl/tests/`:
 ✅ `tick()` view registration and changeset compaction
 ✅ View chaining
 ✅ WebSocket row mutation semantics and snapshot/delta sequencing
-✅ Protocol-v2 pipeline snapshots across a real TCP/WebSocket connection
+✅ Protocol-v3 pipeline deltas/snapshots and checkpoint-based repair across real TCP/WebSocket connections
+✅ Atomic client batches, stale/duplicate/gapped deliveries, bounded repair retries, generation cleanup, and delta-driven rendering
 ✅ Real-world workflows
 ✅ Performance with 1000+ rows
 
@@ -250,7 +252,7 @@ It runs:
 3. Rust `clippy` with `-D warnings` for the `python` feature
 4. Rust library tests with the `server` feature enabled
 5. Filter/sorted pipeline contracts and randomized forward-propagation tests
-6. The protocol-v2 real-WebSocket integration test
+6. The protocol-v3 real-WebSocket integration test
 7. Python package build plus pytest suite on Python 3.12
 8. Frontend lint, Vitest, and production build
 

@@ -5,8 +5,9 @@ original work, not tasks to execute now. The [protocol reference](../../WEBSOCKE
 is authoritative for current wire behavior. Since this plan, bounded mixed-batch
 [filter](../../INCREMENTAL_FILTER_PIPELINE.md) and
 [sorted](../../INCREMENTAL_SORTED_PIPELINE.md) propagation have landed; the
-single-change-only guidance below describes the original milestone. Pipeline
-delivery still uses full snapshots, not derived deltas.
+single-change-only guidance below describes the original milestone. Subsequent
+[protocol-v3 delivery](../../PIPELINE_DELIVERY.md) adds base/filter/sort deltas
+with snapshot recovery; the snapshot-only instructions below remain historical.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

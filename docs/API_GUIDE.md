@@ -347,11 +347,14 @@ lose the incremental path.
 
 With the `server` feature, the crate exports:
 
-- `messages`: protocol-v2 wire types.
+- `messages`: protocol-v3 wire types, including ordered `ViewDelta` operations.
 - `pipeline_spec`: bounded wire-spec validation and view construction.
-- `engine`: the single-threaded table/pipeline owner.
+- `engine`: the single-threaded table/pipeline owner. `tick_and_collect()` returns
+  connection-keyed `Vec<ServerMessage>` deliveries (deltas, snapshots, or errors).
+  `query_view()` rebaselines one node; `pipeline_statuses()` returns watermarks.
 - `websocket`: the Actix actor transport.
-- `server`: HTTP/WebSocket server construction.
+- `server`: HTTP/WebSocket server construction, including
+  `server_from_listener_with_engine()` for pre-seeded embedded/test servers.
 
 Run it with:
 
@@ -369,7 +372,7 @@ From the repository root:
 
 ```bash
 cargo test --manifest-path impl/Cargo.toml --lib --features server
-cargo test --manifest-path impl/Cargo.toml --features server --test filter_pipeline --test sorted_pipeline --test forward_prop_fuzz --test protocol_v2_websocket
+cargo test --manifest-path impl/Cargo.toml --features server --test filter_pipeline --test sorted_pipeline --test forward_prop_fuzz --test protocol_v3_websocket
 cargo doc --manifest-path impl/Cargo.toml --no-deps
 ```
 

@@ -45,8 +45,8 @@ npm run dev
 The default server endpoint is `ws://127.0.0.1:8080/ws`. The Forward Prop Demo
 uses real server-owned filter, sort, and group views. Small batches now propagate
 incrementally through that chain in Rust and Python, including
-`ranked.group_by(...)`. The pipeline wire protocol still sends full snapshots;
-delta delivery is a planned next milestone.
+`ranked.group_by(...)`. Protocol v3 delivers bounded base/filter/sort deltas with
+snapshot recovery; group nodes retain full snapshots.
 
 ## Choose the right guide
 
@@ -57,7 +57,8 @@ delta delivery is a planned next milestone.
 - [Filter propagation](INCREMENTAL_FILTER_PIPELINE.md): shared Rust/Python replay
 - [Sorted pipelines](INCREMENTAL_SORTED_PIPELINE.md): latest contract, limits, and benchmarks
 - [Join operations](JOIN_FEATURE.md): join types and incremental behavior
-- [WebSocket protocol v2](WEBSOCKET_PROTOCOL.md): base and pipeline messages
+- [WebSocket protocol v3](WEBSOCKET_PROTOCOL.md): deltas, snapshots, and recovery
+- [Pipeline delivery](PIPELINE_DELIVERY.md): implementation and measured transport costs
 - [Original design vision](ORIGINAL_VISION.md): architecture goals and status
 - [Performance](PERFORMANCE_COMPARISON.md): benchmark methodology
 - [Test suite](../tests/README.md): local and CI verification

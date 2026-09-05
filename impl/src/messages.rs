@@ -19,6 +19,28 @@ pub struct WireViewRow {
     pub row: HashMap<String, JsonValue>,
 }
 
+/// Ordered edits in a node's own row coordinates. Indices refer to the state
+/// at that step in the batch, not the final view. Derived identities stay null.
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "type")]
+pub enum ViewChange {
+    RowInserted {
+        index: usize,
+        row: WireViewRow,
+    },
+    RowDeleted {
+        index: usize,
+    },
+    CellUpdated {
+        index: usize,
+        column: String,
+        value: JsonValue,
+    },
+}
+
+/// Maximum operations in one delta and in the engine's pending base journal.
+pub const MAX_VIEW_DELTA_CHANGES: usize = 512;
+
 /// One sort key in a `Sort` view spec.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SortKeySpec {
@@ -100,11 +122,19 @@ pub enum ClientMessage {
         pipeline_generation: u32,
         nodes: Vec<ViewNodeSpec>,
     },
+
+    /// Rebaseline one installed node without rebuilding the pipeline. The
+    /// generation must still be current for this connection and table.
+    QueryView {
+        table_name: String,
+        pipeline_generation: u32,
+        node_id: String,
+    },
 }
 
 /// Messages sent from server to client
 ///
-/// `TableData` and every incremental delta carry a `seq`: the table's total
+/// `TableData` and flat-table deltas carry a `seq`: the table's total
 /// change count (`Changeset::total_len`) captured in the same serialized engine
 /// operation as the snapshot or mutation it describes. Because that counter is monotonic, a
 /// client can reconcile a snapshot with concurrently-broadcast deltas: any
@@ -160,8 +190,8 @@ pub enum ServerMessage {
         protocol_version: u32,
     },
 
-    /// Full snapshot of one derived-view node after a tick. One per pipeline
-    /// node whose output changed. Rows without a stable identity carry a null
+    /// Initial, fallback, or requested snapshot of one pipeline node.
+    /// Rows without a stable identity carry a null
     /// `row_id`; the `base` node carries real row ids so the client can
     /// edit/delete.
     ViewData {
@@ -171,10 +201,30 @@ pub enum ServerMessage {
         node_id: String,
         source_id: String,
         kind: String,
-        /// The node's monotonic version at snapshot time (own counter + parent).
+        /// Connection/generation/node-local delivery sequence, starting at zero.
+        /// Not a view version, changeset cursor, or flat-table sequence.
         seq: u64,
         columns: Vec<String>,
         rows: Vec<WireViewRow>,
+    },
+
+    /// Apply the entire ordered batch atomically, only on exactly `from_seq`.
+    /// Duplicate/old deliveries may be ignored; a gap requires QueryView.
+    ViewDelta {
+        table_name: String,
+        pipeline_generation: u32,
+        node_id: String,
+        from_seq: u64,
+        seq: u64,
+        changes: Vec<ViewChange>,
+    },
+
+    /// Periodic delivery watermarks detect a lost final delta or snapshot even
+    /// when there are no further mutations. They carry no row payloads.
+    PipelineStatus {
+        table_name: String,
+        pipeline_generation: u32,
+        sequences: HashMap<String, u64>,
     },
 
     /// A pipeline node failed to build/evaluate (e.g. a bad expression).
@@ -192,7 +242,7 @@ pub enum ServerMessage {
 
 /// Current server→client wire-protocol version. Bump on breaking changes to
 /// message shapes or semantics.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -205,7 +255,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"protocol_version\":2"), "got: {}", json);
+        assert!(json.contains("\"protocol_version\":3"), "got: {}", json);
         assert!(json.contains("\"type\":\"Subscribed\""), "got: {}", json);
     }
 

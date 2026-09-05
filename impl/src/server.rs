@@ -27,7 +27,16 @@ async fn health_check() -> HttpResponse {
 /// listener lets integration tests use an OS-assigned ephemeral port while
 /// production still binds the configured host and port through `run_server`.
 pub fn server_from_listener(listener: TcpListener) -> std::io::Result<actix_web::dev::Server> {
-    let state = web::Data::new(AppState::new());
+    server_from_listener_with_engine(listener, crate::engine::TableEngine::new())
+}
+
+/// Same transport with a pre-seeded engine (for embedding and reproducible
+/// delivery benchmarks). The default demo entry point is unchanged.
+pub fn server_from_listener_with_engine(
+    listener: TcpListener,
+    engine: crate::engine::TableEngine,
+) -> std::io::Result<actix_web::dev::Server> {
+    let state = web::Data::new(AppState::with_engine(engine));
 
     Ok(HttpServer::new(move || {
         App::new()

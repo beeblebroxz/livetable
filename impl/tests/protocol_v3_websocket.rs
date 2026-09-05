@@ -1,7 +1,7 @@
 #![cfg(feature = "server")]
 
 use serde_json::{json, Value as JsonValue};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener};
 use std::time::Duration;
 use tokio::io::{
@@ -13,6 +13,9 @@ use tokio::net::TcpStream;
 struct RawWebSocket {
     reader: BufReader<ReadHalf<TcpStream>>,
     writer: WriteHalf<TcpStream>,
+    snapshots: HashMap<String, JsonValue>,
+    generation: u64,
+    drop_next_node: Option<String>,
 }
 
 impl RawWebSocket {
@@ -39,7 +42,13 @@ impl RawWebSocket {
             }
         }
 
-        Self { reader, writer }
+        Self {
+            reader,
+            writer,
+            snapshots: HashMap::new(),
+            generation: 0,
+            drop_next_node: None,
+        }
     }
 
     async fn send_json(&mut self, value: JsonValue) {
@@ -53,7 +62,11 @@ impl RawWebSocket {
                     .await
                     .expect("timed out waiting for a server WebSocket frame");
             match opcode {
-                0x1 => return serde_json::from_slice(&payload).unwrap(),
+                0x1 => {
+                    let message: JsonValue = serde_json::from_slice(&payload).unwrap();
+                    self.reconstruct(&message);
+                    return message;
+                }
                 0x9 => write_client_frame(&mut self.writer, 0xA, &payload).await,
                 0x8 => panic!("server closed WebSocket before test completed"),
                 other => panic!("unexpected WebSocket opcode {other}"),
@@ -64,11 +77,54 @@ impl RawWebSocket {
     async fn receive_view(&mut self, node_id: &str) -> JsonValue {
         for _ in 0..16 {
             let message = self.receive_json().await;
-            if message["type"] == "ViewData" && message["node_id"] == node_id {
+            if (message["type"] == "ViewData" || message["type"] == "ViewDelta")
+                && message["node_id"] == node_id
+            {
                 return message;
             }
         }
         panic!("did not receive ViewData for node '{node_id}'");
+    }
+
+    fn reconstruct(&mut self, message: &JsonValue) {
+        let Some(kind @ ("ViewData" | "ViewDelta")) = message["type"].as_str() else {
+            return;
+        };
+        let node = message["node_id"].as_str().unwrap();
+        if self.drop_next_node.as_deref() == Some(node) {
+            self.drop_next_node = None;
+            return;
+        }
+        let generation = message["pipeline_generation"].as_u64().unwrap();
+        if generation < self.generation {
+            return;
+        }
+        if generation > self.generation {
+            self.generation = generation;
+            self.snapshots.clear();
+        }
+        if kind == "ViewData" {
+            self.snapshots.insert(node.into(), message.clone());
+        } else {
+            let snapshot = self.snapshots.get_mut(node).expect("delta needs baseline");
+            assert_eq!(snapshot["seq"], message["from_seq"]);
+            let rows = snapshot["rows"].as_array_mut().unwrap();
+            for change in message["changes"].as_array().unwrap() {
+                let index = change["index"].as_u64().unwrap() as usize;
+                match change["type"].as_str().unwrap() {
+                    "RowInserted" => rows.insert(index, change["row"].clone()),
+                    "RowDeleted" => {
+                        rows.remove(index);
+                    }
+                    "CellUpdated" => {
+                        rows[index]["row"][change["column"].as_str().unwrap()] =
+                            change["value"].clone();
+                    }
+                    other => panic!("unknown operation {other}"),
+                }
+            }
+            snapshot["seq"] = message["seq"].clone();
+        }
     }
 
     async fn close(&mut self) {
@@ -140,7 +196,7 @@ where
 }
 
 #[actix::test]
-async fn protocol_v2_pipeline_crosses_real_websocket_boundary() {
+async fn protocol_v3_pipeline_crosses_real_websocket_boundary() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let server = livetable::server::server_from_listener(listener).unwrap();
@@ -171,7 +227,7 @@ async fn protocol_v2_pipeline_crosses_real_websocket_boundary() {
         let message = socket.receive_json().await;
         match message["type"].as_str() {
             Some("Subscribed") => {
-                assert_eq!(message["protocol_version"], 2);
+                assert_eq!(message["protocol_version"], 3);
                 subscribed = true;
             }
             Some("ViewData") => {
@@ -186,6 +242,9 @@ async fn protocol_v2_pipeline_crosses_real_websocket_boundary() {
         HashSet::from(["base".into(), "f".into(), "s".into(), "g".into()])
     );
 
+    // Deliberately lose the filter's final update; periodic watermarks must
+    // reveal the gap even without a subsequent mutation.
+    socket.drop_next_node = Some("f".into());
     socket
         .send_json(json!({
             "type": "InsertRow",
@@ -201,6 +260,25 @@ async fn protocol_v2_pipeline_crosses_real_websocket_boundary() {
         .find(|row| row["row"]["region"] == "West")
         .unwrap();
     assert_eq!(west["row"]["total"], 700.0);
+    assert_eq!(
+        socket.snapshots["base"]["rows"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(socket.snapshots["s"]["rows"][0]["row"]["amount"], 700.0);
+    assert_eq!(socket.snapshots["f"]["seq"], 0);
+    loop {
+        let message = socket.receive_json().await;
+        if message["type"] == "PipelineStatus" {
+            assert_eq!(message["pipeline_generation"], 41);
+            assert_eq!(message["sequences"]["f"], 1);
+            break;
+        }
+    }
+    socket.send_json(json!({"type":"QueryView", "table_name":"demo", "pipeline_generation":41, "node_id":"f"})).await;
+    let repaired = socket.receive_view("f").await;
+    assert_eq!(repaired["type"], "ViewData");
+    assert_eq!(repaired["seq"], 2);
+    assert_eq!(repaired["rows"][0]["row"]["amount"], 700.0);
 
     socket
         .send_json(json!({
@@ -226,11 +304,42 @@ async fn protocol_v2_pipeline_crosses_real_websocket_boundary() {
         }))
         .await;
     let deleted_base = socket.receive_view("base").await;
-    assert!(deleted_base["rows"]
+    assert_eq!(deleted_base["type"], "ViewDelta");
+    assert!(socket.snapshots["base"]["rows"]
         .as_array()
         .unwrap()
         .iter()
         .all(|row| row["row_id"] != 3));
+
+    // Querying a node advances only that node's sequence; normal deltas above
+    // still applied correctly after the repair. Replacement resets baselines.
+    socket.send_json(json!({"type":"SetPipeline", "table_name":"demo", "pipeline_generation":42, "nodes":[]})).await;
+    let replacement = socket.receive_view("base").await;
+    assert_eq!(replacement["pipeline_generation"], 42);
+    assert_eq!(replacement["seq"], 0);
+    assert_eq!(socket.snapshots.len(), 1);
+    socket.send_json(json!({"type":"QueryView", "table_name":"demo", "pipeline_generation":41, "node_id":"f"})).await;
+    loop {
+        let message = socket.receive_json().await;
+        if message["type"] == "ViewError" {
+            assert_eq!(message["pipeline_generation"], 41);
+            break;
+        }
+    }
+
+    // An independent connection gets its own generation/baseline and current
+    // stable base IDs, not the first connection's delivery sequence.
+    let mut second = RawWebSocket::connect(address).await;
+    second
+        .send_json(
+            json!({"type":"SetPipeline", "table_name":"demo", "pipeline_generation":1, "nodes":[]}),
+        )
+        .await;
+    let independent = second.receive_view("base").await;
+    assert_eq!(independent["seq"], 0);
+    assert_eq!(independent["rows"], replacement["rows"]);
+    second.close().await;
+    drop(second);
 
     socket.close().await;
     drop(socket);

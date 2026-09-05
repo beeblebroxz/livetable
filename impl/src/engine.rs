@@ -6,15 +6,23 @@
 
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::column::{ColumnType, ColumnValue};
-use crate::messages::{ServerMessage, ViewKindSpec, ViewNodeSpec, WireTableRow, WireViewRow};
+use crate::messages::{
+    ServerMessage, ViewChange, ViewKindSpec, ViewNodeSpec, WireTableRow, WireViewRow,
+    MAX_VIEW_DELTA_CHANGES,
+};
 use crate::pipeline_spec::{build_filter, build_group, build_sort, validate_pipeline_spec};
 use crate::readable::ReadableTable;
 use crate::table::{Schema, Table};
 use crate::view::TickableTable;
+
+mod delivery;
+#[cfg(test)]
+mod delivery_tests;
+use delivery::DeliveryState;
 
 pub type ConnId = u64;
 type JsonRow = HashMap<String, JsonValue>;
@@ -37,13 +45,14 @@ struct ViewNode {
     source_id: String,
     kind: String,
     view: Rc<RefCell<dyn ReadableTable>>,
-    last_seq: u64,
+    delivery: DeliveryState,
 }
 
 struct Pipeline {
     generation: u32,
     nodes: Vec<ViewNode>,
     base_last_seq: u64,
+    base_delivery_seq: u64,
 }
 
 struct BaseState {
@@ -52,6 +61,9 @@ struct BaseState {
     row_ids: Vec<u64>,
     next_row_id: u64,
     pipelines: HashMap<ConnId, Pipeline>,
+    // Captured at mutation time so deleted/shifted rows retain the right IDs.
+    // Root changesets are compacted by tick before delivery is collected.
+    pending_base: VecDeque<(u64, ViewChange)>,
 }
 
 impl BaseState {
@@ -65,6 +77,7 @@ impl BaseState {
             row_ids: (1..=row_count).collect(),
             next_row_id: row_count + 1,
             pipelines: HashMap::new(),
+            pending_base: VecDeque::new(),
         }
     }
 
@@ -93,7 +106,7 @@ impl BaseState {
             node_id: "base".to_string(),
             source_id: "base".to_string(),
             kind: "base".to_string(),
-            seq: table.changeset().total_len() as u64,
+            seq: 0,
             columns,
             rows,
         })
@@ -187,6 +200,13 @@ impl TableEngine {
         base.table.borrow_mut().append_row(converted.clone())?;
         base.next_row_id += 1;
         base.row_ids.push(row_id);
+        base.record_change(ViewChange::RowInserted {
+            index,
+            row: WireViewRow {
+                row_id: Some(row_id),
+                row: row_to_json(&converted),
+            },
+        });
         Ok(ServerMessage::RowInserted {
             table_name: table_name.to_string(),
             seq: base.base_seq(),
@@ -222,6 +242,11 @@ impl TableEngine {
         base.table
             .borrow_mut()
             .set_value(row_index, column, converted.clone())?;
+        base.record_change(ViewChange::CellUpdated {
+            index: row_index,
+            column: column.to_string(),
+            value: column_value_to_json(&converted),
+        });
         Ok(ServerMessage::CellUpdated {
             table_name: table_name.to_string(),
             seq: base.base_seq(),
@@ -241,6 +266,7 @@ impl TableEngine {
             .ok_or_else(|| format!("Row '{row_id}' not found"))?;
         base.table.borrow_mut().delete_row(row_index)?;
         base.row_ids.remove(row_index);
+        base.record_change(ViewChange::RowDeleted { index: row_index });
         Ok(ServerMessage::RowDeleted {
             table_name: table_name.to_string(),
             seq: base.base_seq(),
@@ -269,6 +295,17 @@ impl TableEngine {
                 format!("Table '{table_name}' not found"),
             ))];
         };
+
+        if base
+            .pipelines
+            .get(&conn)
+            .is_some_and(|pipeline| pipeline_generation <= pipeline.generation)
+        {
+            return vec![Err((
+                "pipeline".to_string(),
+                "pipeline_generation must increase when replacing a pipeline".to_string(),
+            ))];
+        }
 
         let base_source: Rc<RefCell<dyn ReadableTable>> = base.table.clone();
         let mut sources = HashMap::from([("base".to_string(), base_source)]);
@@ -315,13 +352,13 @@ impl TableEngine {
                     break;
                 }
             };
-            let seq = view.borrow().version();
+            let delivery = DeliveryState::new(&*view.borrow());
             match snapshot_view(
                 pipeline_generation,
                 &spec.id,
                 &spec.source_id,
                 &kind,
-                seq,
+                delivery.seq,
                 &view,
             ) {
                 Ok(snapshot) => results.push(Ok(snapshot)),
@@ -336,7 +373,7 @@ impl TableEngine {
                 source_id: spec.source_id.clone(),
                 kind,
                 view,
-                last_seq: seq,
+                delivery,
             });
         }
 
@@ -347,54 +384,10 @@ impl TableEngine {
                 generation: pipeline_generation,
                 nodes,
                 base_last_seq,
+                base_delivery_seq: 0,
             },
         );
         results
-    }
-
-    /// Propagate one pending base mutation and collect every node whose
-    /// sequence advanced. The caller must invoke this once per mutation.
-    pub fn tick_and_collect(&mut self, table_name: &str) -> HashMap<ConnId, Vec<NodeSnapshot>> {
-        let Some(base) = self.bases.get_mut(table_name) else {
-            return HashMap::new();
-        };
-        base.tickable.tick();
-        let base_seq = base.base_seq();
-        let base_table = base.table.clone();
-        let row_ids = base.row_ids.clone();
-        let mut collected = HashMap::new();
-
-        for (conn, pipeline) in &mut base.pipelines {
-            let mut snapshots = Vec::new();
-            if base_seq > pipeline.base_last_seq {
-                if let Ok(snapshot) =
-                    snapshot_base(pipeline.generation, base_seq, &base_table, &row_ids)
-                {
-                    snapshots.push(snapshot);
-                }
-                pipeline.base_last_seq = base_seq;
-            }
-            for node in &mut pipeline.nodes {
-                let seq = node.view.borrow().version();
-                if seq != node.last_seq {
-                    if let Ok(snapshot) = snapshot_view(
-                        pipeline.generation,
-                        &node.id,
-                        &node.source_id,
-                        &node.kind,
-                        seq,
-                        &node.view,
-                    ) {
-                        snapshots.push(snapshot);
-                    }
-                    node.last_seq = seq;
-                }
-            }
-            if !snapshots.is_empty() {
-                collected.insert(*conn, snapshots);
-            }
-        }
-        collected
     }
 
     pub fn drop_connection(&mut self, conn: ConnId) {
@@ -686,7 +679,7 @@ mod tests {
         }
     }
 
-    fn pipeline_specs() -> Vec<ViewNodeSpec> {
+    pub(super) fn pipeline_specs() -> Vec<ViewNodeSpec> {
         vec![
             ViewNodeSpec {
                 id: "filtered".into(),
@@ -720,6 +713,88 @@ mod tests {
         ]
     }
 
+    pub(super) fn apply_deliveries(
+        client: &mut HashMap<String, NodeSnapshot>,
+        messages: Vec<ServerMessage>,
+    ) {
+        for message in messages {
+            match message {
+                ServerMessage::ViewData {
+                    pipeline_generation,
+                    node_id,
+                    source_id,
+                    kind,
+                    seq,
+                    columns,
+                    rows,
+                    ..
+                } => {
+                    client.insert(
+                        node_id.clone(),
+                        NodeSnapshot {
+                            pipeline_generation,
+                            node_id,
+                            source_id,
+                            kind,
+                            seq,
+                            columns,
+                            rows,
+                        },
+                    );
+                }
+                ServerMessage::ViewDelta {
+                    pipeline_generation,
+                    node_id,
+                    from_seq,
+                    seq,
+                    changes,
+                    ..
+                } => {
+                    let snapshot = client.get_mut(&node_id).expect("initial snapshot");
+                    assert_eq!(pipeline_generation, snapshot.pipeline_generation);
+                    assert_eq!(from_seq, snapshot.seq);
+                    assert_eq!(seq, from_seq + 1);
+                    assert!(!changes.is_empty());
+                    assert!(changes.len() <= MAX_VIEW_DELTA_CHANGES);
+                    for change in changes {
+                        match change {
+                            ViewChange::RowInserted { index, row } => {
+                                snapshot.rows.insert(index, row)
+                            }
+                            ViewChange::RowDeleted { index } => {
+                                snapshot.rows.remove(index);
+                            }
+                            ViewChange::CellUpdated {
+                                index,
+                                column,
+                                value,
+                            } => {
+                                assert!(snapshot.rows[index].row.contains_key(&column));
+                                snapshot.rows[index].row.insert(column, value);
+                            }
+                        }
+                    }
+                    snapshot.seq = seq;
+                }
+                other => panic!("unexpected delivery: {other:?}"),
+            }
+        }
+    }
+
+    fn generation_of(message: &ServerMessage) -> u32 {
+        match message {
+            ServerMessage::ViewData {
+                pipeline_generation,
+                ..
+            }
+            | ServerMessage::ViewDelta {
+                pipeline_generation,
+                ..
+            } => *pipeline_generation,
+            _ => panic!("unexpected delivery"),
+        }
+    }
+
     #[test]
     fn builds_pipeline_and_ticks_after_mutation() {
         let mut engine = TableEngine::new();
@@ -745,13 +820,17 @@ mod tests {
         let collected = engine.tick_and_collect("demo");
         let snapshots = &collected[&7];
         assert_eq!(snapshots.len(), 4);
-        assert_eq!(snapshots[0].node_id, "base");
-        let totals = snapshots
+        assert!(
+            matches!(&snapshots[0], ServerMessage::ViewDelta { node_id, .. } if node_id == "base")
+        );
+        let rows = snapshots
             .iter()
-            .find(|snapshot| snapshot.node_id == "totals")
+            .find_map(|message| match message {
+                ServerMessage::ViewData { node_id, rows, .. } if node_id == "totals" => Some(rows),
+                _ => None,
+            })
             .unwrap();
-        let west = totals
-            .rows
+        let west = rows
             .iter()
             .find(|row| row.row["region"] == json!("West"))
             .unwrap();
@@ -775,10 +854,10 @@ mod tests {
         assert_eq!(collected[&2].len(), 1);
         assert!(collected[&1]
             .iter()
-            .all(|snapshot| snapshot.pipeline_generation == 10));
+            .all(|message| generation_of(message) == 10));
         assert!(collected[&2]
             .iter()
-            .all(|snapshot| snapshot.pipeline_generation == 20));
+            .all(|message| generation_of(message) == 20));
 
         engine.drop_connection(1);
         engine.delete_row("demo", 2).unwrap();
@@ -808,7 +887,7 @@ mod tests {
         assert_eq!(snapshots[&1].len(), 4);
         assert!(snapshots[&1]
             .iter()
-            .all(|snapshot| snapshot.pipeline_generation == 1));
+            .all(|message| generation_of(message) == 1));
     }
 
     #[test]
@@ -876,10 +955,15 @@ mod tests {
 
         for trial in 0..10_u64 {
             let mut engine = TableEngine::new();
-            assert!(engine
-                .set_pipeline(1, "demo", 1, &pipeline_specs())
-                .iter()
-                .all(Result::is_ok));
+            let mut client = HashMap::new();
+            apply_deliveries(
+                &mut client,
+                engine
+                    .set_pipeline(1, "demo", 1, &pipeline_specs())
+                    .into_iter()
+                    .map(|result| result.unwrap().into_message("demo"))
+                    .collect(),
+            );
             let mut shadow = vec![
                 ShadowRow {
                     id: 1,
@@ -940,8 +1024,9 @@ mod tests {
                     engine.delete_row("demo", removed.id).unwrap();
                 }
 
-                let collected = engine.tick_and_collect("demo");
-                let snapshots = &collected[&1];
+                let mut collected = engine.tick_and_collect("demo");
+                apply_deliveries(&mut client, collected.remove(&1).unwrap());
+                let snapshots: Vec<_> = client.values().collect();
                 assert_eq!(snapshots.len(), 4, "trial {trial}, step {step}");
 
                 let base = snapshots

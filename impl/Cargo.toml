@@ -58,3 +58,7 @@ path = "examples/joins.rs"
 name = "livetable-server"
 path = "src/bin/livetable-server.rs"
 required-features = ["server"]
+
+[[example]]
+name = "pipeline_delivery_server"
+required-features = ["server"]

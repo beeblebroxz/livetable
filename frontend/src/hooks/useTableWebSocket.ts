@@ -7,6 +7,7 @@ import type {
   TableRow,
   WireTableRecord,
   WireViewRecord,
+  ViewChange,
 } from '../types';
 
 type DeltaMessage = Extract<
@@ -28,7 +29,9 @@ export const MAX_PENDING_DELTAS = 500;
 // Wire-protocol version this client understands. The server reports its own
 // in the Subscribed handshake; a mismatch is logged so protocol drift is
 // visible instead of failing mysteriously.
-export const SUPPORTED_PROTOCOL_VERSION = 2;
+export const SUPPORTED_PROTOCOL_VERSION = 3;
+
+export const MAX_VIEW_DELTA_CHANGES = 512;
 
 export const getDefaultWebSocketUrl = () => {
   if (configuredWsUrl) {
@@ -75,6 +78,16 @@ const isWireViewRecord = (value: unknown): value is WireViewRecord =>
   (value.row_id === null ||
     isWireInteger(value.row_id)) &&
   isTableRow(value.row);
+
+const isViewChange = (value: unknown): value is ViewChange => {
+  if (!isObject(value) || !isWireInteger(value.index)) return false;
+  switch (value.type) {
+    case 'RowInserted': return isWireViewRecord(value.row);
+    case 'RowDeleted': return true;
+    case 'CellUpdated': return typeof value.column === 'string' && isScalarValue(value.value);
+    default: return false;
+  }
+};
 
 const toTableRecord = (record: WireTableRecord): TableRecord => ({
   rowId: record.row_id,
@@ -157,6 +170,21 @@ export const parseServerMessage = (payload: unknown): ServerMessage | null => {
         typeof parsed.message === 'string'
         ? parsed as ServerMessage
         : null;
+    case 'ViewDelta':
+      return typeof parsed.table_name === 'string' &&
+        isWireInteger(parsed.pipeline_generation) &&
+        typeof parsed.node_id === 'string' &&
+        isWireInteger(parsed.from_seq) &&
+        isWireInteger(parsed.seq) && parsed.seq === parsed.from_seq + 1 &&
+        Array.isArray(parsed.changes) && parsed.changes.length > 0 &&
+        parsed.changes.length <= MAX_VIEW_DELTA_CHANGES && parsed.changes.every(isViewChange)
+        ? parsed as ServerMessage : null;
+    case 'PipelineStatus':
+      return typeof parsed.table_name === 'string' &&
+        isWireInteger(parsed.pipeline_generation) &&
+        isObject(parsed.sequences) && Object.keys(parsed.sequences).length <= 33 &&
+        Object.values(parsed.sequences).every(isWireInteger)
+        ? parsed as ServerMessage : null;
     case 'Error':
       return typeof parsed.message === 'string' ? parsed as ServerMessage : null;
     default:

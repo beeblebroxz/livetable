@@ -98,9 +98,10 @@ npm run dev
 ```
 
 Open the URL printed by Vite. The editor uses base-table synchronization; the
-Forward Prop Demo sends a protocol-v2 filter/sort/group pipeline to the Rust
-server. Its engine updates incrementally, but pipeline transport still sends
-full snapshots. See [docs/WEBSOCKET_PROTOCOL.md](docs/WEBSOCKET_PROTOCOL.md).
+Forward Prop Demo sends a protocol-v3 filter/sort/group pipeline to the Rust
+server. Base/filter/sort nodes use ordered deltas after their initial snapshots;
+groups retain snapshots. Gaps recover through node snapshot requests and periodic
+checkpoints. See [docs/WEBSOCKET_PROTOCOL.md](docs/WEBSOCKET_PROTOCOL.md).
 
 ## Verification
 
@@ -113,7 +114,7 @@ From the repository root, run the propagation and real-server tests directly:
 
 ```bash
 cargo test --manifest-path impl/Cargo.toml --features server --test filter_pipeline --test sorted_pipeline --test forward_prop_fuzz
-cargo test --manifest-path impl/Cargo.toml --features server --test protocol_v2_websocket
+cargo test --manifest-path impl/Cargo.toml --features server --test protocol_v3_websocket
 ```
 
 ## Documentation map
