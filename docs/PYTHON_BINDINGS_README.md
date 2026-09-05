@@ -84,6 +84,11 @@ table.delete_row(1)
 
 ### ✅ Storage Hints
 
+Both backends use native-width column buffers and packed NULL masks. Interned
+strings store IDs without a parallel placeholder buffer. This is internal:
+Python values, schemas, NULL behavior, and method signatures are unchanged.
+See [typed column storage](TYPED_COLUMN_STORAGE.md) for guarantees and measurements.
+
 Choose the optimal storage backend for your workload:
 
 ```python
@@ -1061,6 +1066,7 @@ amount = row["right_amount"]     # From right table (prefixed!)
 - [x] ~~Percentile/Median aggregations (P25, P50, P75, P90, P95, P99)~~ ✅ **DONE!**
 - [x] ~~RIGHT and FULL OUTER joins~~ ✅ **DONE!**
 - [x] Shared Rust/Python filter replay for bounded mixed batches
+- [x] Native-width column buffers, packed NULL masks, and ID-only interned strings
 - [x] Sorted-coordinate replay and `SortedView.group_by()` chaining
 - [x] Batched aggregate index remapping for sorted row moves
 

@@ -49,6 +49,10 @@ users.append_row({
 Every field is validated against its schema. Use `None` only for nullable
 columns.
 
+Storage uses native-width column buffers with packed NULL masks on both
+backends. Python values and APIs are unchanged; see
+[typed column storage](TYPED_COLUMN_STORAGE.md) for memory and update-cost details.
+
 Supported column types are `INT32`, `INT64`, `FLOAT32`, `FLOAT64`, `STRING`,
 `BOOL`, `DATE`, and `DATETIME`.
 

@@ -107,7 +107,7 @@ cd frontend && npm install && npm run dev
 
 ### Layered Design (impl/src/)
 - **sequence.rs** - Storage backends: `ArraySequence` (contiguous, default), `TieredVectorSequence` (O(√N) inserts, backed by [tiered-vector](https://crates.io/crates/tiered-vector) crate)
-- **column.rs** - Strongly-typed column values with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
+- **column.rs** + **column/** - Public ColumnValue API over native-width typed buffers, packed array/tiered NULL masks, and ID-only interned strings; storage/bitmap model tests live alongside the implementation
 - **table.rs** - Row-level CRUD operations on column collections
 - **readable.rs** - `ReadableTable` trait: the read surface shared by `Table` and every view, enabling views-over-views (DAG composition)
 - **view.rs** + **view/** - Shared-source views, one file per type: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`, `AggregateView`, `TickableTable`; view.rs holds shared typed join-key machinery; tests in view/tests.rs
@@ -117,6 +117,9 @@ cd frontend && npm install && npm run dev
 - **websocket.rs** + **messages.rs** - Actix transport and protocol-v2 real-time sync
 
 ### Key Patterns
+- `ColumnData` selects `Sequence<T>` once per column; never reintroduce a per-cell enum or an interned-string placeholder buffer. `ColumnValue` stays at API/event boundaries. Numeric `get_f64()` must preserve NULL/type semantics and float bits.
+- `NullBitmap` packs array flags into u64 words; tiered flags use circular bit blocks with O(1) addressing and amortized O(sqrt(N)) middle edits. A flat shifting bitmap would regress the tiered backend. Keep masks/value buffers aligned through growth, shrink, and rollback.
+- Column mutations prevalidate type/bounds and acquire fallible interner locks before changing any state. Updates acquire a new string reference before releasing the old; delete/truncate/drop release owned IDs. Drop also locks the shared interner: callers must not hold its mutex while destroying a column. See `docs/TYPED_COLUMN_STORAGE.md`.
 - Views use `Rc<RefCell<>>` for shared source access, with their own derived state
 - View parents are `Rc<RefCell<dyn ReadableTable>>`. Tables and synchronized filters/sorts expose changesets in their own row coordinates; children of other views use version-checked full refresh. A view's `version()` includes its parents for staleness/iterator guards and is independent of its output changeset sequence. Always sync parents before children (tick registration order is topological).
 - Consumer cursors belong to their immediate parent's stream. Use `root_changeset_cursor()` / `root_changeset_cursors()` for tick compaction; they return `usize::MAX` for derived sources. Never compare a filter's output cursor with a root table's cursor. A consumer created while a filter is stale has no coherent baseline and must refresh after the parent syncs.
@@ -139,7 +142,7 @@ cd frontend && npm install && npm run dev
 - Iterator mutation guards: table/filter/projection/computed iterators capture the root table version; join/sort/aggregate iterators use `ReadableTable::version()` including ancestors and their own sync counter. All detect root mutations; the latter also detect view-version advances on sync/refresh. Filter-only refresh without root mutation is not detected. No-op sync does not invalidate an iterator.
 - Python chaining supports `FilterView.sort()`, `FilterView.group_by()`, and `SortedView.group_by()`, not every Rust DAG. Simplified stateful methods auto-register. Explicit constructors normally do not; `SortedView.group_by()` registers its sort parent once, but children of an explicit filter still require that filter to be synced manually first. Root `tick()` does nothing without pending root changes: after a manual parent refresh, sync children directly.
 - JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
-- String columns use `NULL_STRING_ID` (u32::MAX) as null sentinel in `string_ids` — never use 0
+- Interned string buffers (`ColumnData::StringIds`) use `NULL_STRING_ID` (u32::MAX) as null sentinel — never use 0
 - `Column::check_value_type(&value)` validates without consuming — use before batch mutations
 - Expression parser (`expr.rs`): Lexer has `input: Vec<char>` + `pos: usize`, supports negative literals
 - `filter_expr` uses SQL NULL semantics: all comparisons with NULL return false, use IS NULL/IS NOT NULL

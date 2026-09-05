@@ -11,6 +11,7 @@ tests/
 ├── run_all.sh                  # Standard Rust/Python/frontend checks
 ├── python/                     # Python unit tests
 │   ├── test_table_operations.py    # CRUD operations
+│   ├── test_typed_storage.py       # Native buffers, NULL masks, and pipeline compatibility
 │   ├── test_views.py              # Views and filtering
 │   ├── test_filter_batches.py     # Mixed filter batches and callback failures
 │   ├── test_sorted_batches.py     # Sorted batches and downstream grouping
@@ -148,6 +149,7 @@ npm run build
 Located in Rust source files with `#[cfg(test)]` modules:
 - **sequence.rs** - Storage backends
 - **column.rs** - Column operations
+- **column/layout_tests.rs** and **column/bitmap.rs** - Native widths, NULL word/block boundaries, randomized storage models, interner ownership, and failure atomicity
 - **table.rs** - Table operations
 - **view/tests.rs** - Views and incremental propagation (module rooted at `view.rs`)
 - **websocket.rs** - WebSocket protocol and JSON conversion
@@ -263,6 +265,9 @@ The project intentionally validates different surfaces with different tools:
 This avoids relying on `cargo test --all-features` for the PyO3 extension target, which is less stable across local Python installations. When running Cargo commands locally against newer Python runtimes, set `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`.
 
 ## Performance Testing
+
+For allocator-counted column memory, numeric/string scans, and middle edits, see
+the [typed storage harness and report](../docs/TYPED_COLUMN_STORAGE.md).
 
 For performance benchmarks (separate from unit tests):
 

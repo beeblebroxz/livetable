@@ -1,19 +1,19 @@
+//! Native-width column buffers with packed NULL flags. ColumnValue remains the
+//! public read/write representation, not the per-cell storage representation.
+//! Interned strings store only IDs; both array and tiered backends are supported.
+mod bitmap;
+#[cfg(test)]
+mod layout_tests;
+mod storage;
+
 use crate::interner::{StringId, StringInterner};
-/// LiveTable Column Implementation
-///
-/// A Column is an array-like random-access data container indexed by integer.
-/// Each Column has a type specifying the type of every value stored.
-///
-/// # String Interning
-///
-/// String columns can optionally use a shared `StringInterner` to deduplicate
-/// strings. When an interner is provided, strings are stored as integer IDs
-/// internally, significantly reducing memory for columns with repeated values.
-use crate::sequence::{ArraySequence, Sequence, TieredVectorSequence};
+use crate::sequence::Sequence;
+use bitmap::NullBitmap;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
+use storage::ColumnData;
 
-/// Sentinel value stored in string_ids for NULL entries.
+/// Sentinel value stored in interned ID buffers for NULL entries.
 /// Must never collide with a valid interner ID (which grows from 0 upward).
 const NULL_STRING_ID: StringId = u32::MAX;
 
@@ -112,22 +112,19 @@ impl ColumnValue {
     }
 }
 
-/// Base column class that wraps a Sequence.
-/// Handles type checking and nullable values.
+/// A typed column backed by a native-width array or tiered sequence.
+/// Handles type checking, packed NULL flags, and conversion to ColumnValue.
 ///
 /// For string columns with an interner, strings are stored as integer IDs
-/// in a separate `string_ids` sequence, while the main `sequence` stores
-/// placeholder values.
+/// instead of storing a parallel placeholder value buffer.
 pub struct Column {
     name: String,
     column_type: ColumnType,
     nullable: bool,
-    sequence: Box<dyn Sequence<ColumnValue>>,
-    null_flags: Option<Box<dyn Sequence<bool>>>,
+    data: ColumnData,
+    null_flags: Option<NullBitmap>,
     /// Optional string interner for String columns (shared across table)
     interner: Option<Arc<Mutex<StringInterner>>>,
-    /// String IDs storage (used only when interner is Some and column_type is String)
-    string_ids: Option<Box<dyn Sequence<StringId>>>,
 }
 
 impl Column {
@@ -156,42 +153,16 @@ impl Column {
         use_tiered_vector: bool,
         interner: Option<Arc<Mutex<StringInterner>>>,
     ) -> Self {
-        let sequence: Box<dyn Sequence<ColumnValue>> = if use_tiered_vector {
-            Box::new(TieredVectorSequence::new())
-        } else {
-            Box::new(ArraySequence::new())
-        };
-
-        let null_flags: Option<Box<dyn Sequence<bool>>> = if nullable {
-            if use_tiered_vector {
-                Some(Box::new(TieredVectorSequence::new()))
-            } else {
-                Some(Box::new(ArraySequence::new()))
-            }
-        } else {
-            None
-        };
-
-        // Create string_ids storage only for String columns with an interner
-        let string_ids: Option<Box<dyn Sequence<StringId>>> =
-            if interner.is_some() && column_type == ColumnType::String {
-                if use_tiered_vector {
-                    Some(Box::new(TieredVectorSequence::new()))
-                } else {
-                    Some(Box::new(ArraySequence::new()))
-                }
-            } else {
-                None
-            };
+        let data = ColumnData::new(column_type, use_tiered_vector, interner.is_some());
+        let null_flags = nullable.then(|| NullBitmap::new(use_tiered_vector));
 
         Column {
             name,
             column_type,
             nullable,
-            sequence,
+            data,
             null_flags,
             interner,
-            string_ids,
         }
     }
 
@@ -218,11 +189,11 @@ impl Column {
     }
 
     pub fn len(&self) -> usize {
-        self.sequence.len()
+        self.data.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sequence.is_empty()
+        self.len() == 0
     }
 
     /// Check if a value is type-compatible with this column (without consuming it).
@@ -276,250 +247,213 @@ impl Column {
         }
     }
 
-    pub fn get(&self, index: usize) -> Result<ColumnValue, String> {
-        if self.nullable {
-            if let Some(ref null_flags) = self.null_flags {
-                if null_flags.get(index)? {
-                    return Ok(ColumnValue::Null);
-                }
-            }
+    fn check_index(&self, index: usize, inserting: bool) -> Result<(), String> {
+        if index < self.len() || inserting && index == self.len() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Index {} out of range [0, {}{}",
+                index,
+                self.len(),
+                if inserting { "]" } else { ")" }
+            ))
         }
-
-        // If using string interning, resolve the ID to the actual string
-        if let Some(ref string_ids) = self.string_ids {
-            if let Some(ref interner) = self.interner {
-                let id = string_ids.get(index)?;
-                let interner = interner.lock().unwrap();
-                if let Some(s) = interner.resolve_unchecked(id) {
-                    return Ok(ColumnValue::String(s.to_string()));
-                } else {
-                    return Err(format!("Invalid string ID {} at index {}", id, index));
-                }
-            }
-        }
-
-        self.sequence.get(index)
     }
 
-    /// Fast numeric access - returns the value as f64 without cloning ColumnValue.
-    /// Returns None if the value is null, not a numeric type, or index out of bounds.
-    /// This is optimized for aggregation operations.
+    pub fn get(&self, index: usize) -> Result<ColumnValue, String> {
+        self.check_index(index, false)?;
+        if self.is_null_at(index) {
+            return Ok(ColumnValue::Null);
+        }
+        if let ColumnData::StringIds(ids) = &self.data {
+            let id = ids.get(index)?;
+            let interner = self
+                .interner
+                .as_ref()
+                .expect("interned storage has an interner")
+                .lock()
+                .map_err(|_| "string interner mutex was poisoned by a prior panic".to_string())?;
+            return interner
+                .resolve_unchecked(id)
+                .map(|s| ColumnValue::String(s.to_owned()))
+                .ok_or_else(|| format!("Invalid string ID {} at index {}", id, index));
+        }
+        self.data.get(index)
+    }
+
+    /// Numeric access without constructing ColumnValue. Returns None for NULL,
+    /// non-numeric types (including dates/bools), or an out-of-bounds index.
     #[inline]
     pub fn get_f64(&self, index: usize) -> Option<f64> {
-        // Check null flag first (fast path)
-        if self.nullable {
-            if let Some(ref null_flags) = self.null_flags {
-                if null_flags.get_ref(index).copied() == Some(true) {
-                    return None;
-                }
-            }
+        if self.is_null_at(index) {
+            None
+        } else {
+            self.data.get_f64(index)
         }
-
-        // Get reference to the value without cloning
-        self.sequence.get_ref(index).and_then(|v| match v {
-            ColumnValue::Int32(n) => Some(*n as f64),
-            ColumnValue::Int64(n) => Some(*n as f64),
-            ColumnValue::Float32(f) => Some(*f as f64),
-            ColumnValue::Float64(f) => Some(*f),
-            _ => None, // Not numeric (String, Bool, Null)
-        })
     }
 
-    /// Check if a value at index is null (fast path without cloning).
+    /// Check NULL without cloning. Out-of-bounds indices return false.
     #[inline]
     pub fn is_null_at(&self, index: usize) -> bool {
-        if !self.nullable {
-            return false;
-        }
-        if let Some(ref null_flags) = self.null_flags {
-            null_flags.get_ref(index).copied() == Some(true)
-        } else {
-            false
-        }
+        self.null_flags.as_ref().and_then(|flags| flags.get(index)) == Some(true)
     }
 
     pub fn set(&mut self, index: usize, value: ColumnValue) -> Result<(), String> {
         let value = self.validate_value(value)?;
-
-        if value.is_null() {
-            if let Some(ref mut null_flags) = self.null_flags {
-                null_flags.set(index, true)?;
-            }
-            // Release old string ID if using interning
-            if let Some(ref mut string_ids) = self.string_ids {
-                if let Some(ref interner) = self.interner {
-                    let old_id = string_ids.get(index)?;
-                    if old_id != NULL_STRING_ID {
-                        interner.lock().unwrap().release(old_id);
-                    }
-                    string_ids.set(index, NULL_STRING_ID)?;
-                }
-            }
-            self.sequence.set(index, self.get_default_value())?;
+        self.check_index(index, false)?;
+        let is_null = value.is_null();
+        let value = if is_null {
+            self.get_default_value()
         } else {
-            if let Some(ref mut null_flags) = self.null_flags {
-                null_flags.set(index, false)?;
-            }
-            // Handle string interning
-            if let (Some(ref mut string_ids), Some(ref interner)) =
-                (&mut self.string_ids, &self.interner)
-            {
-                if let ColumnValue::String(ref s) = value {
-                    // Release old string ID (skip if slot was NULL)
-                    let old_id = string_ids.get(index)?;
-                    if old_id != NULL_STRING_ID {
-                        interner.lock().unwrap().release(old_id);
-                    }
-                    // Intern new string
-                    let new_id = interner.lock().unwrap().intern(s);
-                    string_ids.set(index, new_id)?;
-                    // Store placeholder in sequence (not used for interned strings)
-                    self.sequence
-                        .set(index, ColumnValue::String(String::new()))?;
-                    return Ok(());
-                }
-            }
-            self.sequence.set(index, value)?;
-        }
+            value
+        };
 
+        if let ColumnData::StringIds(ids) = &mut self.data {
+            // Obtain every fallible resource before changing storage or flags.
+            let mut interner = self
+                .interner
+                .as_ref()
+                .expect("interned storage has an interner")
+                .lock()
+                .map_err(|_| "string interner mutex was poisoned by a prior panic".to_string())?;
+            let old_id = ids.get(index)?;
+            let new_id = if is_null {
+                NULL_STRING_ID
+            } else {
+                interner.intern(value.as_string().expect("validated string"))
+            };
+            ids.set(index, new_id).expect("column prevalidated index");
+            // Intern first: assigning the same string cannot invalidate its ID.
+            if old_id != NULL_STRING_ID {
+                interner.release(old_id);
+            }
+        } else {
+            self.data.set(index, value);
+        }
+        if let Some(flags) = &mut self.null_flags {
+            flags.set(index, is_null);
+        }
         Ok(())
     }
 
     pub fn insert(&mut self, index: usize, value: ColumnValue) -> Result<(), String> {
         let value = self.validate_value(value)?;
-
-        if value.is_null() {
-            if let Some(ref mut null_flags) = self.null_flags {
-                null_flags.insert(index, true)?;
-            }
-            // Insert sentinel ID for null
-            if let Some(ref mut string_ids) = self.string_ids {
-                string_ids.insert(index, NULL_STRING_ID)?;
-            }
-            self.sequence.insert(index, self.get_default_value())?;
+        self.check_index(index, true)?;
+        let is_null = value.is_null();
+        let value = if is_null {
+            self.get_default_value()
         } else {
-            if let Some(ref mut null_flags) = self.null_flags {
-                null_flags.insert(index, false)?;
-            }
-            // Handle string interning
-            if let (Some(ref mut string_ids), Some(ref interner)) =
-                (&mut self.string_ids, &self.interner)
-            {
-                if let ColumnValue::String(ref s) = value {
-                    let id = interner.lock().unwrap().intern(s);
-                    string_ids.insert(index, id)?;
-                    self.sequence
-                        .insert(index, ColumnValue::String(String::new()))?;
-                    return Ok(());
-                }
-            }
-            self.sequence.insert(index, value)?;
-        }
+            value
+        };
 
+        if let ColumnData::StringIds(ids) = &mut self.data {
+            let mut interner = self
+                .interner
+                .as_ref()
+                .expect("interned storage has an interner")
+                .lock()
+                .map_err(|_| "string interner mutex was poisoned by a prior panic".to_string())?;
+            let id = if is_null {
+                NULL_STRING_ID
+            } else {
+                interner.intern(value.as_string().expect("validated string"))
+            };
+            ids.insert(index, id).expect("column prevalidated index");
+        } else {
+            self.data.insert(index, value);
+        }
+        if let Some(flags) = &mut self.null_flags {
+            flags.insert(index, is_null);
+        }
         Ok(())
     }
 
     pub fn delete(&mut self, index: usize) -> Result<ColumnValue, String> {
-        let is_null = if let Some(ref mut null_flags) = self.null_flags {
-            null_flags.delete(index)?
-        } else {
-            false
-        };
-
-        // Handle string interning - get the string before deleting the ID
-        if let (Some(ref mut string_ids), Some(ref interner)) =
-            (&mut self.string_ids, &self.interner)
-        {
-            let id = string_ids.delete(index)?;
-            self.sequence.delete(index)?; // Delete placeholder
-
-            if is_null {
-                return Ok(ColumnValue::Null);
-            }
-
-            // Get the string value before releasing
-            let result = {
-                let interner_ref = interner.lock().unwrap();
-                interner_ref
+        self.check_index(index, false)?;
+        let is_null = self.is_null_at(index);
+        let value = if let ColumnData::StringIds(ids) = &mut self.data {
+            let mut interner = self
+                .interner
+                .as_ref()
+                .expect("interned storage has an interner")
+                .lock()
+                .map_err(|_| "string interner mutex was poisoned by a prior panic".to_string())?;
+            let id = ids.get(index)?;
+            // Resolve before mutation so a failed read leaves the column intact.
+            let value = if is_null {
+                ColumnValue::Null
+            } else {
+                interner
                     .resolve_unchecked(id)
-                    .map(|s| ColumnValue::String(s.to_string()))
+                    .map(|s| ColumnValue::String(s.to_owned()))
+                    .ok_or_else(|| format!("Invalid string ID {} at index {}", id, index))?
             };
-
-            // Release the reference (skip sentinel for null slots)
+            ids.delete(index).expect("column prevalidated index");
             if id != NULL_STRING_ID {
-                interner.lock().unwrap().release(id);
+                interner.release(id);
             }
-
-            return result.ok_or_else(|| format!("Invalid string ID {} at index {}", id, index));
-        }
-
-        let value = self.sequence.delete(index)?;
-
-        if is_null {
-            Ok(ColumnValue::Null)
+            value
         } else {
-            Ok(value)
+            let value = self.data.delete(index);
+            if is_null {
+                ColumnValue::Null
+            } else {
+                value
+            }
+        };
+        if let Some(flags) = &mut self.null_flags {
+            flags.delete(index);
         }
+        Ok(value)
     }
 
     pub fn append(&mut self, value: ColumnValue) -> Result<(), String> {
         let value = self.validate_value(value)?;
-
-        if value.is_null() {
-            if let Some(ref mut null_flags) = self.null_flags {
-                null_flags.append(true);
-            }
-            // Append sentinel ID for null
-            if let Some(ref mut string_ids) = self.string_ids {
-                string_ids.append(NULL_STRING_ID);
-            }
-            self.sequence.append(self.get_default_value());
+        let is_null = value.is_null();
+        let value = if is_null {
+            self.get_default_value()
         } else {
-            if let Some(ref mut null_flags) = self.null_flags {
-                null_flags.append(false);
-            }
-            // Handle string interning
-            if let (Some(ref mut string_ids), Some(ref interner)) =
-                (&mut self.string_ids, &self.interner)
-            {
-                if let ColumnValue::String(ref s) = value {
-                    let id = interner
-                        .lock()
-                        .map_err(|_| {
-                            "string interner mutex was poisoned by a prior panic".to_string()
-                        })?
-                        .intern(s);
-                    string_ids.append(id);
-                    self.sequence.append(ColumnValue::String(String::new()));
-                    return Ok(());
-                }
-            }
-            self.sequence.append(value);
+            value
+        };
+
+        if let ColumnData::StringIds(ids) = &mut self.data {
+            let mut interner = self
+                .interner
+                .as_ref()
+                .expect("interned storage has an interner")
+                .lock()
+                .map_err(|_| "string interner mutex was poisoned by a prior panic".to_string())?;
+            let id = if is_null {
+                NULL_STRING_ID
+            } else {
+                interner.intern(value.as_string().expect("validated string"))
+            };
+            ids.append(id);
+        } else {
+            self.data.append(value);
+        }
+        if let Some(flags) = &mut self.null_flags {
+            flags.push(is_null);
         }
         Ok(())
     }
 
-    /// Truncate the column back to `target_len` entries. Used by Table for
-    /// rolling back partial mutations when a multi-column append fails
-    /// mid-loop. Idempotent if the column is already <= target_len.
+    /// Roll back appended rows, releasing their interned-string references.
+    /// Idempotent if the column is already no longer than target_len.
     pub(crate) fn truncate_to(&mut self, target_len: usize) {
         while self.len() > target_len {
-            let before = self.len();
-            // delete() handles null flags and releases interned-string refs
-            let _ = self.delete(before - 1);
-            if self.len() == before {
+            if self.delete(self.len() - 1).is_err() {
                 break; // rollback must never spin if a delete fails
             }
         }
     }
 
     pub fn is_null(&self, index: usize) -> Result<bool, String> {
-        if !self.nullable {
-            return Ok(false);
-        }
-
-        if let Some(ref null_flags) = self.null_flags {
-            null_flags.get(index)
+        // Preserve the public non-nullable fast path, including out-of-bounds.
+        if let Some(flags) = &self.null_flags {
+            flags
+                .get(index)
+                .ok_or_else(|| format!("Index {} out of range [0, {})", index, self.len()))
         } else {
             Ok(false)
         }
@@ -542,6 +476,23 @@ impl Column {
         ColumnIterator {
             column: self,
             index: 0,
+        }
+    }
+}
+
+impl Drop for Column {
+    fn drop(&mut self) {
+        if let (ColumnData::StringIds(ids), Some(interner)) = (&self.data, &self.interner) {
+            // Destruction must not panic just because an earlier caller poisoned
+            // the shared lock. Each live ID owns exactly one interner reference.
+            let mut interner = interner.lock().unwrap_or_else(|error| error.into_inner());
+            for index in 0..ids.len() {
+                if let Some(&id) = ids.get_ref(index) {
+                    if id != NULL_STRING_ID {
+                        interner.release(id);
+                    }
+                }
+            }
         }
     }
 }

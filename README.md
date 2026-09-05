@@ -24,6 +24,7 @@ benchmarks for current measurements rather than treating historical numbers as
 guarantees. See [Performance and Benchmarking](docs/PERFORMANCE_COMPARISON.md).
 
 **Key advantages:**
+- **Compact typed storage** - Native-width column buffers, packed NULL masks, and ID-only interned strings
 - **Shared-source views** - Views read source rows while caching indices, sort keys, or aggregate state as needed
 - **Reactive updates** - `tick()` incrementally synchronizes registered views
 - **Incremental sorted pipelines** - Small batches propagate through filter → sort → group
@@ -86,6 +87,15 @@ table = livetable.Table("events", schema, use_string_interning=True)
 Each unique string is stored once; the column holds 4-byte IDs instead of full
 strings. This can reduce memory for low-cardinality or otherwise highly
 repetitive text.
+
+### Native-width column buffers
+
+INT32 values occupy 4-byte slots, FLOAT64 values 8-byte slots; the type is
+selected once per column. Nullable columns use packed masks, and interned
+strings store only 4-byte IDs without a duplicate placeholder buffer. Both
+array and tiered storage are supported without changing the public API.
+Read APIs and changesets still use `ColumnValue`/row objects. See the
+[layout, guarantees, and measurements](docs/TYPED_COLUMN_STORAGE.md).
 
 ## Data Types
 
@@ -388,7 +398,8 @@ livetable/
 │   ├── src/
 │   │   ├── lib.rs              # Library root
 │   │   ├── table.rs            # Table, Schema, storage hints
-│   │   ├── column.rs           # Column types and values
+│   │   ├── column.rs           # Column API, types, and conversions
+│   │   ├── column/             # Typed buffers, packed NULL masks, and tests
 │   │   ├── sequence.rs         # Storage backends (Array / TieredVector)
 │   │   ├── readable.rs         # ReadableTable trait (view composition)
 │   │   ├── view.rs             # View module root + shared join-key types

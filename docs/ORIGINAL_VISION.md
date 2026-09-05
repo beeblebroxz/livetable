@@ -79,6 +79,12 @@ columns remain original design ideas rather than implemented APIs.
 
 ### NULL Support
 
+**Current storage:** Each column selects a native-width typed buffer once,
+with packed NULL flags on both array and tiered backends. Interned strings
+store IDs only. The public `ColumnValue` representation is unchanged. See
+[typed column storage](TYPED_COLUMN_STORAGE.md) for the implementation and
+measurement limits; the alternatives below preserve the original design notes.
+
 Each type has a "may-be-Null" variant (e.g., "double-or-Null", "uint27-or-Null"). The special value NULL (ala SQL) may be stored. This imposes speed and space costs, so it should only be used when necessary.
 
 Implementation options for nullable columns:
@@ -225,6 +231,7 @@ items below remain original future ideas.
 - [x] Sequence layer (ArraySequence, TieredVectorSequence backed by tiered-vector crate)
 - [x] StorageHint API for selecting storage backend (`fast_reads` / `fast_updates`)
 - [x] Column layer with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
+- [x] Native-width column buffers, packed array/tiered NULL masks, and ID-only interned strings
 - [x] Table layer (Root tables with CRUD operations)
 - [x] Views: FilterView, ProjectionView, ComputedView, JoinView (LEFT/INNER/RIGHT/FULL), SortedView
 - [x] AggregateView with GROUP BY and incremental updates (SUM, COUNT, AVG, MIN, MAX, MEDIAN, PERCENTILE)

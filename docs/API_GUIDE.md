@@ -105,6 +105,13 @@ let table = Table::with_hint(
 `Table::with_hint_and_interning` additionally enables string interning. It is
 most useful when string values repeat frequently.
 
+Columns now store native-width `Sequence<T>` buffers, with a per-column type
+tag and packed NULL mask. Interned strings have an ID-only buffer.
+`ColumnValue` remains the public cell representation, so no caller migration is
+required. Tiered NULL masks preserve O(1) addressing and amortized sublinear
+middle edits. See [typed column storage](TYPED_COLUMN_STORAGE.md) for layouts,
+resizing costs, ownership guarantees, and the measurement harness.
+
 ## Table API
 
 Important query and mutation methods:

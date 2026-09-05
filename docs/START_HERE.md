@@ -53,6 +53,7 @@ delta delivery is a planned next milestone.
 - [Getting Started](GETTING_STARTED.md): Python walkthrough and core concepts
 - [Python API reference](PYTHON_BINDINGS_README.md): complete binding surface
 - [Rust API guide](API_GUIDE.md): native Rust usage
+- [Typed column storage](TYPED_COLUMN_STORAGE.md): compact buffers, NULL masks, and measurements
 - [Filter propagation](INCREMENTAL_FILTER_PIPELINE.md): shared Rust/Python replay
 - [Sorted pipelines](INCREMENTAL_SORTED_PIPELINE.md): latest contract, limits, and benchmarks
 - [Join operations](JOIN_FEATURE.md): join types and incremental behavior

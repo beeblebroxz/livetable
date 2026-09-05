@@ -2188,6 +2188,45 @@ mod tests {
     }
 
     #[test]
+    fn test_typed_columns_roll_back_when_interner_is_poisoned() {
+        for hint in [StorageHint::FastReads, StorageHint::FastUpdates] {
+            let schema = Schema::new(vec![
+                ("n".into(), ColumnType::Int32, true),
+                ("s".into(), ColumnType::String, true),
+            ]);
+            let mut table = Table::with_hint_and_interning("atomic".into(), schema, hint, true);
+            let row = HashMap::from([
+                ("n".into(), ColumnValue::Int32(42)),
+                ("s".into(), ColumnValue::String("original".into())),
+            ]);
+            table.append_row(row.clone()).unwrap();
+            let version = table.version();
+            let cursor = table.changeset().total_len();
+            let interner = table.columns[1].interner().unwrap().clone();
+            let _ = std::panic::catch_unwind(|| {
+                let _lock = interner.lock().unwrap();
+                panic!("test failure after an earlier column commits");
+            });
+            assert!(table.append_row(row.clone()).is_err());
+            assert!(table.append_rows(vec![row.clone(), row.clone()]).is_err());
+            assert!(table.insert_row(0, row.clone()).is_err());
+            assert!(table.delete_row(0).is_err());
+            assert!(table.set_value(0, "s", ColumnValue::Null).is_err());
+            assert_eq!(table.len(), 1);
+            assert_eq!(table.version(), version);
+            assert_eq!(table.changeset().total_len(), cursor);
+            interner.clear_poison();
+            assert_eq!(table.get_row(0).unwrap(), row);
+            for column in &table.columns {
+                assert_eq!(column.len(), 1);
+            }
+            assert_eq!(table.interner_stats().unwrap().total_references, 1);
+            table.append_row(row).unwrap();
+            assert_eq!(table.len(), 2, "a failed write must be retryable");
+        }
+    }
+
+    #[test]
     fn test_from_csv_empty_in_first_row_infers_from_later_rows() {
         // Fully empty rows are skipped entirely, so use a partially empty one
         let csv = "id,score\n,9.5\n7,1.5";

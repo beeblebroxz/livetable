@@ -29,6 +29,9 @@ python3 scratch.py
 
 Minimal Python example:
 
+Columns use native-width buffers and packed NULL masks internally; no special
+API is required. Both storage hints support the compact layout.
+
 ```python
 import livetable
 
@@ -119,6 +122,7 @@ cargo test --manifest-path impl/Cargo.toml --features server --test protocol_v2_
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): Python walkthrough
 - [docs/PYTHON_BINDINGS_README.md](docs/PYTHON_BINDINGS_README.md): Python reference
 - [docs/API_GUIDE.md](docs/API_GUIDE.md): Rust reference
+- [docs/TYPED_COLUMN_STORAGE.md](docs/TYPED_COLUMN_STORAGE.md): memory layout and measurements
 - [docs/INCREMENTAL_SORTED_PIPELINE.md](docs/INCREMENTAL_SORTED_PIPELINE.md): latest propagation contract and measured benchmarks
 - [docs/JOIN_FEATURE.md](docs/JOIN_FEATURE.md): join semantics
 - [docs/WEBSOCKET_PROTOCOL.md](docs/WEBSOCKET_PROTOCOL.md): server protocol

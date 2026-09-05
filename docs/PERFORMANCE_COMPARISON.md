@@ -12,6 +12,17 @@ as measurements of the recorded machine, commit, and workload, not guarantees.
 
 ## Benchmark surfaces
 
+### Column memory layout
+
+The [typed storage report](TYPED_COLUMN_STORAGE.md) explains native-width
+buffers and packed NULL masks, with a dedicated allocator-counting and scan/edit
+harness. Its retained-column heap measurements exclude table changesets and
+view caches; do not treat them as whole-application memory savings.
+
+```bash
+cargo run --manifest-path impl/Cargo.toml --release --example column_layout_benchmark -- 10000 100000
+```
+
 ### Rust microbenchmarks
 
 `impl/benches/livetable_benchmarks.rs` uses Criterion to measure the Rust core:
