@@ -3,6 +3,7 @@ import type {
   ClientMessage,
   PipelineSnapshot,
   ScalarValue,
+  ServerMessage,
   TableRow,
   ViewNodeSpec,
 } from '../types';
@@ -16,6 +17,18 @@ import { applyViewDelta, isValidViewSnapshot } from '../lib/pipelineReconciliati
 export const PIPELINE_DEBOUNCE_MS = 250;
 export const PIPELINE_RESYNC_RETRY_MS = 3000;
 
+export type PipelineEvent =
+  | { kind: 'received'; at: number; bytes: number; message: ServerMessage }
+  | { kind: 'applied'; at: number; nodeId: string; format: 'snapshot' | 'delta'; seq: number; operations: number }
+  | { kind: 'repair' | 'recovered' | 'dropped'; at: number; nodeId: string }
+  | { kind: 'generation' | 'disconnected'; at: number };
+
+export interface PipelineOptions {
+  onEvent?: (event: PipelineEvent) => void;
+  /** Opt-in client-side fault injection; never drops traffic for other clients. */
+  allowFaultInjection?: boolean;
+}
+
 const sendMessage = (socket: WebSocket, message: ClientMessage) => {
   socket.send(JSON.stringify(message));
 };
@@ -23,7 +36,8 @@ const sendMessage = (socket: WebSocket, message: ClientMessage) => {
 export function usePipeline(
   tableName: string,
   nodes: ViewNodeSpec[],
-  wsUrl: string = getDefaultWebSocketUrl()
+  wsUrl: string = getDefaultWebSocketUrl(),
+  options: PipelineOptions = {}
 ) {
   const [snapshots, setSnapshots] = useState<Record<string, PipelineSnapshot>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -38,6 +52,14 @@ export function usePipeline(
   const expectedNodesRef = useRef(new Map<string, { sourceId: string; kind: string }>());
   // At most one outstanding repair per installed node; no unbounded delta queue.
   const resyncRef = useRef(new Map<string, number>());
+  const optionsRef = useRef(options);
+  const droppedNodeRef = useRef<string | null>(null);
+  optionsRef.current = options;
+
+  const observe = useCallback((event: PipelineEvent) => {
+    // Diagnostics cannot interfere with reconciliation or retain message queues.
+    try { optionsRef.current.onEvent?.(event); } catch (error) { console.error('Pipeline observer failed', error); }
+  }, []);
 
   nodesRef.current = nodes;
 
@@ -52,6 +74,8 @@ export function usePipeline(
     snapshotsRef.current = {};
     setSnapshots({});
     resyncRef.current.clear();
+    droppedNodeRef.current = null;
+    observe({ kind: 'generation', at: performance.now() });
     expectedNodesRef.current = new Map([
       ['base', { sourceId: 'base', kind: 'base' }],
       ...nodesRef.current.map((node): [string, { sourceId: string; kind: string }] =>
@@ -63,7 +87,7 @@ export function usePipeline(
       pipeline_generation: nextGeneration,
       nodes: nodesRef.current,
     });
-  }, [tableName]);
+  }, [observe, tableName]);
 
   useEffect(() => {
     let disposed = false;
@@ -86,6 +110,7 @@ export function usePipeline(
       if (!expectedNodesRef.current.has(nodeId) || socket.readyState !== WebSocket.OPEN ||
           socketRef.current !== socket || (!retry && resyncRef.current.has(nodeId))) return;
       resyncRef.current.set(nodeId, Date.now());
+      observe({ kind: 'repair', nodeId, at: performance.now() });
       sendMessage(socket, {
         type: 'QueryView', table_name: tableName,
         pipeline_generation: generationRef.current, node_id: nodeId,
@@ -136,6 +161,10 @@ export function usePipeline(
           return;
         }
         if ('table_name' in message && message.table_name !== tableName) return;
+        if ('pipeline_generation' in message && message.pipeline_generation !== generationRef.current) return;
+        if (optionsRef.current.onEvent) {
+          observe({ kind: 'received', at: performance.now(), bytes: new TextEncoder().encode(event.data).byteLength, message });
+        }
 
         switch (message.type) {
           case 'Subscribed':
@@ -170,6 +199,8 @@ export function usePipeline(
               },
             };
             setSnapshots(snapshotsRef.current);
+            observe({ kind: 'applied', at: performance.now(), nodeId: message.node_id, format: 'snapshot', seq: message.seq, operations: message.rows.length });
+            if (resyncRef.current.has(message.node_id)) observe({ kind: 'recovered', at: performance.now(), nodeId: message.node_id });
             resyncRef.current.delete(message.node_id);
             clearNodeError(message.node_id);
             break;
@@ -181,6 +212,11 @@ export function usePipeline(
             if (previous && message.seq <= previous.seq) return;
             // While repairing, only a snapshot can establish a new baseline.
             if (resyncRef.current.has(message.node_id)) return;
+            if (optionsRef.current.allowFaultInjection && droppedNodeRef.current === message.node_id) {
+              droppedNodeRef.current = null;
+              observe({ kind: 'dropped', at: performance.now(), nodeId: message.node_id });
+              return;
+            }
             const next = previous ? applyViewDelta(previous, message) : null;
             if (!next) {
               requestSnapshot(socket, message.node_id);
@@ -188,6 +224,7 @@ export function usePipeline(
             }
             snapshotsRef.current = { ...snapshotsRef.current, [message.node_id]: next };
             setSnapshots(snapshotsRef.current);
+            observe({ kind: 'applied', at: performance.now(), nodeId: message.node_id, format: 'delta', seq: message.seq, operations: message.changes.length });
             clearNodeError(message.node_id);
             break;
           }
@@ -223,6 +260,8 @@ export function usePipeline(
         if (disposed || socketRef.current !== socket) return;
         socketRef.current = null;
         resyncRef.current.clear();
+        droppedNodeRef.current = null;
+        observe({ kind: 'disconnected', at: performance.now() });
         setConnected(false);
         const delay = Math.min(250 * 2 ** reconnectAttempts, 2000);
         reconnectAttempts += 1;
@@ -240,7 +279,7 @@ export function usePipeline(
       socketRef.current = null;
       socket?.close();
     };
-  }, [sendPipeline, tableName, wsUrl]);
+  }, [observe, sendPipeline, tableName, wsUrl]);
 
   useEffect(() => {
     if (pipelineTimerRef.current !== null) {
@@ -300,5 +339,13 @@ export function usePipeline(
     insertRow,
     updateCell,
     deleteRow,
+    send,
+    dropNextDelta: (nodeId: string) => {
+      if (!optionsRef.current.allowFaultInjection || !connected ||
+          !Object.prototype.hasOwnProperty.call(snapshotsRef.current, nodeId) || resyncRef.current.has(nodeId)) return false;
+      droppedNodeRef.current = nodeId;
+      return true;
+    },
+    cancelDrop: () => { droppedNodeRef.current = null; },
   };
 }

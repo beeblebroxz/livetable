@@ -367,26 +367,37 @@ See [tests/README.md](tests/README.md) for the full test matrix and toolchain sp
 
 ## React Frontend
 
-Real-time table editor with WebSocket sync. Protocol v3 also supports
-connection-local server-computed pipelines: the forward-propagation demo sends
-`SetPipeline` definitions and renders Rust-engine snapshots plus ordered deltas
-for base/filter/sort nodes; group nodes retain snapshots. Expression rebuilds are debounced and
-generation-scoped so stale responses cannot overwrite newer definitions.
+The default page is the **Orders Lab**: five guided scenarios, a branching
+server-side pipeline, a virtualized results table, and an actual WebSocket
+delivery inspector. Explore deterministic datasets up to 100,000 rows, bounded
+mixed-batch streaming, independent clients, and intentionally dropped-delta
+recovery. The original editor remains at `/#editor` on the separate `demo` table.
+See the [lab guide](docs/ORDERS_LAB.md) for the tour and measurement boundaries.
+Protocol-v3 base/filter/sort nodes receive ordered deltas; groups retain
+snapshots. Pipeline replacement remains debounced and generation-scoped.
+
+Quick launch: `cd frontend && npm install && npm run lab`. This builds the
+release Rust server and runs both services on loopback; Ctrl+C stops them.
+Alternatively, use separate terminals:
 
 ```bash
-# Terminal 1: Start backend
-cd impl
-cargo run --bin livetable-server --features server
+# Terminal 1: From the repository root; enables isolated synthetic lab data
+cargo run --release --manifest-path impl/Cargo.toml --features server --bin livetable-server -- --lab
 
-# Terminal 2: Start frontend (Node.js 18+)
+# Terminal 2: From the repository root; Node.js 20+ (22+ for browser tests)
 cd frontend
 npm install && npm run dev
 ```
 
-The current demo client connects to `ws://<current-host>:8080/ws` by default. Set
+Open `http://127.0.0.1:5173`. The client connects to `ws://<current-host>:8080/ws` by default. Set
 `VITE_LIVETABLE_WS_URL=ws://host:port/ws` when starting Vite to override it.
 See [WebSocket Protocol v3](docs/WEBSOCKET_PROTOCOL.md) for message schemas and
 reconciliation rules.
+
+Lab reset affects shared synthetic `lab` data and requires UI confirmation.
+The `--lab` CLI requires a loopback host. Omit it for the original editor-only
+server. `npm run test:e2e` in `frontend` runs real-server tests using installed
+Google Chrome and isolated ports 8087/5180.
 
 Pipeline deltas have independent per-node delivery baselines. Missing history
 falls back to snapshots; generation-scoped `QueryView` and periodic checkpoints
@@ -423,7 +434,7 @@ livetable/
 │
 ├── examples/                   # Python examples
 ├── tests/                      # Python + integration test suites
-├── frontend/                   # React real-time editor + Vitest/ESLint
+├── frontend/                   # Orders Lab + editor; Vitest/Playwright/ESLint
 ├── .github/workflows/          # CI pipeline
 ├── docs/                       # Additional documentation
 └── benchmarks/                 # Performance comparisons

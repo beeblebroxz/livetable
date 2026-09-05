@@ -8,8 +8,8 @@
 //! aggregate state rather than another complete source table.
 //!
 //! The core has no default features. Enable `python` for PyO3 bindings or `server`
-//! for the Actix/WebSocket service. Pipeline wire updates currently carry full
-//! snapshots, independently of incremental engine maintenance.
+//! for the Actix/WebSocket service. Protocol v3 delivers bounded base/filter/sort
+//! deltas with snapshot recovery; groups retain snapshot delivery.
 
 pub mod changeset;
 pub mod column;

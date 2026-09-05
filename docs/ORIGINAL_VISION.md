@@ -246,6 +246,7 @@ items below remain original future ideas.
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)
 - [x] Protocol v2 server-computed view pipelines (per-connection filter/sort/group DAGs with generation-scoped snapshots)
 - [x] Protocol v3 base/filter/sort delta delivery, node-local baselines, snapshot fallback, and checkpoint-based resynchronization
+- [x] Local [Orders Lab](ORDERS_LAB.md): guided incremental/recovery scenarios, independent clients, virtualized 100k-row inspection and bounded synthetic streaming
 - [x] RIGHT and FULL OUTER joins
 - [x] Multi-column joins (composite key support)
 - [x] Bulk/Batch operations (`append_rows`)

@@ -33,8 +33,7 @@ cd examples
 
 ```bash
 # Terminal 1
-cd impl
-cargo run --bin livetable-server --features server
+cargo run --release --manifest-path impl/Cargo.toml --features server --bin livetable-server -- --lab
 
 # Terminal 2
 cd frontend
@@ -42,11 +41,12 @@ npm install
 npm run dev
 ```
 
-The default server endpoint is `ws://127.0.0.1:8080/ws`. The Forward Prop Demo
-uses real server-owned filter, sort, and group views. Small batches now propagate
-incrementally through that chain in Rust and Python, including
-`ranked.group_by(...)`. Protocol v3 delivers bounded base/filter/sort deltas with
-snapshot recovery; group nodes retain full snapshots.
+Start each terminal at the repository root. Open `http://127.0.0.1:5173` for
+the [Orders Lab](ORDERS_LAB.md): guided delta/recovery scenarios, branching
+filter/sort/group views, an actual delivery inspector and 1k–100k synthetic rows.
+The default endpoint is `ws://127.0.0.1:8080/ws`. The lab is opt-in and loopback-only;
+the separate `demo` editor remains at `/#editor`. Protocol v3 delivers bounded
+base/filter/sort deltas with snapshot recovery; groups retain full snapshots.
 
 ## Choose the right guide
 

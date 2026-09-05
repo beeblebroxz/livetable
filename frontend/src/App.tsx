@@ -1,12 +1,17 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { LiveTable } from './components/LiveTable';
-import { CascadeDemo } from './pages/CascadeDemo';
+import { OrdersLab } from './pages/OrdersLab';
 
 function App() {
-  const [showDemo, setShowDemo] = useState(false);
+  const [showEditor, setShowEditor] = useState(window.location.hash === '#editor');
+  useEffect(() => {
+    const navigate = () => setShowEditor(window.location.hash === '#editor');
+    window.addEventListener('hashchange', navigate);
+    return () => window.removeEventListener('hashchange', navigate);
+  }, []);
 
-  if (showDemo) {
-    return <CascadeDemo onBack={() => setShowDemo(false)} />;
+  if (!showEditor) {
+    return <OrdersLab />;
   }
 
   return (
@@ -21,13 +26,13 @@ function App() {
               Real-time collaborative editing powered by Rust + WebSocket
             </p>
           </div>
-          <button
-            onClick={() => setShowDemo(true)}
+          <a
+            href="#lab"
             className="px-4 py-2 bg-purple-600 text-white rounded-lg font-medium hover:bg-purple-700 transition flex items-center gap-2"
           >
-            Forward Prop Demo
+            Orders Lab
             <span>&rarr;</span>
-          </button>
+          </a>
         </div>
       </header>
       <main className="py-8">

@@ -182,5 +182,6 @@ python3 playground.py
 - [Python API reference](PYTHON_BINDINGS_README.md)
 - [Incremental filter → sort → group](INCREMENTAL_SORTED_PIPELINE.md)
 - [Join details](JOIN_FEATURE.md)
-- [WebSocket/React demo](WEBSOCKET_PROTOCOL.md)
+- [Orders Lab: interactive server/client tour](ORDERS_LAB.md)
+- [WebSocket protocol](WEBSOCKET_PROTOCOL.md)
 - [Testing](../tests/README.md)

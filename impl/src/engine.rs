@@ -20,6 +20,7 @@ use crate::table::{Schema, Table};
 use crate::view::TickableTable;
 
 mod delivery;
+mod lab;
 #[cfg(test)]
 mod delivery_tests;
 use delivery::DeliveryState;
@@ -116,6 +117,7 @@ impl BaseState {
 /// Server-side table/view state. This type is intentionally `!Send`.
 pub struct TableEngine {
     bases: HashMap<String, BaseState>,
+    lab_step: u64,
 }
 
 impl Default for TableEngine {
@@ -160,6 +162,7 @@ impl TableEngine {
 
         Self {
             bases: HashMap::from([("demo".to_string(), BaseState::with_seed_data(demo))]),
+            lab_step: 0,
         }
     }
 

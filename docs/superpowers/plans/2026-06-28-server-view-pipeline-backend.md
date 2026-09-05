@@ -8,6 +8,8 @@ is authoritative for current wire behavior. Since this plan, bounded mixed-batch
 single-change-only guidance below describes the original milestone. Subsequent
 [protocol-v3 delivery](../../PIPELINE_DELIVERY.md) adds base/filter/sort deltas
 with snapshot recovery; the snapshot-only instructions below remain historical.
+The [Orders Lab](../../ORDERS_LAB.md) has since replaced the cascade UI. This
+plan's original component names are preserved as implementation history.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

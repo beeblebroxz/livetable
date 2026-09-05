@@ -13,6 +13,8 @@ shapes, generation/sequence rules, and limits. Subsequent bounded mixed-batch
 single-change-only verification note below. Subsequent
 [protocol-v3 delivery](../../PIPELINE_DELIVERY.md) adds base/filter/sort deltas
 with snapshot recovery; the original snapshot-only decisions remain below.
+The [Orders Lab](../../ORDERS_LAB.md) has since replaced the CascadeDemo UI;
+references to that component below describe this historical milestone.
 
 ## Original problem
 

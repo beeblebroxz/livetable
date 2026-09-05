@@ -109,6 +109,19 @@ npm run test
 npm run build
 ```
 
+The [Orders Lab](../docs/ORDERS_LAB.md) additionally has real-server browser tests:
+
+```bash
+# From the repository root; requires installed Google Chrome and localhost access
+cd frontend
+npm run test:e2e
+```
+
+This type-checks the browser tests, builds a release Rust server, starts isolated
+ports 8087/5180, and verifies guided deltas/recovery, two clients, shared resets,
+100k-row virtualization, streaming, mobile layout and the retained editor. It
+stops its own servers afterward and refuses to reuse occupied ports.
+
 ## Test Categories
 
 ### Python Unit Tests (`python/`)

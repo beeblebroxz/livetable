@@ -85,10 +85,20 @@ pub struct ViewNodeSpec {
     pub kind: ViewKindSpec,
 }
 
+/// Opt-in, synthetic-data-only controls for the local Orders lab.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LabAction {
+    Reset { rows: usize },
+    Step,
+    Update { row_id: u64, amount: f64 },
+}
+
 /// Messages sent from client to server
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    LabCommand { request_id: u32, action: LabAction },
     /// Subscribe to table updates
     Subscribe { table_name: String },
 
@@ -145,6 +155,14 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    /// Sent after the command's view deliveries have been queued. Not a paint ack.
+    LabComplete {
+        request_id: u32,
+        rows: usize,
+        step: u64,
+        mutations: usize,
+    },
+    LabError { request_id: u32, message: String },
     /// Full table data in response to Query
     TableData {
         table_name: String,

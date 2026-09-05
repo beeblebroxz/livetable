@@ -86,7 +86,7 @@ Terminal 1:
 
 ```bash
 cd impl
-cargo run --bin livetable-server --features server
+cargo run --release --bin livetable-server --features server -- --lab
 ```
 
 Terminal 2:
@@ -97,11 +97,12 @@ npm install
 npm run dev
 ```
 
-Open the URL printed by Vite. The editor uses base-table synchronization; the
-Forward Prop Demo sends a protocol-v3 filter/sort/group pipeline to the Rust
-server. Base/filter/sort nodes use ordered deltas after their initial snapshots;
-groups retain snapshots. Gaps recover through node snapshot requests and periodic
-checkpoints. See [docs/WEBSOCKET_PROTOCOL.md](docs/WEBSOCKET_PROTOCOL.md).
+Open the URL printed by Vite for the [Orders Lab](docs/ORDERS_LAB.md): five guided
+scenarios, 1k–100k deterministic orders, a branching server pipeline, and real
+delivery/recovery inspection. The original editor remains at `/#editor` on a
+separate table. Base/filter/sort nodes receive ordered deltas; groups retain
+snapshots. The `--lab` server is loopback-only and reset affects only shared
+synthetic lab data. See [docs/WEBSOCKET_PROTOCOL.md](docs/WEBSOCKET_PROTOCOL.md).
 
 ## Verification
 

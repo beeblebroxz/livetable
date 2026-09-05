@@ -25,7 +25,12 @@ Defaults:
 - Health check: `http://127.0.0.1:8080/health`
 - `HOST` and `PORT` override the bind address.
 
-The server currently seeds one in-memory table named `demo`. State is not
+By default the server seeds one in-memory table named `demo`. Add `-- --lab`
+to also enable synthetic `lab` data and the
+[Orders Lab control extension](ORDERS_LAB.md#demo-control-extension):
+`LabCommand`, `LabComplete`, and `LabError`. These additive v3 messages do not
+change existing sequencing contracts. The `--lab` CLI requires a loopback host.
+State is not
 persisted across restarts. CORS is permissive because this server is intended
 for local development and demos.
 

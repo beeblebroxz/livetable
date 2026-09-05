@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::engine::{ConnId, NodeSnapshot, TableEngine};
-use crate::messages::{ClientMessage, ServerMessage, ViewNodeSpec, PROTOCOL_VERSION};
+use crate::messages::{ClientMessage, LabAction, ServerMessage, ViewNodeSpec, PROTOCOL_VERSION};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -102,6 +102,14 @@ struct QueryView {
 #[rtype(result = "()")]
 struct Disconnect {
     conn: ConnId,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct LabCommand {
+    request_id: u32,
+    action: LabAction,
+    requester: ClientRecipient,
 }
 
 /// Owns all core tables and `Rc`-based views on one Actix thread.
@@ -224,6 +232,32 @@ impl Handler<Query> for TableEngineActor {
         match self.engine.query_table(&message.table_name) {
             Ok(response) => Self::send(&message.requester, response),
             Err(error) => Self::send_error(&message.requester, error),
+        }
+    }
+}
+
+impl Handler<LabCommand> for TableEngineActor {
+    type Result = ();
+
+    fn handle(&mut self, message: LabCommand, _ctx: &mut Self::Context) {
+        match self.engine.lab_command(&message.action) {
+            Ok((flat, mutations, rows, step)) => {
+                if matches!(message.action, LabAction::Reset { .. }) {
+                    // Flat clients also receive a monotonic, coherent baseline.
+                    if let Ok(snapshot) = self.engine.query_table("lab") {
+                        self.broadcast_base("lab", snapshot);
+                    }
+                } else {
+                    for update in flat { self.broadcast_base("lab", update); }
+                }
+                self.propagate_views("lab");
+                Self::send(&message.requester, ServerMessage::LabComplete {
+                    request_id: message.request_id, rows, step, mutations,
+                });
+            }
+            Err(error) => Self::send(&message.requester, ServerMessage::LabError {
+                request_id: message.request_id, message: error,
+            }),
         }
     }
 }
@@ -382,6 +416,9 @@ impl TableWebSocket {
     ) {
         let requester = ctx.address().recipient();
         match message {
+            ClientMessage::LabCommand { request_id, action } => {
+                self.state.engine.do_send(LabCommand { request_id, action, requester });
+            }
             ClientMessage::Subscribe { table_name } => {
                 self.state.engine.do_send(SubscribeBase {
                     table_name,

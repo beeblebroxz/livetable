@@ -97,9 +97,9 @@ cd impl && cargo bench
 
 ```bash
 # Start WebSocket server first
-cd impl && cargo run --bin livetable-server --features server
+cd impl && cargo run --release --bin livetable-server --features server -- --lab
 
-# Then start frontend (requires Node.js 18+)
+# Then start frontend (Node.js 20+; 22+ for browser tests)
 cd frontend && npm install && npm run dev
 ```
 
@@ -154,6 +154,9 @@ cd frontend && npm install && npm run dev
 - `hooks/useTableWebSocket.ts` - Flat-table WebSocket connection management
 - `hooks/usePipeline.ts` + `lib/pipelineReconciliation.ts` - Generation-aware pipeline connection management, atomic deltas, and snapshot recovery
 - `components/LiveTable.tsx` - Real-time table rendering with TanStack Table
+- `pages/OrdersLab.tsx` + `hooks/useLab.ts` - Default synthetic Orders Lab, five guided scenarios, virtualized results, actual delivery counters and bounded mixed streaming. `/#editor` preserves the old flat editor. See `docs/ORDERS_LAB.md`.
+- `engine/lab.rs` - Opt-in `lab` table and deterministic reset/step/update controls; never target `demo`. Reset preserves source identity, monotonically increasing IDs and delivery baselines. `LabComplete` is a command/delivery reply, not a browser-paint acknowledgement.
+- `npm run test:e2e` - Isolated real Rust server + installed headless Chrome tests on ports 8087/5180. Browser outputs are ignored under `frontend/test-results/`.
 
 ## Critical Notes
 

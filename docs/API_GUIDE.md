@@ -366,6 +366,11 @@ cargo run --bin livetable-server --features server
 The server is an in-memory demo service, not a persistence or authentication
 layer. See [WEBSOCKET_PROTOCOL.md](WEBSOCKET_PROTOCOL.md).
 
+For the interactive [Orders Lab](ORDERS_LAB.md), append `-- --lab` (loopback
+host only). Embedders can call `TableEngine::enable_lab()` to create the separate
+synthetic table. `lab_command()` applies its bounded demo controls; callers
+must tick/collect afterward, as the WebSocket actor does. It never mutates `demo`.
+
 ## Verification
 
 From the repository root:

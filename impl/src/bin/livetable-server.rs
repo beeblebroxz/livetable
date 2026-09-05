@@ -17,5 +17,17 @@ async fn main() -> std::io::Result<()> {
         .expect("PORT must be a number");
 
     // Start the server
-    run_server(&host, port).await
+    if std::env::args().any(|arg| arg == "--lab") {
+        // Reset/load controls are explicitly local-only and opt-in.
+        if !["127.0.0.1", "::1", "localhost"].contains(&host.as_str()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--lab requires a loopback HOST"));
+        }
+        let mut engine = livetable::engine::TableEngine::new();
+        engine.enable_lab().map_err(std::io::Error::other)?;
+        let listener = std::net::TcpListener::bind((host.as_str(), port))?;
+        println!("LiveTable Lab • ws://{host}:{port}/ws • 1,000 synthetic orders");
+        livetable::server::server_from_listener_with_engine(listener, engine)?.await
+    } else {
+        run_server(&host, port).await
+    }
 }

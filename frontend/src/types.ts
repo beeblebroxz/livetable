@@ -60,6 +60,7 @@ export type ConnectionState =
   | 'error';
 
 export type ClientMessage =
+  | { type: 'LabCommand'; request_id: number; action: LabAction }
   | { type: 'Subscribe'; table_name: string }
   | { type: 'Query'; table_name: string }
   | { type: 'InsertRow'; table_name: string; row: TableRow }
@@ -83,6 +84,8 @@ export type ClientMessage =
 // Clients drop any delta whose `seq` is <= the snapshot's `seq` (already
 // reflected) and apply the rest. See ServerMessage in impl/src/messages.rs.
 export type ServerMessage =
+  | { type: 'LabComplete'; request_id: number; rows: number; step: number; mutations: number }
+  | { type: 'LabError'; request_id: number; message: string }
   | { type: 'Subscribed'; table_name: string; protocol_version?: number }
   | { type: 'TableData'; table_name: string; seq: number; columns: string[]; rows: WireTableRecord[] }
   | { type: 'RowInserted'; table_name: string; seq: number; index: number; row_id: number; row: TableRow }
@@ -122,3 +125,8 @@ export type ServerMessage =
       message: string;
     }
   | { type: 'Error'; message: string };
+
+export type LabAction =
+  | { kind: 'reset'; rows: number }
+  | { kind: 'step' }
+  | { kind: 'update'; row_id: number; amount: number };

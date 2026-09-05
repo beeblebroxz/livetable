@@ -111,6 +111,11 @@ export const parseServerMessage = (payload: unknown): ServerMessage | null => {
   }
 
   switch (parsed.type) {
+    case 'LabComplete':
+      return isWireInteger(parsed.request_id) && isWireInteger(parsed.rows) &&
+        isWireInteger(parsed.step) && isWireInteger(parsed.mutations) ? parsed as ServerMessage : null;
+    case 'LabError':
+      return isWireInteger(parsed.request_id) && typeof parsed.message === 'string' ? parsed as ServerMessage : null;
     case 'Subscribed':
       return typeof parsed.table_name === 'string' &&
         (parsed.protocol_version === undefined || isWireInteger(parsed.protocol_version))
