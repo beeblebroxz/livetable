@@ -5,6 +5,14 @@
 **Goal:** Make the "Forward Propagation" browser demo run on LiveTable's real
 Rust engine instead of a client-side JavaScript reimplementation.
 
+This is an archived design, including its original constraints and alternatives.
+Use the [protocol reference](../../WEBSOCKET_PROTOCOL.md) for current message
+shapes, generation/sequence rules, and limits. Subsequent bounded mixed-batch
+[filter](../../INCREMENTAL_FILTER_PIPELINE.md) and
+[sorted](../../INCREMENTAL_SORTED_PIPELINE.md) propagation supersede the
+single-change-only verification note below. Full pipeline snapshots remain the
+wire format; pipeline deltas are planned separately.
+
 ## Original problem
 
 `frontend/src/pages/CascadeDemo.tsx` advertised "live base rows flow through
@@ -22,7 +30,7 @@ fuzz over filter / sort / group / join / computed, single-change and batched;
 three `AggregateView` bugs fixed). This design exposes that engine over the
 wire so the demo becomes truthful.
 
-## Approved decisions (from brainstorming)
+## Original approved decisions (from brainstorming)
 
 1. **Faithful incremental** — the server holds real Rust views and propagates
    via `TickableTable::tick()` on every mutation (single change per tick — the

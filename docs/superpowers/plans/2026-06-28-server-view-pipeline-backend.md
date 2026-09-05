@@ -1,5 +1,13 @@
 # Server-Computed View Pipeline (Backend) Implementation Plan
 
+**Archived, implemented plan.** Instructions and checklists below record the
+original work, not tasks to execute now. The [protocol reference](../../WEBSOCKET_PROTOCOL.md)
+is authoritative for current wire behavior. Since this plan, bounded mixed-batch
+[filter](../../INCREMENTAL_FILTER_PIPELINE.md) and
+[sorted](../../INCREMENTAL_SORTED_PIPELINE.md) propagation have landed; the
+single-change-only guidance below describes the original milestone. Pipeline
+delivery still uses full snapshots, not derived deltas.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Expose LiveTable's real Rust view engine over the WebSocket protocol so a client can subscribe to a server-computed filter→sort→group pipeline that updates incrementally on every base-table mutation.

@@ -2,7 +2,11 @@
 
 **Status:** Implemented. This file preserves the original execution plan; its
 unchecked step boxes are historical and are not the current feature status.
-See `docs/JOIN_FEATURE.md` and the join tests for the implemented behavior.
+See the [current join guide](../../JOIN_FEATURE.md) and join tests for implemented
+behavior. This archived plan's commands, agent instructions, code locations,
+and line numbers are historical, not current execution instructions; view
+implementations now live under `impl/src/view/`. Subsequent filter/sort parent
+replay is documented in the [Rust API guide](../../API_GUIDE.md).
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 

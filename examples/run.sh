@@ -16,7 +16,7 @@ echo ""
 echo "  2. Playground (playground.py)"
 echo "     → Interactive examples and challenges"
 echo ""
-echo "  3. Full Test Suite (test_python_bindings.py)"
+echo "  3. Binding Feature Demo (test_python_bindings.py)"
 echo "     → Comprehensive feature demonstration"
 echo ""
 echo "  4. Python REPL with livetable imported"
@@ -40,7 +40,7 @@ case $choice in
     ;;
   3)
     echo ""
-    echo "Running Full Test Suite..."
+    echo "Running Binding Feature Demo..."
     echo "--------------------------"
     python3 test_python_bindings.py
     ;;

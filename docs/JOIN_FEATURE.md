@@ -1,8 +1,9 @@
 # Join Operations
 
 LiveTable implements equality joins as read-only `JoinView` objects. Joins may
-use a single key or a composite key, may derive from tables or other views, and
-can synchronize incrementally after either parent changes.
+use a single key or a composite key and can synchronize after either parent
+changes. Rust joins accept tables or other views; the Python join API currently
+accepts root `Table` objects, not arbitrary derived parents.
 
 ## Supported join types
 
@@ -84,7 +85,9 @@ joined.refresh()         # unconditional full rebuild
 
 Join views support iteration, negative indices, and slicing through the common
 Python view interface. Iterators are fail-fast: mutating a parent or syncing the
-view while iterating raises `RuntimeError` on the next item.
+view with pending changes while iterating raises `RuntimeError` on the next
+item. An unconditional `refresh()` also invalidates the iterator; a no-op
+`sync()` does not.
 
 Joins created through `table.join()` are registered with both root tables.
 Calling `tick()` on the mutated root synchronizes the join automatically:
@@ -171,17 +174,22 @@ For unmatched rows:
   as the same `ColumnValue` variant.
 - NULL keys never match.
 - Float NaN keys never match.
-- Float keys use their IEEE bit representation; this preserves exact equality
-  semantics used by the implementation.
+- Float keys use their IEEE bit representation: `-0.0` and `0.0` are distinct
+  join keys, unlike their tie/grouping behavior in sorts and aggregates.
 - Composite keys are typed vectors, so embedded null bytes in strings cannot
   collide with key separators.
 
 ## Incremental behavior
 
 `JoinView` maintains a cached output index. `sync()` consumes pending changes
-from both roots and handles inserts, deletes, and key updates. When a parent is
-itself a view, the join uses parent versions and rebuilds when that parent is
-stale. `refresh()` always rebuilds from current parents.
+from both parents and handles inserts, deletes, and key updates. Tables and
+synchronized filters/sorts expose history that Rust joins can replay. If either
+parent exposes no changeset, the join instead uses version-checked rebuilds.
+Missing history, structural changes on both sides in one batch, or a key update
+before a structural change on the same side also require a rebuild to avoid
+mixing row-coordinate frames. Always synchronize parents first; `refresh()`
+unconditionally rebuilds from their current state. Joins themselves do not
+publish output changesets, so children use version-checked rebuilds.
 
 Construction and a full refresh are O(N + M + R), where `N` and `M` are parent
 sizes and `R` is the output size. Output can be much larger than either parent

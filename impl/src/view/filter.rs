@@ -13,7 +13,7 @@ use super::RowPredicate;
 /// A FilterView filters rows from the parent table based on a predicate.
 /// Maintains a mapping from view indices to parent indices.
 ///
-/// Replays bounded batches from a table or filter parent and emits a changeset
+/// Replays bounded batches from a table, filter, or sort parent and emits a changeset
 /// in its own row coordinates. Missing history or large batches trigger a
 /// rebuild, which invalidates the output history for downstream consumers.
 pub struct FilterView {

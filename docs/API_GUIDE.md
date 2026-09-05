@@ -162,7 +162,9 @@ incompatible mixed types, while CSV may fall back to string.
 
 Every table and view implements `ReadableTable`. A view parent is therefore an
 `Rc<RefCell<dyn ReadableTable>>`, which permits view-over-view DAGs without
-copying the source rows. The following focused fragments use `?` and assume a
+materializing a second source table. Views still keep indices, sort-key caches,
+or aggregate state, and read APIs and changeset payloads clone values/rows.
+The following focused fragments use `?` and assume a
 surrounding function that returns `Result<(), String>`.
 
 ### Filter, projection, and computed views
@@ -210,7 +212,11 @@ let sorted = Rc::new(RefCell::new(SortedView::new(
 ```
 
 `SortKey::new(column, order, nulls_first)` provides explicit null ordering.
-`SortedView::sync()` updates the sorted index; `refresh()` rebuilds it.
+`ascending` and `descending` default to NULL last. Equal keys retain parent
+order (including signed-zero ties); NaNs tie and sort after numbers ascending,
+before numbers descending, independently of NULL placement.
+`SortedView::sync()` updates the index and publishes sorted-coordinate changes;
+it also returns `true` for a non-sort column edit. `refresh()` rebuilds it.
 
 ### Aggregation
 
@@ -218,15 +224,15 @@ let sorted = Rc::new(RefCell::new(SortedView::new(
 use livetable::{AggregateFunction, AggregateView};
 
 let grouped = Rc::new(RefCell::new(AggregateView::new(
-    "by_department".to_string(),
-    table.clone(),
-    vec!["department".to_string()],
+    "by_name".to_string(),
+    sorted.clone(),
+    vec!["name".to_string()],
     vec![
-        ("total".to_string(), "salary".to_string(), AggregateFunction::Sum),
-        ("count".to_string(), "salary".to_string(), AggregateFunction::Count),
+        ("total".to_string(), "score".to_string(), AggregateFunction::Sum),
+        ("count".to_string(), "score".to_string(), AggregateFunction::Count),
         (
             "p95".to_string(),
-            "salary".to_string(),
+            "score".to_string(),
             AggregateFunction::Percentile(0.95),
         ),
     ],
@@ -291,16 +297,40 @@ For joins, register the same `Rc<RefCell<JoinView>>` with
 right root. Registration uses weak references, so dropped views are pruned on a
 later tick.
 
-The incremental fast path is optimized for one mutation per tick. A stateful
-view falls back to a full rebuild when a multi-change batch cannot be replayed
-safely.
+Filters and sorts replay mixed batches of up to 256 input events. Larger batches,
+missing history, or an incoherent baseline trigger a full rebuild. Sort moves
+emit a delete/insert pair, so a 256-event input batch can produce 512 events;
+a downstream filter/sort may consequently rebuild. Aggregates batch structural
+index remapping for up to 512 events; requested MIN/MAX can still rescan a group.
+These are bounded incremental paths, not constant-time guarantees: structural
+changes still shift indices. See the [filter](INCREMENTAL_FILTER_PIPELINE.md)
+and [sorted](INCREMENTAL_SORTED_PIPELINE.md) contracts for limits and measurements.
+
+`tick()` returns immediately without pending root mutations. After manually
+refreshing a parent without a root mutation, call each child's `sync()` in
+parent-before-child order.
 
 ## Changesets and versions
 
 Root mutations append `TableChange` entries and increment `Table::version()`.
 `Changeset::total_len()` is an absolute monotonic change count even after
-compaction. Stateful views keep their own cursor; composed views include parent
-versions so staleness flows through the DAG.
+compaction. Consumer cursors belong to their immediate parent's stream, not
+necessarily the root. `TickableTable` uses translated `root_changeset_cursor()` /
+`root_changeset_cursors()` internally for root compaction; derived-stream cursors
+are excluded. Prefer `tick()` to duplicating that bookkeeping. Never compare
+counters from different streams.
+
+| Producer | Output history for children |
+|----------|-----------------------------|
+| Table | Root-coordinate mutation events |
+| Synchronized filter/sort | Own-coordinate events; one successful nonempty input batch retained |
+| Projection, computed, join, aggregate | No output changeset; children use version-checked rebuilds |
+
+No-op sync preserves filter/sort history. Rebuild/refresh invalidates it even
+for a caught-up consumer. A child constructed from a stale parent must rebuild
+after that parent synchronizes. Versions include ancestors independently of
+output event counts: a filtered-out mutation can advance a version without
+emitting any filter events.
 
 Prefer `TickableTable::tick()` over manually clearing a changeset. Clearing or
 compacting changes before registered views synchronize can force a rebuild or
@@ -331,12 +361,9 @@ layer. See [WEBSOCKET_PROTOCOL.md](WEBSOCKET_PROTOCOL.md).
 From the repository root:
 
 ```bash
-cd impl
-cargo test --lib
-cargo test --lib --features server
-cargo test --test forward_prop_fuzz
-cargo test --features server --test protocol_v2_websocket
-cargo doc --no-deps
+cargo test --manifest-path impl/Cargo.toml --lib --features server
+cargo test --manifest-path impl/Cargo.toml --features server --test filter_pipeline --test sorted_pipeline --test forward_prop_fuzz --test protocol_v2_websocket
+cargo doc --manifest-path impl/Cargo.toml --no-deps
 ```
 
 Python builds should additionally set `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`

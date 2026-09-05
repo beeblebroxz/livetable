@@ -1,13 +1,21 @@
+//! LiveTable: typed columnar tables with shared-source views and incremental updates.
+//!
+//! [`ReadableTable`] is the common read interface for [`Table`] and all views.
+//! Mutate root tables, then synchronize stateful views in parent-before-child
+//! order, either directly or through [`TickableTable`]. Filters and sorts publish
+//! bounded changesets in their own row coordinates; children of other view types
+//! use version-checked rebuilds. Views retain derived indices, cached keys, or
+//! aggregate state rather than another complete source table.
+//!
+//! The core has no default features. Enable `python` for PyO3 bindings or `server`
+//! for the Actix/WebSocket service. Pipeline wire updates currently carry full
+//! snapshots, independently of incremental engine maintenance.
+
 pub mod changeset;
 pub mod column;
 pub mod expr;
 mod filter_changes;
 pub mod interner;
-/// LiveTable - High-Performance Columnar Table System
-///
-/// A high-performance columnar table system with reactive views and incremental updates.
-/// This implementation demonstrates high-performance tabular data structures with
-/// strong type safety and zero-cost abstractions.
 pub mod readable;
 pub mod sequence;
 pub mod table;

@@ -2,7 +2,7 @@
 
 Comprehensive test suite for the livetable Rust-powered table system.
 
-## Test Structure
+## Test Structure (selected files)
 
 ```
 tests/
@@ -12,6 +12,9 @@ tests/
 ├── python/                     # Python unit tests
 │   ├── test_table_operations.py    # CRUD operations
 │   ├── test_views.py              # Views and filtering
+│   ├── test_filter_batches.py     # Mixed filter batches and callback failures
+│   ├── test_sorted_batches.py     # Sorted batches and downstream grouping
+│   ├── test_view_composition.py   # Supported Python chains
 │   └── test_bindings.py           # Legacy comprehensive test
 └── integration/                # Integration tests
     └── test_end_to_end.py         # Real-world workflows
@@ -26,11 +29,17 @@ cd tests
 ./run_all.sh
 ```
 
+Rebuild/install the Python extension after Rust changes (see the
+[build instructions](../docs/PYTHON_BINDINGS_README.md#building-from-source)).
+The runner only installs it if importing `livetable` fails; an existing import
+is not proof that it contains the latest source. Use an isolated virtualenv.
+
 This runs:
+
 1. Rust `clippy` for the core library, `server`, and `python` features
 2. Rust library tests with the `server` feature enabled
-3. Python unit tests
-4. Integration tests
+3. Rust filter and sorted pipeline contract tests
+4. Python unit and integration tests
 5. Frontend lint, Vitest, and production build
 
 The script intentionally keeps the long randomized fuzz suite and the
@@ -62,7 +71,8 @@ pytest -s
 ### Rust Tests Only
 
 ```bash
-cd ../impl
+# From the repository root
+cd impl
 env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib --features server
 
 # Randomized forward-propagation tests
@@ -81,7 +91,8 @@ cargo test --features server --test protocol_v2_websocket
 ### Rust Lint Only
 
 ```bash
-cd ../impl
+# From the repository root
+cd impl
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features server -- -D warnings
 env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo clippy --all-targets --features python -- -D warnings
@@ -90,7 +101,8 @@ env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo clippy --all-targets --features 
 ### Frontend Checks Only
 
 ```bash
-cd ../frontend
+# From the repository root
+cd frontend
 npm run lint
 npm run test
 npm run build
@@ -111,11 +123,15 @@ npm run build
 - FilterView (basic filters, null handling)
 - ProjectionView (column selection)
 - ComputedView (dynamic columns)
-- JoinView (LEFT, INNER, RIGHT, and FULL joins)
-- View chaining (filter + project, filter + compute)
+- JoinView basics (LEFT and INNER); RIGHT/FULL and composite keys have separate tests
+
+**test_view_composition.py**, **test_filter_batches.py**, **test_sorted_batches.py**
+- Supported filter → sort → aggregate and filter → aggregate chains
+- Mixed batches, nullable values, stable ties, and explicit-constructor behavior
+- Filter callback failure/retry without partial state commits
 
 **test_bindings.py** - Legacy comprehensive test
-- All features in one file (142 lines)
+- A legacy collection of binding checks
 - Useful for quick smoke testing
 
 ### Integration Tests (`integration/`)
@@ -133,7 +149,7 @@ Located in Rust source files with `#[cfg(test)]` modules:
 - **sequence.rs** - Storage backends
 - **column.rs** - Column operations
 - **table.rs** - Table operations
-- **view.rs** - Views and incremental propagation
+- **view/tests.rs** - Views and incremental propagation (module rooted at `view.rs`)
 - **websocket.rs** - WebSocket protocol and JSON conversion
 - **engine.rs** - Server table ownership, stable row IDs, and per-connection pipelines
 - **pipeline_spec.rs** - Protocol pipeline validation and view construction
@@ -142,6 +158,8 @@ Located in Rust source files with `#[cfg(test)]` modules:
 Rust integration tests under `../impl/tests/`:
 
 - **forward_prop_fuzz.rs** - Differential randomized view propagation
+- **filter_pipeline.rs** - Filter output coordinates, bounded work, history, and compaction
+- **sorted_pipeline.rs** - Sorted-coordinate replay, move batches, and bounded source reads
 - **protocol_v2_websocket.rs** - Real Actix server and WebSocket boundary
 
 ## Test Coverage
@@ -229,9 +247,10 @@ It runs:
 2. Rust `clippy` with `-D warnings` for the `server` feature
 3. Rust `clippy` with `-D warnings` for the `python` feature
 4. Rust library tests with the `server` feature enabled
-5. The protocol-v2 real-WebSocket integration test
-6. Python package build plus pytest suite on Python 3.12
-7. Frontend lint, Vitest, and production build
+5. Filter/sorted pipeline contracts and randomized forward-propagation tests
+6. The protocol-v2 real-WebSocket integration test
+7. Python package build plus pytest suite on Python 3.12
+8. Frontend lint, Vitest, and production build
 
 ### Toolchain Split
 
@@ -248,16 +267,24 @@ This avoids relying on `cargo test --all-features` for the PyO3 extension target
 For performance benchmarks (separate from unit tests):
 
 ```bash
-cd ../benchmarks
+# From the repository root
+cd benchmarks
 python3 benchmark_vs_pandas.py
 ```
 
 Or Rust benchmarks:
 
 ```bash
-cd ../impl
+# From the repository root
+cd impl
 cargo bench
 ```
+
+For end-to-end Rust mutation-plus-tick workloads, use the dedicated
+[filter pipeline](../docs/INCREMENTAL_FILTER_PIPELINE.md#reproducible-benchmark)
+and [sorted pipeline](../docs/INCREMENTAL_SORTED_PIPELINE.md#reproducible-benchmark)
+harnesses. Their reports record commit/environment-specific timings; they are
+not Python or browser benchmarks, nor CI performance thresholds.
 
 ## Troubleshooting
 

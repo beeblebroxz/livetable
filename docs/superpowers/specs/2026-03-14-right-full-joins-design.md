@@ -4,9 +4,15 @@
 **Status:** Implemented
 **Scope:** Add RIGHT and FULL OUTER join types to JoinView, integrate JoinView with tick() auto-propagation
 
+This is the historical design. The original problem below has been resolved:
+all four join types and tick integration are implemented. Current APIs, typed
+key semantics, and table/filter/sort-parent replay limits are documented in the
+[join guide](../../JOIN_FEATURE.md). Source locations below predate the split
+into `impl/src/view/` modules.
+
 ---
 
-## Context
+## Original context (before implementation)
 
 LiveTable's JoinView currently supports LEFT and INNER joins. The `join_index` stores `Vec<(usize, Option<usize>)>` — each entry maps a left row to an optional right row. RIGHT and FULL OUTER joins are listed as planned in the original vision document.
 

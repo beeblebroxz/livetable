@@ -90,7 +90,7 @@ Recorded September 4, 2026 (America/Los_Angeles), Apple M2, 24 GiB RAM,
 macOS 26.5.2 (25F84), arm64, `rustc 1.91.1 (ed61e7d7e 2025-11-07)`,
 release profile, array storage. Before: `f49ea3c0a1205bab1e6f88ae4260145444a8a156`
 plus the identical new benchmark harness, measured before implementation.
-After: the implementation in the commit introducing this report, including
+After: `cdbae9bcb3a7c8cac0e620d9b5060c6b3af1d023`, including
 batched aggregate index remapping. The final run was isolated from other
 agent-started test/build jobs.
 
@@ -147,7 +147,8 @@ read counts, not timing thresholds.
 - `tests/python/test_sorted_batches.py`: an independent stable-sort/group model
   on both storage backends with manual sync and tick, history fallbacks, nullable
   integer groups, explicit-constructor registration, and child lifetimes.
-- Verified 198 Rust unit tests, 9 filter contracts, 10 sorted contracts, 6
+- At the recorded implementation commit, verified 198 Rust unit tests, 9 filter contracts, 10 sorted contracts, 6
   randomized tests, 1 real WebSocket integration test, 422 Python tests, and 23
   frontend tests (669 total). Core/server/Python Clippy checks and frontend
-  lint/build also pass.
+  lint/build also passed. These counts record that milestone, not a permanent
+  test-suite size; current commands are in the [test guide](../tests/README.md).

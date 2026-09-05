@@ -1,7 +1,8 @@
 //! LiveTable View Implementation
 //!
-//! Views are read-only derived tables that automatically propagate changes
-//! from parent tables. Each view type lives in its own submodule; shared
+//! Views are read-only derived tables. Stateful views synchronize parent changes
+//! through explicit `sync()` calls or a registered `TickableTable::tick()`;
+//! projection/computed views read through. Each type lives in its own submodule; shared
 //! key types used by joins and aggregates live here in the module root.
 
 use crate::column::ColumnValue;
@@ -38,8 +39,8 @@ type ComputeFunction = dyn Fn(&HashMap<String, ColumnValue>) -> ColumnValue;
 /// which collided when string data contained `\x00`).
 ///
 /// Float variants store IEEE 754 bit patterns so `Eq`/`Hash` derive cleanly.
-/// Per SQL semantics, NaN never equals anything: builders return `None` for any
-/// NaN-bearing row, which excludes it from joins.
+/// LiveTable excludes NaN-bearing rows from joins: builders return `None` for
+/// those keys. Signed zeros remain distinct because their bits differ.
 ///
 /// Also reused by `aggregate_support::GroupKey`, which applies a different
 /// float policy (NaN/-0.0 canonicalized instead of excluded — see there).

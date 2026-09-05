@@ -4,6 +4,12 @@
 
 This document captures the original design philosophy and architectural decisions that guide LiveTable's implementation.
 
+The design sections preserve aspirations, not current API guarantees. In
+particular, automatic layout tuning, parallel execution/locking, and strict mode
+are not implemented. See [Implementation Status](#implementation-status) for
+the current scope, the [Rust API guide](API_GUIDE.md) for supported behavior, and
+the [sorted pipeline contract](INCREMENTAL_SORTED_PIPELINE.md) for recent work.
+
 ---
 
 ## Design Philosophy
@@ -44,7 +50,8 @@ An unusual data structure using circular buffers to achieve true constant-time a
 
 ### Choosing Between Them
 
-The system can dynamically choose good layout strategies based on the relative ratios of insert/delete vs. loops over the entire Column, random access, etc.
+The original proposal was to dynamically choose layout strategies based on
+insert/delete versus read patterns; automatic switching remains unimplemented.
 
 **Current Implementation**: Users select the storage backend via `StorageHint` at table creation:
 - `storage="fast_reads"` (default): Uses ArraySequence
@@ -96,7 +103,7 @@ A **Table** is a list of named Columns. The list of Column names and their types
 - Once a Root has children, its Schema can no longer change
 
 #### View Tables
-- Has no data of its own
+- Has no independently mutable source data (may cache derived state)
 - Is just a function of the values in other Tables
 - Cannot be directly modified
 - Always derives from parent Tables via a DAG (Directed Acyclic Graph)
@@ -111,11 +118,22 @@ Views can be implemented with different materialization strategies:
 
 3. **Hybrid View**: Tracks a little state that needs to be updated whenever the parent changes, but still doesn't keep its own copy of everything. Example: a SortedView that maintains its own row-index-permuting Sequence to track how the parent should be reordered, but without actually copying all the row data.
 
+Today filters/joins keep row mappings, sorts also cache sort-key values and
+inverse indices, and aggregates materialize group state. Reads/event payloads
+clone values or affected rows. The original locking discussion does not apply
+to the current single-threaded `Rc<RefCell<...>>` view graph.
+
 ---
 
 ## Change Propagation
 
 Only Roots may be directly modified, and those modifications recursively propagate through descendant Views based on what function they are computing.
+
+Currently this is explicit: mutate the root, then `tick()` registered views, or
+manually `sync()` in parent-before-child order. Filters/sorts publish bounded
+own-coordinate history; other views' children use version-checked rebuilds.
+See the [filter contract](INCREMENTAL_FILTER_PIPELINE.md). Root `tick()` requires
+pending mutations; refresh-only propagation requires direct child sync.
 
 ### Batched Changesets
 
@@ -149,9 +167,14 @@ Some Columns use the same strings over and over again, so interning is useful:
 
 ## Group By / Aggregations
 
-Rather than having one table feed directly into a "group by" table, the implementation:
+The original proposal, rather than feeding directly into a "group by" table:
 1. Has the parent table feed into a group-by object that hashes, unifies, etc.
 2. Then forward propagates into a normal table that can be processed efficiently
+
+The current `AggregateView` instead exposes its own materialized group state
+through `ReadableTable`; it does not populate a separate root table or publish
+output changesets. SUM/COUNT/AVG maintain incremental state; requested extrema
+may rescan a group, while percentiles maintain sorted values.
 
 ### Parallel Group By
 
@@ -222,7 +245,8 @@ items below remain original future ideas.
 - [x] Pandas DataFrame interop (`to_pandas`, `from_pandas`)
 
 ### Planned
-- [ ] Materialized Views (cached for faster reads)
+- [ ] General-purpose fully materialized row views (beyond existing key/group caches)
+- [ ] Pipeline WebSocket delta delivery and derived-row identity (currently full snapshots)
 - [ ] Persistence and recovery
 - [ ] Parallel view execution
 - [ ] SQL/query-planning layer

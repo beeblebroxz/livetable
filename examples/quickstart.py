@@ -175,9 +175,10 @@ for i in range(len(by_course)):
 print("\n🔄 Step 10: Reactive updates with tick()")
 print("-" * 60)
 
-# Views created with simplified API are auto-registered for tick()
+# Chained views created with the simplified API register parent before child.
 filtered = table.filter(lambda r: r["score"] >= 90)
-sorted_view = table.sort("score", descending=True)
+sorted_view = filtered.sort("score", descending=True)
+totals = sorted_view.group_by("test_date", agg=[("total_score", "score", "sum")])
 print(f"Registered views: {table.registered_view_count()}")
 
 # Add new data
@@ -187,11 +188,14 @@ print(f"Added Diana (score: 98)")
 # Before tick, views haven't updated yet
 print(f"Filtered count (stale): {len(filtered)}")
 
-# tick() propagates changes to all registered views at once
+# tick() propagates table -> filter -> sort -> aggregate in one call.
 synced = table.tick()
 print(f"After tick(): synced {synced} views")
 print(f"Filtered count (fresh): {len(filtered)}")
 print(f"New top scorer: {sorted_view[0]['name']}")
+print(f"Scores by test date: {list(totals)}")
+assert [row["name"] for row in sorted_view] == ["Diana", "Alice", "Charlie"]
+assert abs(sum(row["total_score"] for row in totals) - 285.6) < 1e-9
 
 # =============================================================================
 # 🎓 YOU'RE READY!
@@ -210,6 +214,7 @@ You now know how to:
 ✅ Join tables
 ✅ Use simplified API (sort, join, group_by)
 ✅ Propagate changes with tick()
+✅ Chain filter → sort → aggregate views
 
 Next steps:
 1. Watch reactive propagation: python3 demo_reactive_propagation.py

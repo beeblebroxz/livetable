@@ -200,7 +200,9 @@ See [the internal sorted pipeline contract](INCREMENTAL_SORTED_PIPELINE.md).
 
 The server immediately sends a snapshot for the synthetic `base` node and each
 successfully built node. It sends new full snapshots for nodes whose version
-changes after a base mutation:
+changes after a base mutation, including the synthetic base node. Versions
+include ancestors, so even an edit excluded by a filter can cause a new full
+snapshot. Suppressing empty internal output is not wire-level suppression:
 
 ```json
 {
@@ -258,11 +260,23 @@ Pipeline responses require two keys:
 2. Compare `seq` only within the same generation and node. Rebuilding a
    pipeline resets view-local version counters.
 
+For derived nodes, `seq` is the view version (including ancestors), not the
+filter/sort output changeset count. It can jump: pipeline snapshots do not use
+the contiguous `applied + 1` delta rule of the flat-table protocol.
+
 The bundled hooks implement these rules and reconnect with exponential backoff.
 Pipeline expression changes are debounced by 250 ms. The current `usePipeline`
 hook keeps the last snapshot for a node until current-generation data for that
 same node ID arrives. Callers that remove or rename node IDs should clear or
 filter the snapshot map; the bundled cascade demo uses stable IDs.
+
+### Planned: pipeline delta delivery
+
+Pipeline-specific deltas and stable derived-row identity are not implemented.
+The next transport work must define identity, snapshot/delta baselines, ordering,
+gap recovery, and generation changes before internal view events can be sent
+directly. Existing flat-table mutation deltas do not provide that contract for
+derived nodes. No wire format change accompanied the incremental sort milestone.
 
 ## Resource limits
 

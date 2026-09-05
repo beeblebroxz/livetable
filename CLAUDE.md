@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LiveTable is a high-performance columnar table system written in Rust with Python bindings via PyO3. It focuses on typed row operations, zero-copy view DAGs, and incremental change propagation; benchmark claims must be tied to the checked-in harnesses and a recorded environment.
+LiveTable is a columnar table system written in Rust with Python bindings via PyO3. It focuses on typed row operations, shared-source view DAGs, and incremental change propagation; benchmark claims must be tied to the checked-in harnesses and a recorded environment. Views keep indices, cached keys, or aggregate state; reads and event payloads clone values/rows, so do not claim blanket zero-copy behavior.
 
 ## Original Design Vision
 
@@ -30,6 +30,13 @@ Key principles from the original vision:
 3. **docs/PYTHON_BINDINGS_README.md** - Full API reference and examples
 4. **docs/ORIGINAL_VISION.md** - Mark implemented features as complete
 5. **docs/WEBSOCKET_PROTOCOL.md** - Wire changes, sequencing, and limits (server feature only)
+6. **QUICK_START.md**, **docs/GETTING_STARTED.md**, **docs/START_HERE.md** - Onboarding and runnable examples
+7. **docs/API_GUIDE.md**, **docs/JOIN_FEATURE.md**, **tests/README.md** - Rust/API contracts and actual local/CI checks
+8. **docs/INCREMENTAL_*_PIPELINE.md**, **docs/PERFORMANCE_COMPARISON.md** - Propagation limits and reproducible benchmarks; preserve measured commit/environment provenance
+
+Plans/specs under `docs/superpowers/` are historical records, not current task
+instructions. Keep their implementation status and current-reference links
+accurate without rewriting original checklists as if they were executed today.
 
 **Checklist for new features:**
 - [ ] Add to README.md Features section
@@ -43,6 +50,10 @@ Key principles from the original vision:
 
 
 ## Build Commands
+
+Each command group starts at the repository root. Prefer an isolated virtualenv
+for Python builds; see the Python reference. Rebuild/reinstall after Rust changes:
+the test runner checks importability, not whether an installed extension is current.
 
 ```bash
 # Build and install Python package (recommended)
@@ -65,6 +76,9 @@ cd tests && ./run_all.sh
 
 # Rust tests only
 cd impl && cargo test --lib --features server
+
+# Propagation contracts and randomized differential tests
+cd impl && cargo test --features server --test filter_pipeline --test sorted_pipeline --test forward_prop_fuzz
 
 # Real WebSocket protocol integration test
 cd impl && cargo test --features server --test protocol_v2_websocket
@@ -96,31 +110,34 @@ cd frontend && npm install && npm run dev
 - **column.rs** - Strongly-typed column values with NULL support (INT32, INT64, FLOAT32, FLOAT64, STRING, BOOL, DATE, DATETIME)
 - **table.rs** - Row-level CRUD operations on column collections
 - **readable.rs** - `ReadableTable` trait: the read surface shared by `Table` and every view, enabling views-over-views (DAG composition)
-- **view.rs** + **view/** - Zero-copy views, one file per type: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`, `AggregateView`, `TickableTable`; view.rs holds shared typed join-key machinery; tests in view/tests.rs
+- **view.rs** + **view/** - Shared-source views, one file per type: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`, `AggregateView`, `TickableTable`; view.rs holds shared typed join-key machinery; tests in view/tests.rs
+- **filter_changes.rs** - Shared historical-row reconstruction and filter replay for Rust/Python; also used by sort/aggregate consumers
 - **python_bindings.rs** - PyO3 bindings exposing Rust types as Python classes
 - **engine.rs** + **pipeline_spec.rs** - Single-threaded server table owner and bounded wire-spec → real-view construction
 - **websocket.rs** + **messages.rs** - Actix transport and protocol-v2 real-time sync
 
 ### Key Patterns
-- Views use `Rc<RefCell<>>` for shared table access without data duplication
+- Views use `Rc<RefCell<>>` for shared source access, with their own derived state
 - View parents are `Rc<RefCell<dyn ReadableTable>>`. Tables and synchronized filters/sorts expose changesets in their own row coordinates; children of other views use version-checked full refresh. A view's `version()` includes its parents for staleness/iterator guards and is independent of its output changeset sequence. Always sync parents before children (tick registration order is topological).
 - Consumer cursors belong to their immediate parent's stream. Use `root_changeset_cursor()` / `root_changeset_cursors()` for tick compaction; they return `usize::MAX` for derived sources. Never compare a filter's output cursor with a root table's cursor. A consumer created while a filter is stale has no coherent baseline and must refresh after the parent syncs.
 - `filter_changes.rs` shares replay and output emission between native/Python filters. It reconstructs historical updated rows across later shifts/deletes and emits filter-coordinate events. Batches up to 256 changes replay; larger batches rebuild. One successful non-empty input batch is retained; a no-op sync preserves history, and rebuild uses `Changeset::invalidate()` to force even caught-up consumers to refresh. Python callbacks are evaluated before committing indices/history, so errors are retryable. See `docs/INCREMENTAL_FILTER_PIPELINE.md` and `impl/tests/filter_pipeline.rs`.
 - Aggregate group-key updates use the same historical-row reconstruction. SUM/COUNT/AVG updates do not trigger unused MIN/MAX rescans; requested extrema may rescan the affected group.
 - SortedView caches only sort keys in parent coordinates plus forward/inverse index mappings. Small batches (up to 256 input events) replay against historical keys, never live-parent comparisons. A moved row emits delete(old full row) + insert(new full row); stationary edits emit CellUpdated. Ties follow parent order, NaNs sort after numbers ascending (before descending), and signed zero ties are stable. History/invalidation follow the filter contract. See `docs/INCREMENTAL_SORTED_PIPELINE.md`.
 - Aggregate batches with multiple structural events (up to 512 total events) use temporary row identities and remap index hashes once before MIN/MAX rescans. This avoids rehashing all rows for each delete/insert pair emitted by a sort. It uses O(N+B) temporary index storage, not a table snapshot.
-- Python lambdas are converted to Rust closures for filter/computed operations
-- Join operations use O(N+M) algorithm
+- Python filter/computed callbacks still execute Python; they are not compiled into native predicates. Filter callbacks are fallible and must return a bool.
+- Join construction/refresh costs O(N+M+R), where R is output size. Rust joins replay table/filter/sort history when available; parents without output history require version-checked rebuilds. Float join keys are bitwise, so -0.0 and +0.0 differ (unlike sorting/grouping).
 - WebSocket base protocol: `Subscribe`, `Query`, `InsertRow`, `UpdateCell`, and `DeleteRow`; successful mutations broadcast `RowInserted`, `CellUpdated`, and `RowDeleted` to base subscribers
 - WebSocket reconciliation: every `TableData` and delta carries a monotonic `seq` (the table's `Changeset::total_len`, captured in the same serialized engine operation as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. This closes a snapshot/delta race where an insert around subscribe could otherwise be applied twice. Keep `seq` populated when adding new server→client messages.
 - WebSocket gap recovery: deltas only apply contiguously (`seq == applied + 1`); if a gap persists for `SEQ_GAP_REQUERY_MS` the client re-sends `Query` and re-baselines from the fresh snapshot (`useTableWebSocket.ts`). The pending-delta buffer is capped at `MAX_PENDING_DELTAS` (oldest evicted; the resulting gap heals via re-query). Cell edits are server-authoritative: on blur the input snaps back to the last confirmed value and only the `CellUpdated` broadcast echo moves it forward, so rejected updates (e.g. null into a non-nullable column) self-heal.
 - WebSocket `Subscribed` carries `protocol_version` (`messages::PROTOCOL_VERSION`); the client warns on mismatch with `SUPPORTED_PROTOCOL_VERSION`. Bump both on breaking wire changes.
 - WebSocket protocol v2 pipeline messages carry a client-selected `pipeline_generation` on `SetPipeline`, `ViewData`, and `ViewError`. Reconcile responses by `(pipeline_generation, node_id, seq)`: ignore non-current generations and compare `seq` only within one generation/node. The current `usePipeline` retains an old snapshot until current-generation data for that node ID arrives; changing/removing node IDs requires explicitly clearing or filtering snapshot state.
 - `ViewData` uses `WireViewRow { row_id: Option<u64>, row }`; derived rows without stable identity serialize `row_id: null`. Never use `u64::MAX` as a JavaScript sentinel. Pipeline `count` is `COUNT(column)` and every aggregate spec therefore requires a source `column`.
+- Pipeline delivery still sends full snapshots for the base and nodes whose inherited version changes, even for edits excluded by a filter. Internal filter/sort events are not wire deltas. Pipeline `seq` is a view version and may jump; do not apply the flat-table contiguous-delta rule to it. Pipeline delta delivery remains planned.
 - Run `pipeline_spec::validate_pipeline_spec()` before allocating views. It enforces ordered/acyclic sources, unique non-reserved node IDs, required node fields, and protocol resource limits.
 - The canonical wire reference is `docs/WEBSOCKET_PROTOCOL.md`; update it whenever message shapes, limits, generation rules, or sequence semantics change.
 - `Table::from_json`/`from_csv` infer each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null/empty → STRING); values are then converted against the inferred schema, not in isolation. JSON rejects incompatible mixes (number + string) at inference with a clear error; CSV falls back to STRING since every CSV value is a string at heart.
-- Iterator mutation guards: every Py iterator (table and all six views) captures a version at `__iter__` and raises `RuntimeError` from `__next__` if it changes. View iterators use `ReadableTable::version()` (own sync counter + parent version), so both parent mutations and `sync()`/`refresh()` trip the guard.
+- Iterator mutation guards: table/filter/projection/computed iterators capture the root table version; join/sort/aggregate iterators use `ReadableTable::version()` including ancestors and their own sync counter. All detect root mutations; the latter also detect view-version advances on sync/refresh. Filter-only refresh without root mutation is not detected. No-op sync does not invalidate an iterator.
+- Python chaining supports `FilterView.sort()`, `FilterView.group_by()`, and `SortedView.group_by()`, not every Rust DAG. Simplified stateful methods auto-register. Explicit constructors normally do not; `SortedView.group_by()` registers its sort parent once, but children of an explicit filter still require that filter to be synced manually first. Root `tick()` does nothing without pending root changes: after a manual parent refresh, sync children directly.
 - JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
 - String columns use `NULL_STRING_ID` (u32::MAX) as null sentinel in `string_ids` — never use 0
 - `Column::check_value_type(&value)` validates without consuming — use before batch mutations
@@ -159,6 +176,10 @@ cd frontend && npm install && npm run dev
 
 ## Python API Usage
 
+These are independent API fragments assuming tables with the indicated columns,
+not a single runnable program. For a complete chain, see
+[Getting Started](docs/GETTING_STARTED.md).
+
 ```python
 import livetable
 
@@ -182,10 +203,10 @@ row = table[0]           # Indexing: table[idx]
 row = table.get_row(0)   # Same as above
 table.delete_row(0)
 
-# Views (zero-copy)
-filtered = table.filter(lambda row: row["score"] >= 90)
+# Views (shared source, derived state)
+filtered = table.filter(lambda row: row["score"] is not None and row["score"] >= 90)
 projected = table.select(["name", "score"])
-computed = table.add_computed_column("grade", lambda row: "A" if row["score"] >= 90 else "B")
+computed = table.add_computed_column("grade", lambda row: "A" if row["score"] is not None and row["score"] >= 90 else "B")
 
 # Expression-based filtering (runs in Rust without a Python callback)
 indices = table.filter_expr("score >= 90 AND name != 'Test'")
@@ -277,14 +298,14 @@ table.append_row({"region": "South", "amount": 1500})
 table.tick()  # All registered views are now updated
 
 # Check how many views are registered
-count = table.registered_view_count()  # Returns 3
+count = table.registered_view_count()  # 3 if only the three views above are registered
 
 # View composition - chain views on filtered results (views over views)
 big = table.filter(lambda row: row["amount"] >= 100)
 ranked = big.sort("amount", descending=True)     # SortedView over the filter
-by_region = big.group_by("region", agg=[("total", "amount", "sum")])
+by_region = ranked.group_by("region", agg=[("total", "amount", "sum")])
 table.append_row({"region": "South", "amount": 900})
-table.tick()  # Propagates root -> filter -> sorted/grouped in one call
+table.tick()  # Propagates root -> filter -> sort -> aggregate in one call
 
 # Serialization - export
 csv_string = table.to_csv()

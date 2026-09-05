@@ -20,8 +20,9 @@ use super::{AggregateView, FilterView, JoinView, SortedView};
 /// Per-view "syncer" closure stored in the registry.
 ///
 /// When invoked: upgrades the captured `Weak<RefCell<View>>`, calls
-/// `view.sync()`, and returns the cursor (absolute change index) the view
-/// has now consumed from the parent table's changeset. Returns `None` if
+/// `view.sync()`, and returns the consumed root-table cursor (absolute change
+/// index), or `usize::MAX` when the view consumes a derived stream. This is not
+/// the view's immediate-parent cursor in that case. Returns `None` if
 /// the view has been dropped, letting `TickableTable::tick` prune dead
 /// entries in one pass.
 type SyncerFn = Box<dyn FnMut() -> Option<usize>>;
@@ -51,7 +52,7 @@ impl TickableTable {
     }
 
     /// Borrow the underlying table handle — useful for mutations or for
-    /// constructing views (which take `Rc<RefCell<Table>>` as parent).
+    /// constructing views (the handle coerces to `Rc<RefCell<dyn ReadableTable>>`).
     pub fn table(&self) -> &Rc<RefCell<Table>> {
         &self.table
     }

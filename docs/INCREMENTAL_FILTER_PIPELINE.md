@@ -60,8 +60,10 @@ extension. Other output-view types retain version-checked rebuilds for their
 children. View versions still include ancestors for
 staleness and iterator checks, independently of emitted changes.
 
-The WebSocket server continues to serialize full view snapshots. These
-measurements cover the Rust mutation + tick path, not Python callback time,
+The WebSocket server continues to serialize full view snapshots, including
+after excluded edits that advance inherited node versions. No filter events
+does not mean no wire traffic. See the [protocol reference](WEBSOCKET_PROTOCOL.md).
+These measurements cover the Rust mutation + tick path, not Python callback time,
 snapshot serialization, network delivery, or browser rendering.
 
 ## Reproducible benchmark

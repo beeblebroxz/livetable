@@ -24,6 +24,7 @@ joins, sorting, grouping, and `tick()` propagation.
 To explore interactively:
 
 ```bash
+# From the repository root (or run ./run.sh if already in examples/)
 cd examples
 ./run.sh
 ```
@@ -42,13 +43,18 @@ npm run dev
 ```
 
 The default server endpoint is `ws://127.0.0.1:8080/ws`. The Forward Prop Demo
-uses real server-owned filter, sort, and group views.
+uses real server-owned filter, sort, and group views. Small batches now propagate
+incrementally through that chain in Rust and Python, including
+`ranked.group_by(...)`. The pipeline wire protocol still sends full snapshots;
+delta delivery is a planned next milestone.
 
 ## Choose the right guide
 
 - [Getting Started](GETTING_STARTED.md): Python walkthrough and core concepts
 - [Python API reference](PYTHON_BINDINGS_README.md): complete binding surface
 - [Rust API guide](API_GUIDE.md): native Rust usage
+- [Filter propagation](INCREMENTAL_FILTER_PIPELINE.md): shared Rust/Python replay
+- [Sorted pipelines](INCREMENTAL_SORTED_PIPELINE.md): latest contract, limits, and benchmarks
 - [Join operations](JOIN_FEATURE.md): join types and incremental behavior
 - [WebSocket protocol v2](WEBSOCKET_PROTOCOL.md): base and pipeline messages
 - [Original design vision](ORIGINAL_VISION.md): architecture goals and status

@@ -121,20 +121,34 @@ SUM, COUNT, AVG, MIN, MAX, MEDIAN, and percentile operations.
 
 ## Propagate changes
 
-Stateful views are snapshots with incremental sync metadata. Simplified table
-methods register them for `tick()`:
+Stateful views cache indices, sort keys, or aggregate state; they are not
+detached snapshots. Filter/sort/join reads still reach into their live parents,
+so reading before synchronization can mix stale indices with new source values.
+Simplified methods register stateful views for `tick()`:
 
 ```python
 large_orders = orders.filter(lambda row: row["amount"] >= 500)
 ranked_orders = large_orders.sort("amount", descending=True)
+totals = ranked_orders.group_by("user_id", agg=[("total", "amount", "sum")])
 
 orders.append_row({"order_id": 10, "user_id": 1, "amount": 900.0})
 orders.tick()
+assert totals[0]["total"] == 900.0
 ```
 
-Views may parent other views. Registering happens in creation order, so a
-root-to-leaf chain updates in one tick. Explicit view constructors expose
-`sync()` or `refresh()` where appropriate.
+Python supports `FilterView.sort()`, `FilterView.group_by()`, and
+`SortedView.group_by()`; arbitrary view composition is available in Rust.
+Registering happens in creation order, so this chain updates parent-first.
+Filters and sorts replay up to 256 input events, retaining one batch of output.
+Missing history, oversized batches, and explicit refresh use rebuild fallbacks.
+Row movement can still cost O(N); see the [full contract](INCREMENTAL_SORTED_PIPELINE.md).
+
+Explicit constructors normally require manual `sync()`/`refresh()`. Calling
+`group_by()` on an explicit sort also registers that sort before the new child.
+An explicitly constructed filter still needs manual synchronization even when
+its child is registered; prefer `table.filter()` for fully automatic chains.
+After a refresh without a root mutation, manually sync descendants because
+`tick()` returns immediately when the root has no pending mutations.
 
 ## Import, export, and pandas
 
@@ -154,6 +168,7 @@ Pandas is optional and imported only when those methods are called.
 ## Next steps
 
 ```bash
+# From the repository root
 cd examples
 python3 quickstart.py
 python3 demo_reactive_propagation.py --tick
@@ -161,6 +176,7 @@ python3 playground.py
 ```
 
 - [Python API reference](PYTHON_BINDINGS_README.md)
+- [Incremental filter → sort → group](INCREMENTAL_SORTED_PIPELINE.md)
 - [Join details](JOIN_FEATURE.md)
 - [WebSocket/React demo](WEBSOCKET_PROTOCOL.md)
 - [Testing](../tests/README.md)

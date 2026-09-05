@@ -50,6 +50,20 @@ python3 benchmark_vs_pandas.py
 This comparison includes Python binding overhead and is the relevant benchmark
 for Python callers. It is not equivalent to the Rust Criterion microbenchmarks.
 
+### Incremental pipeline updates
+
+From the repository root:
+
+```bash
+cargo run --manifest-path impl/Cargo.toml --release --example filter_pipeline_benchmark -- 10000 100000
+cargo run --manifest-path impl/Cargo.toml --release --example sorted_pipeline_benchmark -- 10000 100000
+```
+
+These harnesses measure Rust mutation batches plus `tick()`, excluding initial
+construction, Python callbacks, serialization, WebSocket delivery, and rendering.
+The linked reports above preserve their before/after commits and measured
+environments; rerunning on a different revision creates a new measurement.
+
 ### Filter comparison
 
 `benchmarks/filter_vs_pandas.py` compares:
@@ -80,10 +94,18 @@ operation.
 | Filter full rebuild | O(N) |
 | Sort full rebuild | O(N log N) |
 | Group full rebuild | O(N) plus percentile bookkeeping |
-| Single-change view sync | Depends on view; avoids a full rebuild when supported |
+| Bounded-batch view sync | Depends on view and event types; incremental when history/bounds permit |
 
 `R` is join output size. Many-to-many joins may produce an output much larger
 than either input.
+
+Filters/sorts replay at most 256 input events; sorting can emit up to 512 events
+because a move is a delete/insert pair. Non-sort scalar updates can avoid source
+scans, but structural updates still shift indices and can cost O(BN) for B events.
+Aggregate structural remapping uses O(N+B) temporary index storage for bounded
+batches. Sorts retain O(NK+N) indices and cached values for K sort keys, plus
+bounded full-row event payloads. Shared source ownership is not zero memory
+overhead, and faster source insertion does not remove downstream index costs.
 
 ## Storage selection
 

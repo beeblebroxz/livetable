@@ -4,6 +4,12 @@ Python APIs for the Rust-powered table implementation.
 
 This package exposes LiveTable tables and views through a Pythonic PyO3 API.
 
+Reference snippets are independent: unless they define a schema, they assume
+tables with the named columns and matching types. They are not one continuous
+script. For a runnable introduction, use [Getting Started](GETTING_STARTED.md)
+or the standalone composition example below. Constructor signature blocks are
+API notation, not executable Python.
+
 ## Status
 
 The documented API is implemented and tested. The package is version `0.1.0`
@@ -105,7 +111,7 @@ Create filtered views using Python lambda functions:
 
 ```python
 # Filter with lambda
-adults = table.filter(lambda row: row.get("age") and row["age"] >= 18)
+adults = table.filter(lambda row: row["age"] is not None and row["age"] >= 18)
 
 print(f"Found {len(adults)} adults")
 
@@ -397,16 +403,28 @@ print(len(filtered))  # Now 2 (includes new high-value sale)
 print(sorted_view[0]["amount"])  # 1500 (new top seller)
 ```
 
-**Note:** Views created with explicit constructors (e.g., `FilterView(table, predicate)`) are NOT auto-registered. Use the simplified API methods on the table for automatic registration.
+Explicit constructors normally require manual `sync()`/`refresh()`. Exception:
+calling `SortedView.group_by()` registers the sort (once) before its child, even
+when that sort was constructed explicitly. `FilterView.sort()`/`group_by()`
+register their children but do not register an explicitly constructed filter:
+synchronize that filter yourself before ticking, or start with `table.filter()`.
+Projection/computed views read through to their parents and need no registration.
 
 ### ✅ View Composition (Views over Views)
 
 Views can derive from other views, forming a DAG over root tables. A
 `FilterView` exposes `sort()` and `group_by()` that chain on the filtered rows;
-`SortedView` also exposes `group_by()`. Chained views are auto-registered on the root table, so one `tick()`
-propagates the whole chain (parents sync before children):
+`SortedView` also exposes `group_by()`. Starting with `table.filter()` registers
+the complete chain on the root, so one `tick()` propagates it in parent-before-child
+order. This example is standalone:
 
 ```python
+import livetable
+
+schema = livetable.Schema([
+    ("region", livetable.ColumnType.STRING, False),
+    ("amount", livetable.ColumnType.FLOAT64, False),
+])
 table = livetable.Table("sales", schema)
 table.append_rows([
     {"region": "N", "amount": 50.0},
@@ -434,14 +452,17 @@ the `ReadableTable` trait and can parent any other view (e.g., a `JoinView`
 whose left side is a `FilterView`). Tables and synchronized filters/sorts expose
 changesets. Both `filtered.group_by(...)` and `ranked.group_by(...)` update their
 aggregates without rescanning all filtered rows for a scalar SUM/COUNT/AVG
-update. Changes that stay outside the filter produce no downstream work.
+update that does not move a sorted row or change group membership. Changes that
+stay outside the filter emit no downstream events; this does not suppress
+WebSocket snapshots, which are triggered by inherited versions. Python exposes
+only the chaining methods listed above, not arbitrary Rust DAG construction.
 
 Filter/sort history retains one successful non-empty input batch. Consumers that
 miss that window rebuild; explicit `refresh()` also invalidates their
 baseline. When manually synchronizing, sync parents before children. After an
 explicit refresh without a root mutation, call the child's `sync()` directly.
-Sorts replay up to 256 pending input events using cached sort-key columns and
-index mappings, not full rows. A changed sort key may move a row; ordinary
+Filters and sorts replay up to 256 pending input events. Sorts use cached
+sort-key columns and index mappings, not full rows. A changed sort key may move a row; ordinary
 non-sort edits forward without reordering or scanning the source. Moves emit
 delete/insert pairs internally and can still require linear-time bookkeeping.
 Other view types expose no output history and their children rebuild when
@@ -541,7 +562,7 @@ print(row["created_at"])   # datetime(2024, 1, 15, 10, 30)
 # Dates before Unix epoch (1970-01-01) are supported
 table.append_row({
     "id": 3,
-    "birth_date": date(1955, 3, 14),  # Einstein's death
+    "birth_date": date(1955, 3, 14),
     "created_at": datetime(1969, 7, 20, 20, 17, 0),  # Moon landing
 })
 
@@ -564,7 +585,8 @@ print(row["date"])  # date(2023, 6, 15)
 
 ### ✅ Iterator Protocol
 
-All tables and views support Python's iterator protocol, enabling `for row in table:` syntax:
+All tables and views support Python's iterator protocol, enabling `for row in table:`
+syntax. This snippet assumes a `name`/`score` table with non-null scores:
 
 ```python
 # Iterate over a table
@@ -597,6 +619,13 @@ for i, row in enumerate(table):
 - `SortedView`
 - `AggregateView`
 
+Iterators are fail-fast on root mutations. Table/filter/projection/computed
+iterators capture the root table version; join/sort/aggregate iterators capture
+their view version including ancestors, so a rebuilding `refresh()` or a `sync()`
+that advances that version also invalidates them. A filter-only refresh without
+a root mutation is not detected by its iterator. Finish iteration before
+mutating or synchronizing views; a no-op sync does not invalidate an iterator.
+
 ### ✅ Bulk Operations
 
 Insert multiple rows efficiently with a single call:
@@ -610,13 +639,12 @@ rows = [
 ]
 count = table.append_rows(rows)  # Returns number of rows inserted
 
-# Much more efficient than calling append_row() in a loop
-# Especially for large datasets (1000+ rows)
+# One Python-to-Rust call instead of one call per row.
+# Measure speedups with your schema and batch size.
 ```
 
 **Benefits:**
 - Reduces Python-Rust boundary crossings from N to 1
-- Better memory allocation patterns
 - Validates all rows before inserting (atomic operation)
 
 ### ✅ Pandas DataFrame Interop
@@ -671,7 +699,7 @@ table_copy = livetable.Table.from_pandas("copy", df_copy)
 
 ### Schema
 
-```python
+```text
 Schema(columns: list[tuple[str, ColumnType, bool]])
 ```
 
@@ -688,7 +716,7 @@ Create a table schema.
 
 ### Table
 
-```python
+```text
 Table(name: str, schema: Schema, storage: str = None, use_string_interning: bool = False)
 ```
 
@@ -745,7 +773,7 @@ Create a new table.
 
 ### FilterView
 
-```python
+```text
 FilterView(table: Table, predicate: callable)
 ```
 
@@ -756,13 +784,19 @@ Filtered view of a table.
 - `get_row(index: int) -> dict` - Get row
 - `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get value
-- `refresh()` - Rebuild filter (if table changed)
+- `refresh()` - Unconditionally rebuild the filter and invalidate output history
 - `sync() -> bool` - Incrementally apply parent changes when possible
 - `last_synced_generation() -> int` - Last consumed root changeset generation
+- `sort(by, descending=False) -> SortedView` - Sort the filtered rows
+- `group_by(by, agg) -> AggregateView` - Aggregate the filtered rows
+
+Chaining arguments match the corresponding `Table` methods. For automatic
+parent-before-child propagation, create the filter through `table.filter()`;
+an explicit `FilterView(...)` remains manual-sync even when it has children.
 
 ### ProjectionView
 
-```python
+```text
 ProjectionView(table: Table, columns: list[str])
 ```
 
@@ -777,7 +811,7 @@ View with selected columns only.
 
 ### ComputedView
 
-```python
+```text
 ComputedView(table: Table, computed_column_name: str, compute_fn: callable)
 ```
 
@@ -792,7 +826,7 @@ View with an additional computed column.
 
 ### JoinView
 
-```python
+```text
 JoinView(
     name: str,
     left_table: Table,
@@ -885,7 +919,7 @@ Enum for aggregation types:
 
 ### AggregateView
 
-```python
+```text
 AggregateView(
     name: str,
     table: Table,
@@ -976,7 +1010,8 @@ env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin build --release
 
 ### Type Errors
 
-Make sure you're using the correct types:
+Make sure you're using the correct types. This fragment assumes a schema with
+only `id: INT32` and `score: FLOAT64`:
 
 ```python
 # ✓ Correct
@@ -988,7 +1023,8 @@ table.append_row({"id": "1", "score": 95.5})
 
 ### NULL Values
 
-Use Python `None` for NULL values in nullable columns:
+Use Python `None` for NULL values in nullable columns. This fragment assumes a
+schema with only non-nullable `id: INT32` and nullable `age: INT32`:
 
 ```python
 # ✓ Correct
@@ -1024,15 +1060,20 @@ amount = row["right_amount"]     # From right table (prefixed!)
 - [x] ~~Storage hints (fast_reads/fast_updates)~~ ✅ **DONE!**
 - [x] ~~Percentile/Median aggregations (P25, P50, P75, P90, P95, P99)~~ ✅ **DONE!**
 - [x] ~~RIGHT and FULL OUTER joins~~ ✅ **DONE!**
+- [x] Shared Rust/Python filter replay for bounded mixed batches
+- [x] Sorted-coordinate replay and `SortedView.group_by()` chaining
+- [x] Batched aggregate index remapping for sorted row moves
 
 Current project-level gaps include persistence, parallel view execution, SQL
-query planning, and a published API compatibility policy. The optional
-WebSocket server is documented separately in
+query planning, and a published API compatibility policy. Pipeline delta
+delivery is planned, not implemented. The optional WebSocket server is documented in
 [WEBSOCKET_PROTOCOL.md](WEBSOCKET_PROTOCOL.md).
 
 ## Contributing
 
-This is part of the livetable project. See the main README for contribution guidelines.
+See the [test guide](../tests/README.md) for local and CI checks, and keep this
+reference, the [README](../README.md), and relevant protocol/contract docs in
+sync with API changes.
 
 ## License
 
