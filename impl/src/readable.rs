@@ -5,13 +5,13 @@
 //! are held as `Rc<RefCell<dyn ReadableTable>>`; an `Rc<RefCell<Table>>`
 //! coerces implicitly at call sites.
 //!
-//! Change propagation has two tiers:
-//! - Root tables expose their `Changeset` via [`ReadableTable::changeset`],
-//!   so direct children sync incrementally (the existing fast paths).
-//! - Views return `None` from `changeset()`; children of views detect
-//!   staleness via [`ReadableTable::version`] and refresh with a full
-//!   rebuild. A view's version includes its parent's version, so staleness
-//!   propagates live through arbitrarily deep chains.
+//! Root tables and synchronized filters expose changesets in their own row
+//! coordinates. Filters retain one bounded batch; a rebuild invalidates the
+//! previous history. Consumers refresh if their cursor is outside the retained
+//! window. Other view types expose no output history and their children use
+//! version-checked rebuilds. Version still includes ancestors for stale-read
+//! and iterator guards; an unchanged output stream can skip downstream sync
+//! work even when an ancestor's version advanced.
 //!
 //! Sync ordering: a child reflects its parent *as currently visible*. To
 //! bring a whole chain up to date, sync parents before children — which is
@@ -62,10 +62,17 @@ pub trait ReadableTable {
     /// every descendant register as stale.
     fn version(&self) -> u64;
 
-    /// Root tables expose their changeset for incremental child sync.
-    /// Views return None; children fall back to version-checked refresh.
+    /// Incremental history in this table/view's own row coordinates. None
+    /// means unavailable (including a filter that has not synced its parent).
+    /// Consumers must refresh when history does not cover their cursor.
     fn changeset(&self) -> Option<&Changeset> {
         None
+    }
+
+    /// Translate a consumer cursor for root-table compaction. A derived view's
+    /// sequence is independent of the root's, so it must never constrain it.
+    fn root_changeset_cursor(&self, _cursor: usize) -> usize {
+        usize::MAX
     }
 }
 
@@ -108,5 +115,9 @@ impl ReadableTable for Table {
 
     fn changeset(&self) -> Option<&Changeset> {
         Some(Table::changeset(self))
+    }
+
+    fn root_changeset_cursor(&self, cursor: usize) -> usize {
+        cursor
     }
 }

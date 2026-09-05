@@ -2,6 +2,7 @@
 
 use crate::changeset::{IncrementalView, TableChange};
 use crate::column::{ColumnType, ColumnValue};
+use crate::filter_changes::{row_after_update, MAX_FILTER_REPLAY_CHANGES};
 use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -38,11 +39,10 @@ pub struct AggregateView {
     row_to_group: HashMap<usize, GroupKey>,
     /// Whether row_to_group is populated (deferred for fast initial build)
     row_to_group_built: bool,
-    /// Last synced generation from parent's changeset (root-table parents)
+    /// Last synced generation from the parent's changeset.
     last_synced_generation: u64,
-    /// Number of changes already processed. `usize::MAX` when the parent is
-    /// a view (no changeset) — a "not cursor-tracked" sentinel that keeps
-    /// tick()'s min-cursor compaction folds correct.
+    /// Consumed cursor in the parent's stream, or usize::MAX without a coherent
+    /// baseline. root_changeset_cursor() translates for root compaction.
     last_processed_change_count: usize,
     /// Own sync counter; the visible version() adds the parent's version.
     sync_count: u64,
@@ -163,14 +163,15 @@ impl AggregateView {
             let source_col_name_ref = single_source_col_name.as_ref();
 
             // Build using integer keys directly
-            let mut int_groups: HashMap<i32, GroupState> = HashMap::new();
-            let mut int_group_order: Vec<i32> = Vec::new();
+            let mut int_groups: HashMap<Option<i32>, GroupState> = HashMap::new();
+            let mut int_group_order: Vec<Option<i32>> = Vec::new();
 
             for row_idx in 0..num_rows {
                 // Get group key value directly as int
                 let group_val = match parent.get_value_by_index(row_idx, group_col_idx) {
-                    Ok(ColumnValue::Int32(v)) => v,
-                    _ => continue, // Skip null/invalid
+                    Ok(ColumnValue::Int32(v)) => Some(v),
+                    Ok(ColumnValue::Null) => None,
+                    _ => continue,
                 };
 
                 // Get or create group state directly with int key
@@ -381,7 +382,9 @@ impl AggregateView {
 
             // Defer MIN/MAX recalc until all batch index shifts are applied.
             for source_col in cols_needing_recalc {
-                pending_recalc.insert((key.clone(), source_col));
+                if self.needs_min_max(&source_col) {
+                    pending_recalc.insert((key.clone(), source_col));
+                }
             }
 
             true
@@ -421,6 +424,12 @@ impl AggregateView {
         }
     }
 
+    fn needs_min_max(&self, column: &str) -> bool {
+        self.aggregations.iter().any(|(_, source, function)| {
+            source == column && matches!(function, AggregateFunction::Min | AggregateFunction::Max)
+        })
+    }
+
     /// Extract numeric value from ColumnValue, converting to f64
     fn extract_numeric(value: &ColumnValue) -> Option<f64> {
         match value {
@@ -444,6 +453,10 @@ impl AggregateView {
 
     pub fn last_processed_change_count(&self) -> usize {
         self.last_processed_change_count
+    }
+
+    pub(crate) fn root_changeset_cursor(&self) -> usize {
+        self.parent.borrow().root_changeset_cursor(self.last_processed_change_count)
     }
 
     pub fn len(&self) -> usize {
@@ -546,23 +559,6 @@ impl AggregateView {
         let parent_version = parent.version();
         drop(parent);
 
-        // A CellUpdated on a group-by column is applied by reading the LIVE
-        // parent (reconstruct_old_row / add_row_to_aggregates). That is only
-        // valid when the parent reflects exactly the post-change state — i.e. a
-        // single change. In a multi-change batch the parent has already moved
-        // past the intermediate change, so its rows/indices no longer match and
-        // the read grabs the wrong values. Fall back to a full rebuild, which
-        // reads the final parent and is always correct. (Caught by the
-        // forward_prop_fuzz batched differential test.)
-        let has_group_key_update = new_changes.iter().any(|change| {
-            matches!(change, TableChange::CellUpdated { column, .. }
-                if self.group_by_columns.contains(column))
-        });
-        if new_changes.len() > 1 && has_group_key_update {
-            self.rebuild_index();
-            return true;
-        }
-
         // Ensure row_to_group is built before processing changes
         self.ensure_row_to_group_built();
 
@@ -577,6 +573,27 @@ impl AggregateView {
 
 impl IncrementalView for AggregateView {
     fn apply_changes(&mut self, changes: &[TableChange]) -> bool {
+        // Recover group-key updates in their original layout before replay.
+        // Other updates need only the old/new scalar values in the changeset.
+        let mut updated_rows = HashMap::new();
+        for (index, change) in changes.iter().enumerate() {
+            if matches!(change, TableChange::CellUpdated { column, .. }
+                if self.group_by_columns.contains(column))
+            {
+                if changes.len() > MAX_FILTER_REPLAY_CHANGES {
+                    self.rebuild_index();
+                    return true;
+                }
+                let row = row_after_update(changes, index, |i| self.parent.borrow().get_row(i));
+                match row {
+                    Ok(row) => { updated_rows.insert(index, row); }
+                    Err(_) => {
+                        self.rebuild_index();
+                        return true;
+                    }
+                }
+            }
+        }
         let mut modified = false;
         // MIN/MAX (and sorted_values) recalcs are DEFERRED to the end of the
         // batch. `recalculate_group_column_min_max` reads the parent at the
@@ -586,7 +603,7 @@ impl IncrementalView for AggregateView {
         // by the forward_prop_fuzz differential test.)
         let mut pending_recalc: HashSet<(GroupKey, String)> = HashSet::new();
 
-        for change in changes {
+        for (change_index, change) in changes.iter().enumerate() {
             match change {
                 TableChange::RowInserted { index, data } => {
                     // Adjust existing row indices
@@ -612,15 +629,11 @@ impl IncrementalView for AggregateView {
                 } => {
                     // Check if group-by column changed
                     if self.group_by_columns.contains(column) {
-                        // Need to move row to a different group
-                        if let Ok(old_row) = self.reconstruct_old_row(*row, column, old_value) {
-                            self.remove_row_from_aggregates(*row, &old_row, &mut pending_recalc);
-                        }
-                        // Get new row separately to avoid borrow conflicts
-                        let new_row = self.parent.borrow().get_row(*row).ok();
-                        if let Some(new_row) = new_row {
-                            self.add_row_to_aggregates(*row, &new_row);
-                        }
+                        let new_row = &updated_rows[&change_index];
+                        let mut old_row = new_row.clone();
+                        old_row.insert(column.clone(), old_value.clone());
+                        self.remove_row_from_aggregates(*row, &old_row, &mut pending_recalc);
+                        self.add_row_to_aggregates(*row, new_row);
                         modified = true;
                     } else {
                         // Check if aggregated column changed
@@ -639,7 +652,7 @@ impl IncrementalView for AggregateView {
                                 }
 
                                 // Defer MIN/MAX recalc to end of batch (see above)
-                                if needs_recalc {
+                                if needs_recalc && self.needs_min_max(column) {
                                     pending_recalc.insert((key.clone(), column.clone()));
                                 }
 
@@ -732,18 +745,6 @@ impl AggregateView {
         }
     }
 
-    /// Reconstruct what a row looked like before a cell update
-    fn reconstruct_old_row(
-        &self,
-        row_idx: usize,
-        changed_col: &str,
-        old_value: &ColumnValue,
-    ) -> Result<HashMap<String, ColumnValue>, String> {
-        let parent = self.parent.borrow();
-        let mut row = parent.get_row(row_idx)?;
-        row.insert(changed_col.to_string(), old_value.clone());
-        Ok(row)
-    }
 }
 
 impl ReadableTable for AggregateView {

@@ -84,8 +84,8 @@ pub struct JoinView {
     left_column_names: Vec<String>,
     right_column_names: Vec<String>,
     /// Number of changes already processed from left table (absolute index).
-    /// `usize::MAX` when that parent is a view (no changeset) — a "not
-    /// cursor-tracked" sentinel, neutral in tick()'s min-cursor folds.
+    /// usize::MAX without a coherent baseline. root_changeset_cursors()
+    /// translates both parent cursors for root compaction.
     left_last_processed_change_count: usize,
     /// Number of changes already processed from right table (absolute index)
     right_last_processed_change_count: usize,
@@ -324,7 +324,7 @@ impl JoinView {
             }
         }
 
-        // Update cursor trackers (one per parent); MAX = view parent, no cursor
+        // Update cursor trackers (one per parent); MAX = no coherent history.
         self.left_last_processed_change_count =
             left.changeset().map_or(usize::MAX, |cs| cs.total_len());
         self.right_last_processed_change_count =
@@ -525,6 +525,13 @@ impl JoinView {
         (
             self.left_last_processed_change_count,
             self.right_last_processed_change_count,
+        )
+    }
+
+    pub(crate) fn root_changeset_cursors(&self) -> (usize, usize) {
+        (
+            self.left_table.borrow().root_changeset_cursor(self.left_last_processed_change_count),
+            self.right_table.borrow().root_changeset_cursor(self.right_last_processed_change_count),
         )
     }
 

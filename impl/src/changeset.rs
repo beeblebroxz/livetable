@@ -101,13 +101,17 @@ impl Changeset {
     }
 
     /// Returns a slice of changes since the given absolute index.
-    /// Returns None if the requested index has been compacted away.
+    /// Returns None if the requested index has been compacted/invalidated or
+    /// lies beyond this stream's end (including an uninitialized consumer).
     pub fn changes_from(&self, index: usize) -> Option<&[TableChange]> {
         if index < self.base_index {
             return None;
         }
         let total = self.total_len();
-        if index >= total {
+        if index > total {
+            return None;
+        }
+        if index == total {
             return Some(&[]);
         }
         let offset = index - self.base_index;
@@ -134,6 +138,14 @@ impl Changeset {
         self.base_index += self.changes.len();
         self.changes.clear();
         self.generation += 1;
+    }
+
+    /// Discard history after a view rebuild whose delta is unavailable. Reserve
+    /// a sequence position so even a consumer at the old end must refresh.
+    /// Root tables continue to use clear/compact, which preserve continuity.
+    pub(crate) fn invalidate(&mut self) {
+        self.clear();
+        self.base_index += 1;
     }
 
     /// Returns true if there are no pending changes

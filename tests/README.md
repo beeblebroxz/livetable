@@ -68,6 +68,9 @@ env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib --features server
 # Randomized forward-propagation tests
 cargo test --test forward_prop_fuzz
 
+# Filter pipeline correctness, bounded work, history, and compaction contracts
+cargo test --features server --test filter_pipeline
+
 # Real TCP/WebSocket protocol-v2 integration test
 cargo test --features server --test protocol_v2_websocket
 ```

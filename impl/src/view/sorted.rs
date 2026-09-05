@@ -127,11 +127,11 @@ pub struct SortedView {
     sort_keys: Vec<SortKey>,
     /// Sorted index: sorted_index[view_pos] = parent_row_index
     sorted_index: Vec<usize>,
-    /// Last synced generation from parent's changeset (root-table parents)
+    /// Last synced generation from the parent's changeset.
     last_synced_generation: u64,
     /// Number of changes already processed (absolute index). `usize::MAX`
-    /// when the parent is a view (no changeset) — a "not cursor-tracked"
-    /// sentinel that keeps tick()'s min-cursor compaction folds correct.
+    /// when the parent has no coherent changeset baseline. Root compaction
+    /// uses root_changeset_cursor(), not this potentially derived cursor.
     last_processed_change_count: usize,
     /// Own sync counter; the visible version() adds the parent's version.
     sync_count: u64,
@@ -462,6 +462,10 @@ impl SortedView {
 
     pub fn last_processed_change_count(&self) -> usize {
         self.last_processed_change_count
+    }
+
+    pub(crate) fn root_changeset_cursor(&self) -> usize {
+        self.parent.borrow().root_changeset_cursor(self.last_processed_change_count)
     }
 }
 

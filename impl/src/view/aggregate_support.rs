@@ -273,8 +273,8 @@ impl GroupKey {
     }
 
     #[inline]
-    pub(super) fn from_single_int(value: i32) -> Self {
-        GroupKey(vec![Some(JoinKeyPart::Int32(value))])
+    pub(super) fn from_single_int(value: Option<i32>) -> Self {
+        GroupKey(vec![value.map(JoinKeyPart::Int32)])
     }
 
     pub(super) fn to_column_values(&self, group_by: &[String]) -> HashMap<String, ColumnValue> {

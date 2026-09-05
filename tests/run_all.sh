@@ -48,7 +48,8 @@ echo ""
 echo "📦 Running Rust Unit Tests..."
 echo "--------------------------------------"
 cd ../impl
-if env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib --features server 2>&1 | tee /tmp/rust_tests.log | grep -q "test result: ok"; then
+if env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --lib --features server 2>&1 | tee /tmp/rust_tests.log | grep -q "test result: ok" \
+    && cargo test --features server --test filter_pipeline; then
     RUST_PASSED=1
     RUST_COUNT=$(grep "passed" /tmp/rust_tests.log | grep -o "[0-9]* passed" | head -1 | awk '{print $1}')
     echo ""

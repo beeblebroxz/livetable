@@ -1,10 +1,8 @@
 //! FilterView — predicate-filtered view over a parent table.
 
-use crate::changeset::{
-    apply_filter_cell_updated, apply_filter_row_deleted, apply_filter_row_inserted,
-    IncrementalView, TableChange,
-};
+use crate::changeset::{Changeset, IncrementalView, TableChange};
 use crate::column::{ColumnType, ColumnValue};
+use crate::filter_changes::{apply_filter_changes, prepare_filter_changes, MAX_FILTER_REPLAY_CHANGES};
 use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -15,19 +13,20 @@ use super::RowPredicate;
 /// A FilterView filters rows from the parent table based on a predicate.
 /// Maintains a mapping from view indices to parent indices.
 ///
-/// Supports incremental updates: when the parent is a root table, the view
-/// consumes its changeset without a full rebuild. When the parent is itself
-/// a view (no changeset), sync falls back to a version-checked rebuild.
+/// Replays bounded batches from a table or filter parent and emits a changeset
+/// in its own row coordinates. Missing history or large batches trigger a
+/// rebuild, which invalidates the output history for downstream consumers.
 pub struct FilterView {
     name: String,
     parent: Rc<RefCell<dyn ReadableTable>>,
     predicate: Box<RowPredicate>,
     view_to_parent: Vec<usize>,
-    /// Last synced generation from parent's changeset (root-table parents)
+    output_changes: Changeset,
+    /// Last synced generation from the parent's changeset.
     last_synced_generation: u64,
     /// Number of changes already processed (absolute index). `usize::MAX`
-    /// when the parent is a view (no changeset) — a "not cursor-tracked"
-    /// sentinel that keeps tick()'s min-cursor compaction folds correct.
+    /// when the parent has no coherent changeset baseline. Root compaction
+    /// uses root_changeset_cursor(), not this potentially derived cursor.
     last_processed_change_count: usize,
     /// Own sync counter; the visible version() adds the parent's version.
     sync_count: u64,
@@ -53,6 +52,7 @@ impl FilterView {
             parent,
             predicate: Box::new(predicate),
             view_to_parent: Vec::new(),
+            output_changes: Changeset::new(),
             last_synced_generation: generation,
             last_processed_change_count: change_count,
             sync_count: 0,
@@ -83,6 +83,7 @@ impl FilterView {
         }
         self.last_parent_version = parent.version();
         drop(parent);
+        self.output_changes.invalidate();
         self.sync_count += 1;
     }
 
@@ -138,22 +139,18 @@ impl FilterView {
         };
 
         if changes.is_empty() {
+            self.last_parent_version = parent.version();
             return false;
         }
 
-        // Clone changes so we can drop the borrow
-        let changes: Vec<TableChange> = changes.to_vec();
-        drop(parent);
-
-        // The CellUpdated path re-evaluates the predicate by reading the LIVE
-        // parent for the changed row, valid only when the parent matches the
-        // post-change state — i.e. a single change. In a multi-change batch the
-        // parent has advanced past intermediate changes, so fall back to a full
-        // rebuild. (Caught by the forward_prop_fuzz batched differential test.)
-        if changes.len() > 1 {
+        if changes.len() > MAX_FILTER_REPLAY_CHANGES {
+            drop(parent);
             self.rebuild_index();
             return true;
         }
+
+        let changes: Vec<TableChange> = changes.to_vec();
+        drop(parent);
 
         let modified = self.apply_changes(&changes);
         let parent = self.parent.borrow();
@@ -174,42 +171,37 @@ impl FilterView {
     pub fn last_processed_change_count(&self) -> usize {
         self.last_processed_change_count
     }
+
+    pub(crate) fn root_changeset_cursor(&self) -> usize {
+        self.parent.borrow().root_changeset_cursor(self.last_processed_change_count)
+    }
 }
 
 impl IncrementalView for FilterView {
     fn apply_changes(&mut self, changes: &[TableChange]) -> bool {
-        let mut modified = false;
-
-        for change in changes {
-            match change {
-                TableChange::RowInserted { index, data } => {
-                    let matched = (self.predicate)(data);
-                    if apply_filter_row_inserted(&mut self.view_to_parent, *index, matched) {
-                        modified = true;
-                    }
-                }
-
-                TableChange::RowDeleted { index, .. } => {
-                    if apply_filter_row_deleted(&mut self.view_to_parent, *index) {
-                        modified = true;
-                    }
-                }
-
-                TableChange::CellUpdated { row, .. } => {
-                    let now_matches = self
-                        .parent
-                        .borrow()
-                        .get_row(*row)
-                        .map(|data| (self.predicate)(&data))
-                        .unwrap_or(false);
-                    if apply_filter_cell_updated(&mut self.view_to_parent, *row, now_matches) {
-                        modified = true;
-                    }
-                }
+        if changes.is_empty() {
+            return false;
+        }
+        if changes.len() > MAX_FILTER_REPLAY_CHANGES {
+            self.rebuild_index();
+            return true;
+        }
+        let parent = self.parent.borrow();
+        let prepared = prepare_filter_changes(
+            changes,
+            |index| parent.get_row(index),
+            |row| Ok((self.predicate)(row)),
+        );
+        drop(parent);
+        match prepared {
+            Ok(prepared) => apply_filter_changes(
+                &mut self.view_to_parent, &mut self.output_changes, prepared,
+            ),
+            Err(_) => {
+                self.rebuild_index();
+                true
             }
         }
-
-        modified
     }
 
     fn last_synced_generation(&self) -> u64 {
@@ -261,5 +253,12 @@ impl ReadableTable for FilterView {
 
     fn version(&self) -> u64 {
         self.sync_count.wrapping_add(self.parent.borrow().version())
+    }
+
+    fn changeset(&self) -> Option<&Changeset> {
+        // A child built while this filter is stale has no coherent delta
+        // baseline. It must refresh once we synchronize the parent.
+        (self.parent.borrow().version() == self.last_parent_version)
+            .then_some(&self.output_changes)
     }
 }

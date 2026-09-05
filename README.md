@@ -145,6 +145,13 @@ In Rust, any view can parent any other view — every view implements the
 `ReadableTable` trait (`FilterView`, `SortedView`, `AggregateView`, `JoinView`,
 `ProjectionView`, `ComputedView`, and `Table` itself).
 
+Filters publish changesets, allowing `table -> filter -> group_by` to update
+incrementally in both Rust and Python. Small batches evaluate only changed
+rows; an edit that stays outside the filter produces no downstream changes.
+Filters retain one batch of history and rebuild for batches over 256 changes
+or unavailable history. Other view types still use version-checked rebuilds
+for their children. See [the propagation contract and benchmarks](docs/INCREMENTAL_FILTER_PIPELINE.md).
+
 ### Filtering
 ```python
 # Lambda filter

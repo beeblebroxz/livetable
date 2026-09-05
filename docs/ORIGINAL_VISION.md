@@ -208,7 +208,8 @@ items below remain original future ideas.
 - [x] String interning with reference counting
 - [x] Changesets and incremental view propagation
 - [x] Automatic view propagation via `tick()` method
-- [x] View-over-view composition (DAG): all views implement the `ReadableTable` trait and can parent other views; children of root tables sync incrementally via changesets, children of views via version-checked refresh
+- [x] View-over-view composition (DAG): all views implement `ReadableTable`; tables and filters emit changesets so filter-to-aggregate chains update incrementally, while children of other views use version-checked refresh
+- [x] Shared Rust/Python filter replay for bounded mixed batches, with derived-coordinate changesets, bounded history, and rebuild invalidation
 - [x] CSV/JSON serialization with type inference
 - [x] Python bindings via PyO3
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)

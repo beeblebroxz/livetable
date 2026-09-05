@@ -191,6 +191,11 @@ required.
 
 ### View snapshots
 
+The engine can maintain `base -> filter -> group` incrementally. Internal
+filter changesets are separate from the wire protocol: `ViewData` still carries
+full snapshots, and `seq` retains its existing generation/node-scoped meaning.
+Sort nodes do not emit changesets, so groups below a sort still rebuild.
+
 The server immediately sends a snapshot for the synthetic `base` node and each
 successfully built node. It sends new full snapshots for nodes whose version
 changes after a base mutation:

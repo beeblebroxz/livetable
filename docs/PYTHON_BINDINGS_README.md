@@ -116,10 +116,11 @@ for i in range(len(adults)):
 
 `FilterView` maintains an index. After parent mutations, call `table.tick()`
 for views created through `table.filter()`, or call `adults.sync()` directly.
-One pending change is applied incrementally. If multiple changes accumulated
-since the filter last synced, it rebuilds its index from the current table.
-This keeps updates correct when inserts or deletes shift row indices within a
-batch, but evaluates the predicate for every current row.
+Up to 256 pending changes are replayed incrementally using historical row data,
+including batches where inserts/deletes shift indices. Larger batches or
+unavailable history rebuild the index. Predicates should be pure functions of
+their row; they may read the table but must not mutate it. Callback failures
+leave the previously published index and change history intact for retry.
 
 ### ✅ Expression-Based Filtering
 
@@ -430,9 +431,17 @@ as `table.group_by()`.
 
 At the Rust level composition is fully general: every view type implements
 the `ReadableTable` trait and can parent any other view (e.g., a `JoinView`
-whose left side is a `FilterView`). Children of root tables update
-incrementally from the changeset; children of views refresh via cheap
-version checks when their parent has changed.
+whose left side is a `FilterView`). Tables and synchronized filters expose
+changesets. In particular, `filtered.group_by(...)` incrementally updates its
+aggregates without rescanning all filtered rows for a scalar SUM/COUNT/AVG
+update. Changes that stay outside the filter produce no downstream work.
+
+Filter history retains one successful non-empty input batch. Consumers that
+miss that window rebuild; explicit `filtered.refresh()` also invalidates their
+baseline. When manually synchronizing, sync parents before children. After an
+explicit refresh without a root mutation, call the child's `sync()` directly.
+Other view types still expose no output history and their children rebuild
+when their parent version changes. See [the full contract](INCREMENTAL_FILTER_PIPELINE.md).
 
 ### ✅ Serialization (CSV/JSON)
 

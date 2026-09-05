@@ -1,6 +1,7 @@
 pub mod changeset;
 pub mod column;
 pub mod expr;
+mod filter_changes;
 pub mod interner;
 /// LiveTable - High-Performance Columnar Table System
 ///

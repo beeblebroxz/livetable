@@ -136,6 +136,8 @@ struct PyFilterViewInner {
     table_inner: Rc<RefCell<RustTable>>,
     predicate: PyObject,
     indices: Vec<usize>,
+    output_changes: crate::changeset::Changeset,
+    last_parent_version: u64,
     last_synced_generation: u64,
     last_processed_change_count: usize,
     /// Own sync counter; the visible ReadableTable::version() adds the
@@ -166,125 +168,92 @@ fn call_predicate_bool(
 }
 
 impl PyFilterViewInner {
-    /// Rebuild all indices by re-evaluating the predicate for all rows.
-    ///
-    /// The parent table borrow is released before calling the user's
-    /// predicate so read-only callbacks can safely access other rows.
-    /// Mutations from within the predicate are rejected with a clear error.
-    fn refresh(&mut self, py: Python) -> PyResult<()> {
-        self.indices.clear();
-
-        // Snapshot rows + metadata while the borrow is live, then drop it.
-        let (rows, generation, change_count) = {
-            let table_ref = self.table_inner.borrow();
-            let rows: Vec<_> = (0..table_ref.len())
-                .filter_map(|i| table_ref.get_row(i).ok())
-                .collect();
-            (
-                rows,
-                table_ref.changeset_generation(),
-                table_ref.changeset().total_len(),
-            )
-        };
-
-        for (i, row) in rows.iter().enumerate() {
-            let dict = PyDict::new_bound(py);
-            for (key, value) in row.iter() {
-                dict.set_item(key, column_value_to_py(py, value)?)?;
-            }
-            if call_predicate_bool(&self.predicate, py, dict)? {
-                self.indices.push(i);
-            }
+    fn evaluate(&self, py: Python, row: &HashMap<String, RustColumnValue>) -> PyResult<bool> {
+        let dict = PyDict::new_bound(py);
+        for (key, value) in row {
+            dict.set_item(key, column_value_to_py(py, value)?)?;
         }
+        call_predicate_bool(&self.predicate, py, dict)
+    }
 
+    /// Rebuild atomically: callback failures preserve the previous index and
+    /// output history, allowing callers to correct the predicate and retry.
+    fn refresh(&mut self, py: Python) -> PyResult<()> {
+        let (rows, generation, change_count, version) = {
+            let table = self.table_inner.borrow();
+            let rows = (0..table.len())
+                .map(|i| table.get_row(i))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PyValueError::new_err)?;
+            (rows, table.changeset_generation(), table.changeset().total_len(), table.version())
+        };
+        let mut indices = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            if self.evaluate(py, row)? {
+                indices.push(index);
+            }
+            self.check_parent_version(version)?;
+        }
+        self.check_parent_version(version)?;
+        self.indices = indices;
+        self.output_changes.invalidate();
         self.last_synced_generation = generation;
         self.last_processed_change_count = change_count;
+        self.last_parent_version = version;
         self.sync_count += 1;
         Ok(())
     }
 
-    fn sync(&mut self, py: Python) -> PyResult<bool> {
-        use crate::changeset::{
-            apply_filter_cell_updated, apply_filter_row_deleted, apply_filter_row_inserted,
-            TableChange,
-        };
+    fn check_parent_version(&self, expected: u64) -> PyResult<()> {
+        if self.table_inner.borrow().version() != expected {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Table mutated during filter predicate — predicates must not mutate the parent",
+            ));
+        }
+        Ok(())
+    }
 
-        let table_ref = self.table_inner.borrow();
-        let changes = match table_ref
-            .changeset()
-            .changes_from(self.last_processed_change_count)
-        {
+    fn sync(&mut self, py: Python) -> PyResult<bool> {
+        use crate::filter_changes::{
+            apply_filter_changes, prepare_filter_changes, MAX_FILTER_REPLAY_CHANGES,
+        };
+        let table = self.table_inner.borrow();
+        let changes = match table.changeset().changes_from(self.last_processed_change_count) {
             Some(changes) => changes,
             None => {
-                drop(table_ref);
+                drop(table);
                 self.refresh(py)?;
                 return Ok(true);
             }
         };
-
         if changes.is_empty() {
             return Ok(false);
         }
-
-        // Match native FilterView: CellUpdated reads the live parent, whose
-        // row indices may have shifted since an earlier change in this batch.
-        // Rebuild from the final table state instead of replaying stale indices.
-        if changes.len() > 1 {
-            drop(table_ref);
+        if changes.len() > MAX_FILTER_REPLAY_CHANGES {
+            drop(table);
             self.refresh(py)?;
             return Ok(true);
         }
+        let changes = changes.to_vec();
+        let generation = table.changeset_generation();
+        let change_count = table.changeset().total_len();
+        let version = table.version();
+        drop(table);
 
-        let changes: Vec<TableChange> = changes.to_vec();
-        drop(table_ref);
-
-        let mut modified = false;
-        for change in changes {
-            match change {
-                TableChange::RowInserted { index, data } => {
-                    // Evaluate the Python predicate first; bookkeeping (shift +
-                    // tail-insert fast path + sorted insert) is delegated to the
-                    // shared helper so the algorithm matches the native Rust
-                    // FilterView byte-for-byte.
-                    let dict = PyDict::new_bound(py);
-                    for (key, value) in data.iter() {
-                        dict.set_item(key, column_value_to_py(py, value)?)?;
-                    }
-                    let matched = call_predicate_bool(&self.predicate, py, dict)?;
-                    if apply_filter_row_inserted(&mut self.indices, index, matched) {
-                        modified = true;
-                    }
-                }
-
-                TableChange::RowDeleted { index, .. } => {
-                    if apply_filter_row_deleted(&mut self.indices, index) {
-                        modified = true;
-                    }
-                }
-
-                TableChange::CellUpdated { row, .. } => {
-                    // Snapshot the row and drop the borrow before any Python call.
-                    let row_data = self.table_inner.borrow().get_row(row).ok();
-                    let now_matches = if let Some(row_data) = row_data {
-                        let dict = PyDict::new_bound(py);
-                        for (key, value) in row_data.iter() {
-                            dict.set_item(key, column_value_to_py(py, value)?)?;
-                        }
-                        call_predicate_bool(&self.predicate, py, dict)?
-                    } else {
-                        false
-                    };
-                    if apply_filter_cell_updated(&mut self.indices, row, now_matches) {
-                        modified = true;
-                    }
-                }
-            }
-        }
-
-        let table_ref = self.table_inner.borrow();
-        self.last_processed_change_count = table_ref.changeset().total_len();
-        self.last_synced_generation = table_ref.changeset_generation();
-        drop(table_ref);
+        let prepared = prepare_filter_changes(
+            &changes,
+            |index| self.table_inner.borrow().get_row(index).map_err(PyValueError::new_err),
+            |row| {
+                let matched = self.evaluate(py, row)?;
+                self.check_parent_version(version)?;
+                Ok(matched)
+            },
+        )?;
+        self.check_parent_version(version)?;
+        let modified = apply_filter_changes(&mut self.indices, &mut self.output_changes, prepared);
+        self.last_processed_change_count = change_count;
+        self.last_synced_generation = generation;
+        self.last_parent_version = version;
         self.sync_count += 1;
         Ok(modified)
     }
@@ -294,6 +263,11 @@ impl PyFilterViewInner {
 /// Python-side filter. Reads never call the Python predicate (only sync
 /// does), so no GIL is needed here.
 impl crate::readable::ReadableTable for PyFilterViewInner {
+    fn changeset(&self) -> Option<&crate::changeset::Changeset> {
+        (self.table_inner.borrow().version() == self.last_parent_version)
+            .then_some(&self.output_changes)
+    }
+
     fn len(&self) -> usize {
         self.indices.len()
     }
@@ -1419,23 +1393,23 @@ impl PyTable {
                 }
                 ActiveRegisteredView::Sorted(inner) => {
                     inner.borrow_mut().sync();
-                    min_cursor = min_cursor.min(inner.borrow().last_processed_change_count());
+                    min_cursor = min_cursor.min(inner.borrow().root_changeset_cursor());
                     synced_count += 1;
                 }
                 ActiveRegisteredView::Aggregate(inner) => {
                     inner.borrow_mut().sync();
-                    min_cursor = min_cursor.min(inner.borrow().last_processed_change_count());
+                    min_cursor = min_cursor.min(inner.borrow().root_changeset_cursor());
                     synced_count += 1;
                 }
                 ActiveRegisteredView::JoinLeft(inner) => {
                     inner.borrow_mut().sync();
-                    let (left_cursor, _) = inner.borrow().last_processed_change_count();
+                    let (left_cursor, _) = inner.borrow().root_changeset_cursors();
                     min_cursor = min_cursor.min(left_cursor);
                     synced_count += 1;
                 }
                 ActiveRegisteredView::JoinRight(inner) => {
                     inner.borrow_mut().sync();
-                    let (_, right_cursor) = inner.borrow().last_processed_change_count();
+                    let (_, right_cursor) = inner.borrow().root_changeset_cursors();
                     min_cursor = min_cursor.min(right_cursor);
                     synced_count += 1;
                 }
@@ -1494,6 +1468,8 @@ impl PyFilterView {
             table_inner: Rc::clone(&table.inner),
             predicate,
             indices: Vec::new(),
+            output_changes: crate::changeset::Changeset::new(),
+            last_parent_version: 0,
             last_synced_generation: generation,
             last_processed_change_count: change_count,
             sync_count: 0,

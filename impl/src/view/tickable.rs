@@ -7,8 +7,9 @@
 //! for view-over-view chains: a
 //! chained view registered after its parent always syncs after it.
 //!
-//! Chained views (view parents, no changeset) report `usize::MAX` as their
-//! cursor — neutral in the min-cursor compaction fold below.
+//! A consumer of a derived stream reports usize::MAX for root compaction,
+//! independently of its cursor within the derived stream. Sequence numbers
+//! from different sources must never be compared in the min-cursor fold.
 
 use crate::table::Table;
 use std::cell::RefCell;
@@ -61,7 +62,7 @@ impl TickableTable {
         self.syncers.borrow_mut().push(Box::new(move || {
             let v = weak.upgrade()?;
             v.borrow_mut().sync();
-            let cursor = v.borrow().last_processed_change_count();
+            let cursor = v.borrow().root_changeset_cursor();
             Some(cursor)
         }));
     }
@@ -72,7 +73,7 @@ impl TickableTable {
         self.syncers.borrow_mut().push(Box::new(move || {
             let v = weak.upgrade()?;
             v.borrow_mut().sync();
-            let cursor = v.borrow().last_processed_change_count();
+            let cursor = v.borrow().root_changeset_cursor();
             Some(cursor)
         }));
     }
@@ -83,7 +84,7 @@ impl TickableTable {
         self.syncers.borrow_mut().push(Box::new(move || {
             let v = weak.upgrade()?;
             v.borrow_mut().sync();
-            let cursor = v.borrow().last_processed_change_count();
+            let cursor = v.borrow().root_changeset_cursor();
             Some(cursor)
         }));
     }
@@ -96,7 +97,7 @@ impl TickableTable {
         self.syncers.borrow_mut().push(Box::new(move || {
             let v = weak.upgrade()?;
             v.borrow_mut().sync();
-            let (left_cursor, _) = v.borrow().last_processed_change_count();
+            let (left_cursor, _) = v.borrow().root_changeset_cursors();
             let cursor = left_cursor;
             Some(cursor)
         }));
@@ -108,7 +109,7 @@ impl TickableTable {
         self.syncers.borrow_mut().push(Box::new(move || {
             let v = weak.upgrade()?;
             v.borrow_mut().sync();
-            let (_, right_cursor) = v.borrow().last_processed_change_count();
+            let (_, right_cursor) = v.borrow().root_changeset_cursors();
             let cursor = right_cursor;
             Some(cursor)
         }));

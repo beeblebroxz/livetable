@@ -236,6 +236,7 @@ struct Pipeline {
     filter: Rc<RefCell<FilterView>>,
     sorted_chain: Rc<RefCell<SortedView>>,
     agg_chain: Rc<RefCell<AggregateView>>,
+    agg_filtered: Rc<RefCell<AggregateView>>,
     sorted_direct: Rc<RefCell<SortedView>>,
     agg_direct: Rc<RefCell<AggregateView>>,
     tick: TickableTable,
@@ -243,6 +244,9 @@ struct Pipeline {
 
 fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
     let filter = Rc::new(RefCell::new(FilterView::new("f".to_string(), base.clone(), passes)));
+    let agg_filtered = Rc::new(RefCell::new(
+        AggregateView::new("gf".to_string(), filter.clone(), vec!["region".to_string()], aggs()).unwrap(),
+    ));
     let sorted_chain = Rc::new(RefCell::new(
         SortedView::new("sc".to_string(), filter.clone(), sort_keys()).unwrap(),
     ));
@@ -259,12 +263,13 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
     // Registration order = topological order (parents before children).
     let tick = TickableTable::new(base.clone());
     tick.register_filter(&filter);
+    tick.register_aggregate(&agg_filtered);
     tick.register_sorted(&sorted_direct);
     tick.register_aggregate(&agg_direct);
     tick.register_sorted(&sorted_chain);
     tick.register_aggregate(&agg_chain);
 
-    Pipeline { filter, sorted_chain, agg_chain, sorted_direct, agg_direct, tick }
+    Pipeline { filter, sorted_chain, agg_chain, agg_filtered, sorted_direct, agg_direct, tick }
 }
 
 /// Assert every live view equals a from-scratch rebuild on the current root.
@@ -285,6 +290,7 @@ fn assert_pipeline_matches(trial: u64, step: usize, base: &Rc<RefCell<Table>>, p
     assert_ordered_eq("sorted_chain", trial, step, &snapshot(&*p.sorted_chain.borrow()), &snapshot(&*osc.borrow()));
     assert_agg_eq("agg_direct", trial, step, "region", &snapshot(&*p.agg_direct.borrow()), &snapshot(&*ogd.borrow()));
     assert_agg_eq("agg_chain", trial, step, "region", &snapshot(&*p.agg_chain.borrow()), &snapshot(&*ogc.borrow()));
+    assert_agg_eq("agg_filtered", trial, step, "region", &snapshot(&*p.agg_filtered.borrow()), &snapshot(&*ogc.borrow()));
 }
 
 #[test]
