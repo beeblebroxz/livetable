@@ -105,6 +105,7 @@ cd frontend && npm install && npm run dev
 - Views use `Rc<RefCell<>>` for shared table access without data duplication
 - View parents are `Rc<RefCell<dyn ReadableTable>>` — an `Rc<RefCell<Table>>` coerces implicitly, and any view can parent another view. Children of root tables sync incrementally via the parent's changeset; children of views (`changeset()` returns None) use version-checked full refresh. A view's `version()` = own sync counter + parent version, so staleness propagates through chains. Sync parents before children (tick registration order = creation order = topological).
 - Chained views set `last_processed_change_count = usize::MAX` (no root-changeset cursor) — neutral in tick()'s min-cursor compaction folds. Keep that sentinel when adding cursor consumers.
+- Native `FilterView` and Python `PyFilterViewInner` rebuild when more than one change is pending. Their cell-update paths read the live parent, so replaying a batch can use stale row indices after an insert/delete. Keep both guards aligned; `tests/python/test_filter_batches.py` checks mixed batches and dependent views against a Python model.
 - Python lambdas are converted to Rust closures for filter/computed operations
 - Join operations use O(N+M) algorithm
 - WebSocket base protocol: `Subscribe`, `Query`, `InsertRow`, `UpdateCell`, and `DeleteRow`; successful mutations broadcast `RowInserted`, `CellUpdated`, and `RowDeleted` to base subscribers

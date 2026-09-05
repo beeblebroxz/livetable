@@ -226,6 +226,15 @@ impl PyFilterViewInner {
             return Ok(false);
         }
 
+        // Match native FilterView: CellUpdated reads the live parent, whose
+        // row indices may have shifted since an earlier change in this batch.
+        // Rebuild from the final table state instead of replaying stale indices.
+        if changes.len() > 1 {
+            drop(table_ref);
+            self.refresh(py)?;
+            return Ok(true);
+        }
+
         let changes: Vec<TableChange> = changes.to_vec();
         drop(table_ref);
 

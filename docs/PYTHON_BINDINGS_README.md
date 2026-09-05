@@ -116,6 +116,10 @@ for i in range(len(adults)):
 
 `FilterView` maintains an index. After parent mutations, call `table.tick()`
 for views created through `table.filter()`, or call `adults.sync()` directly.
+One pending change is applied incrementally. If multiple changes accumulated
+since the filter last synced, it rebuilds its index from the current table.
+This keeps updates correct when inserts or deletes shift row indices within a
+batch, but evaluates the predicate for every current row.
 
 ### ✅ Expression-Based Filtering
 
