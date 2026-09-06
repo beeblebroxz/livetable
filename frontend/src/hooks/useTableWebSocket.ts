@@ -291,6 +291,9 @@ export function useTableWebSocket(
   const [data, setData] = useState<TableRecord[]>([]);
   const [columns, setColumns] = useState<string[]>([]);
   const [connected, setConnected] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [error, setError] = useState('');
+  const [errorRevision, setErrorRevision] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const dataRef = useRef<TableRecord[]>([]);
@@ -303,6 +306,13 @@ export function useTableWebSocket(
   useEffect(() => {
     let disposed = false;
     let reconnectAttempts = 0;
+    setData([]);
+    setColumns([]);
+    setReady(false);
+    setConnected(false);
+    setError('');
+    dataRef.current = [];
+    lastAppliedSeqRef.current = null;
 
     const clearReconnectTimer = () => {
       if (reconnectTimerRef.current !== null) {
@@ -348,9 +358,12 @@ export function useTableWebSocket(
       wsRef.current = socket;
 
       socket.onopen = () => {
+        if (disposed || wsRef.current !== socket) return;
         logDebug('WebSocket connected');
         reconnectAttempts = 0;
         setConnected(true);
+        setReady(false);
+        setError('');
 
         // A fresh connection means a fresh snapshot is on the way; discard the
         // seq cutoff and any buffered deltas from the previous connection.
@@ -363,6 +376,7 @@ export function useTableWebSocket(
       };
 
       socket.onmessage = (event) => {
+        if (disposed || wsRef.current !== socket) return;
         const message = parseServerMessage(event.data);
         if (!message) {
           console.error('Invalid server message payload:', event.data);
@@ -370,10 +384,12 @@ export function useTableWebSocket(
         }
 
         logDebug('Received:', message);
+        if ('table_name' in message && message.table_name !== tableName) return;
 
         switch (message.type) {
           case 'TableData': {
             setColumns(message.columns);
+            setReady(true);
             // Replay deltas that raced ahead of the snapshot, keeping only a
             // contiguous sequence newer than it. Older/duplicate deltas are
             // already reflected in the snapshot and are dropped.
@@ -444,17 +460,25 @@ export function useTableWebSocket(
             break;
           case 'Error':
             console.error('Server error:', message.message);
+            setError(message.message);
+            setErrorRevision(revision => revision + 1);
             break;
         }
       };
 
-      socket.onerror = () => console.error('WebSocket error');
+      socket.onerror = () => {
+        if (disposed || wsRef.current !== socket) return;
+        setError('Connection interrupted. Waiting to reconnect.');
+        setErrorRevision(revision => revision + 1);
+      };
       socket.onclose = () => {
+        if (disposed || wsRef.current !== socket) return;
         logDebug('Disconnected');
         if (wsRef.current === socket) {
           wsRef.current = null;
         }
         setConnected(false);
+        setReady(false);
         clearGapTimer();
 
         if (disposed) {
@@ -490,7 +514,7 @@ export function useTableWebSocket(
   }, []);
 
   const insertRow = useCallback((row: TableRow) => {
-    sendMessage({ type: 'InsertRow', table_name: tableName, row });
+    return sendMessage({ type: 'InsertRow', table_name: tableName, row });
   }, [sendMessage, tableName]);
 
   const updateCell = useCallback((
@@ -498,7 +522,7 @@ export function useTableWebSocket(
     column: string,
     value: ScalarValue
   ) => {
-    sendMessage({
+    return sendMessage({
       type: 'UpdateCell',
       table_name: tableName,
       row_id: rowId,
@@ -508,12 +532,16 @@ export function useTableWebSocket(
   }, [sendMessage, tableName]);
 
   const deleteRow = useCallback((rowId: number) => {
-    sendMessage({
+    return sendMessage({
       type: 'DeleteRow',
       table_name: tableName,
       row_id: rowId,
     });
   }, [sendMessage, tableName]);
 
-  return { data, columns, connected, insertRow, updateCell, deleteRow };
+  const clearError = useCallback(() => setError(''), []);
+  return {
+    data, columns, connected, ready, error, errorRevision, clearError,
+    sequence: lastAppliedSeqRef.current, insertRow, updateCell, deleteRow,
+  };
 }

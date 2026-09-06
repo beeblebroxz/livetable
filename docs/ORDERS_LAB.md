@@ -1,7 +1,7 @@
 # LiveTable Orders Lab
 
 A local demonstration of the real Rust engine and protocol-v3 client. It replaces
-the Forward Prop Demo; the original editor remains at `/#editor` on the separate
+the Forward Prop Demo; the redesigned editor lives at `/#editor` on the separate
 `demo` table. No user data is needed.
 
 ## Start locally
@@ -93,6 +93,35 @@ Generic protocol edits can also change the synthetic table, so reset if a guided
 scenario has no suitable row. Concurrent clients can change a chosen row between
 selection and execution; use one active publisher for repeatable demonstrations.
 
+## Table editor
+
+Open **Table editor** in the navigation, or visit `/#editor`. It shares the lab's
+visual style but edits the separate `demo` base table; lab resets never affect it.
+Use **Open another editor** to watch confirmed changes arrive in a second tab.
+
+- Click a cell to edit. **Enter** or blur submits; **Escape** discards the current
+  draft; **Tab** submits and moves focus. The input returns to its confirmed value
+  until the server reflects the change. Rejected values produce a visible error.
+- Search and column-header sorting are local to each browser, not server pipeline
+  operations. Search covers all loaded rows; pagination renders at most 25 at a
+  time and stays on the current page across updates. Mutations use stable wire
+  row IDs, never a display position or an editable business ID.
+- Select a row number or cell for its server-confirmed record inspector.
+  **Add row** opens a draft form; only **Create row** sends an insertion.
+  Deletion requires explicit confirmation and has no undo.
+- Editing waits for the initial/reconnected snapshot. One mutation is allowed
+  in flight per editor. Generic writes have no correlated request IDs: the status
+  confirms a matching server state, not a transactional receipt or durability.
+  On disconnect or a 10-second confirmation timeout, inspect the refreshed table
+  before retrying; mutations are never automatically replayed.
+
+The flat snapshot includes column names and values, not schema types/nullability.
+Input types are inferred from observed non-null values and retained across nulls;
+the known `demo.amount` field also works when the table is empty. All-null columns
+without an observed type default to text. Finite-number and boolean syntax checks
+run locally; the server still validates the actual schema. This is not a schema
+editor. Data is in memory and is lost when the server restarts.
+
 ## Measurement boundaries
 
 - **Received JSON:** UTF-8 bytes of valid current-table/current-generation
@@ -159,4 +188,7 @@ refuse occupied ports and do not touch a lab on 8080. Release builds and
 localhost/browser launch permissions are required. Screenshots/failure traces
 are ignored artifacts in `frontend/test-results/`. Coverage includes guided
 scenarios, independent clients, shared reset, 100k scrolling, bounded streaming,
-mobile layout, reset cancellation and the preserved editor.
+mobile layout, reset cancellation, and the redesigned editor's keyboard actions,
+independent local search/sort, two-client edits, server rejection, draft creation
+and confirmed deletion. Unit tests additionally cover pagination, stable row IDs,
+confirmation timeouts, disconnects and stale-socket isolation.

@@ -9,13 +9,15 @@ import {
 } from './useTableWebSocket';
 import { FakeWebSocket } from '../test/fakeWebSocket';
 
-function HookHarness({ label, wsUrl = 'ws://localhost:8080/ws' }: { label: string; wsUrl?: string }) {
-  const { connected, data } = useTableWebSocket('demo', wsUrl);
+function HookHarness({ label, wsUrl = 'ws://localhost:8080/ws', tableName = 'demo' }: { label: string; wsUrl?: string; tableName?: string }) {
+  const { connected, data, ready, error, errorRevision } = useTableWebSocket(tableName, wsUrl);
 
   return (
     <div>
       <div data-testid={`${label}-connected`}>{connected ? 'connected' : 'disconnected'}</div>
       <div data-testid={`${label}-rows`}>{JSON.stringify(data)}</div>
+      <div data-testid={`${label}-ready`}>{String(ready)}</div>
+      <div data-testid={`${label}-error`}>{errorRevision}: {error}</div>
     </div>
   );
 }
@@ -30,6 +32,47 @@ describe('useTableWebSocket', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it('ignores other tables and marks a connection ready only after its own snapshot', async () => {
+    render(<HookHarness label="client" />);
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => socket.open());
+    expect(screen.getByTestId('client-ready').textContent).toBe('false');
+    await act(async () => socket.receive({ type: 'TableData', table_name: 'other', seq: 100, columns: ['name'], rows: [] }));
+    expect(screen.getByTestId('client-ready').textContent).toBe('false');
+    await act(async () => socket.receive({ type: 'TableData', table_name: 'demo', seq: 1, columns: ['name'], rows: [{ row_id: 1, row: { name: 'Alice' } }] }));
+    expect(screen.getByTestId('client-ready').textContent).toBe('true');
+    await act(async () => socket.receive({ type: 'RowDeleted', table_name: 'other', seq: 2, row_id: 1 }));
+    expect(screen.getByTestId('client-rows').textContent).toContain('Alice');
+    await act(async () => socket.close());
+    expect(screen.getByTestId('client-ready').textContent).toBe('false');
+  });
+
+  it('discards stale socket events when switching tables and exposes repeated server errors', async () => {
+    const { rerender } = render(<HookHarness label="client" />);
+    const previous = FakeWebSocket.instances[0];
+    await act(async () => {
+      previous.open();
+      previous.receive({ type: 'TableData', table_name: 'demo', seq: 1, columns: ['name'], rows: [{ row_id: 1, row: { name: 'Alice' } }] });
+    });
+    rerender(<HookHarness label="client" tableName="other" />);
+    expect(screen.getByTestId('client-rows').textContent).toBe('[]');
+    const current = FakeWebSocket.instances[1];
+    await act(async () => {
+      current.open();
+      current.receive({ type: 'TableData', table_name: 'other', seq: 1, columns: ['name'], rows: [{ row_id: 2, row: { name: 'Bob' } }] });
+      previous.open();
+      previous.receive({ type: 'TableData', table_name: 'demo', seq: 99, columns: [], rows: [] });
+      previous.emitError();
+      previous.close();
+    });
+    expect(screen.getByTestId('client-rows').textContent).toContain('Bob');
+    expect(screen.getByTestId('client-connected').textContent).toBe('connected');
+    expect(screen.getByTestId('client-error').textContent).toBe('0: ');
+    await act(async () => current.receive({ type: 'Error', message: 'Rejected' }));
+    await act(async () => current.receive({ type: 'Error', message: 'Rejected' }));
+    expect(screen.getByTestId('client-error').textContent).toBe('2: Rejected');
   });
 
   it('keeps multiple clients in sync using stable row ids', async () => {

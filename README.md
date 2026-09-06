@@ -371,7 +371,9 @@ The default page is the **Orders Lab**: five guided scenarios, a branching
 server-side pipeline, a virtualized results table, and an actual WebSocket
 delivery inspector. Explore deterministic datasets up to 100,000 rows, bounded
 mixed-batch streaming, independent clients, and intentionally dropped-delta
-recovery. The original editor remains at `/#editor` on the separate `demo` table.
+recovery. The redesigned table editor lives at `/#editor` on the separate `demo`
+table, with keyboard-first cells, local search/sort, paginated rows, a record
+inspector and visible server confirmations.
 See the [lab guide](docs/ORDERS_LAB.md) for the tour and measurement boundaries.
 Protocol-v3 base/filter/sort nodes receive ordered deltas; groups retain
 snapshots. Pipeline replacement remains debounced and generation-scoped.
@@ -395,7 +397,7 @@ See [WebSocket Protocol v3](docs/WEBSOCKET_PROTOCOL.md) for message schemas and
 reconciliation rules.
 
 Lab reset affects shared synthetic `lab` data and requires UI confirmation.
-The `--lab` CLI requires a loopback host. Omit it for the original editor-only
+The `--lab` CLI requires a loopback host. Omit it for the editor-only
 server. `npm run test:e2e` in `frontend` runs real-server tests using installed
 Google Chrome and isolated ports 8087/5180.
 
