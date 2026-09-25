@@ -18,7 +18,7 @@ export function isValidViewSnapshot(message: ViewData): boolean {
 // partially change the visible baseline. Row coordinates are step-local.
 export function applyViewDelta(previous: PipelineSnapshot, delta: ViewDelta): PipelineSnapshot | null {
   if (previous.generation !== delta.pipeline_generation || previous.nodeId !== delta.node_id ||
-      previous.seq !== delta.from_seq || previous.kind === 'group') return null;
+      previous.seq !== delta.from_seq) return null;
   const rows = previous.rows.slice();
   for (const change of delta.changes) {
     if (change.type === 'RowInserted') {

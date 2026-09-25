@@ -70,7 +70,7 @@ fn assert_matches(client: &HashMap<String, NodeSnapshot>, fresh: &HashMap<String
 }
 
 #[test]
-fn excluded_edits_send_no_filter_or_sort_payload_and_keep_baselines() {
+fn excluded_edits_send_only_the_base_delta_and_keep_baselines() {
     let mut engine = TableEngine::new();
     let mut client = install(&mut engine, 1, 1, &pipeline_specs());
     for value in [50.0, 75.0, 125.0] {
@@ -78,7 +78,7 @@ fn excluded_edits_send_no_filter_or_sort_payload_and_keep_baselines() {
             .update_cell("demo", 1, "amount", &json!(value))
             .unwrap();
         let messages = engine.tick_and_collect("demo").remove(&1).unwrap();
-        assert_eq!(messages.len(), 2, "base delta plus aggregate snapshot only");
+        assert_eq!(messages.len(), 1, "base delta only");
         assert!(
             matches!(&messages[0], ServerMessage::ViewDelta { node_id, from_seq, .. }
             if node_id == "base" && *from_seq == client["base"].seq)
@@ -86,6 +86,7 @@ fn excluded_edits_send_no_filter_or_sort_payload_and_keep_baselines() {
         apply_deliveries(&mut client, messages);
         assert_eq!(client["filtered"].seq, 0);
         assert_eq!(client["ranked"].seq, 0);
+        assert_eq!(client["totals"].seq, 0);
     }
     engine
         .update_cell("demo", 1, "amount", &json!(600.0))
@@ -99,6 +100,10 @@ fn excluded_edits_send_no_filter_or_sort_payload_and_keep_baselines() {
             seq: 1,
             ..
         }
+    ));
+    assert!(matches!(
+        &messages[3],
+        ServerMessage::ViewDelta { node_id, from_seq: 0, seq: 1, .. } if node_id == "totals"
     ));
     apply_deliveries(&mut client, messages);
     assert_matches(&client, &install(&mut engine, 2, 1, &pipeline_specs()));
@@ -310,7 +315,7 @@ fn seeded_mixed_batches_match_fresh_pipelines() {
 }
 
 #[test]
-fn group_descendants_keep_snapshot_fallback() {
+fn groups_and_their_descendants_receive_deltas() {
     let mut engine = TableEngine::new();
     let mut specs = pipeline_specs();
     specs.push(ViewNodeSpec {
@@ -325,7 +330,17 @@ fn group_descendants_keep_snapshot_fallback() {
         .update_cell("demo", 2, "amount", &json!(400.0))
         .unwrap();
     let messages = engine.tick_and_collect("demo").remove(&1).unwrap();
-    assert!(messages.iter().any(|message| matches!(message, ServerMessage::ViewData { node_id, .. } if node_id == "group_filter")));
+    assert!(!messages
+        .iter()
+        .any(|message| matches!(message, ServerMessage::ViewData { .. })));
+    for group_node in ["totals", "group_filter"] {
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::ViewDelta { node_id, changes, .. }
+            if node_id == group_node
+                && matches!(changes[..], [ViewChange::CellUpdated { index: 0, .. }])
+        )));
+    }
     apply_deliveries(&mut client, messages);
     assert_matches(&client, &install(&mut engine, 2, 1, &specs));
 }

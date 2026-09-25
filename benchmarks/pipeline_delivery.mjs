@@ -2,7 +2,7 @@
 // Usage: node benchmarks/pipeline_delivery.mjs /absolute/server/binary 10000 100000
 // Measures request -> Rust actor/engine -> JSON/WebSocket -> reconstructed client
 // state. Uses the production delta reducer; excludes React render and hook/parser
-// validation. The identical client also accepts protocol-v2 snapshot-only servers.
+// validation. The identical client measures protocol-3 and protocol-4 servers.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -18,6 +18,15 @@ const nodes = [
   { id: 'g', source_id: 's', kind: 'group', group_by: ['region'], aggs: [{ alias: 'total', column: 'amount', op: 'sum' }] },
 ];
 const quantile = (values, percentile) => [...values].sort((a, b) => a - b)[Math.ceil(values.length * percentile) - 1];
+// Nodes whose client state each request changes. A sample ends once all have
+// delivered; any other node delivery fails the run. Protocol 3 also resends
+// the group snapshot on every edit; protocol 4 sends it only a changed total.
+const DELIVERIES = {
+  install: ['base', 'f', 's', 'g'],
+  excluded_update: ['base'],
+  non_sort_update: ['base', 'f', 's'],
+  sort_key_move: ['base', 'f', 's', 'g'],
+};
 
 async function run(size) {
   assert(Number.isSafeInteger(size) && size >= 100);
@@ -37,6 +46,7 @@ async function run(size) {
     let messages = 0;
     let protocol;
     let checkpointBytes = 0;
+    let failure;
     socket.addEventListener('message', ({ data }) => {
       try {
         const message = JSON.parse(data);
@@ -57,23 +67,28 @@ async function run(size) {
           assert(next, 'delta must apply to exactly the current baseline');
           snapshots.set(message.node_id, next);
         }
-        if (message.type === 'ViewData' && message.node_id === 'g') awaiting?.resolve();
-      } catch (error) { awaiting?.reject(error); }
+        if (message.type === 'ViewData' || message.type === 'ViewDelta') {
+          if (!awaiting?.pending.delete(message.node_id)) throw new Error(`unexpected ${message.type} for ${message.node_id}`);
+          if (awaiting.pending.size === 0) awaiting.resolve();
+        }
+      } catch (error) { failure ??= error; awaiting?.reject(error); }
     });
     await new Promise((resolve, reject) => {
       socket.addEventListener('open', resolve, { once: true });
       socket.addEventListener('error', reject, { once: true });
     });
-    const roundTrip = async (message) => {
-      const done = new Promise((resolve, reject) => { awaiting = { resolve, reject }; });
-      const timeout = setTimeout(() => awaiting?.reject(new Error('delivery timed out')), 30000);
+    const roundTrip = async (message, step) => {
+      if (failure) throw failure; // including a stray delivery between samples
+      const expected = protocol >= 4 ? DELIVERIES[step] : [...new Set([...DELIVERIES[step], 'g'])];
+      const done = new Promise((resolve, reject) => { awaiting = { pending: new Set(expected), resolve, reject }; });
+      const timeout = setTimeout(() => awaiting?.reject(new Error(`${step} delivery timed out`)), 30000);
       try {
         socket.send(JSON.stringify(message));
         await done;
       } finally { clearTimeout(timeout); awaiting = undefined; }
     };
     socket.send(JSON.stringify({ type: 'Subscribe', table_name: 'demo' }));
-    await roundTrip({ type: 'SetPipeline', table_name: 'demo', pipeline_generation: 1, nodes });
+    await roundTrip({ type: 'SetPipeline', table_name: 'demo', pipeline_generation: 1, nodes }, 'install');
     assert.equal(snapshots.get('base').rows.length, size);
     for (const workload of ['excluded_update', 'non_sort_update', 'sort_key_move']) {
       const timings = [], payloadBytes = [], frameCounts = [];
@@ -85,7 +100,7 @@ async function run(size) {
         };
         bytes = 0; messages = 0;
         const start = performance.now();
-        await roundTrip(message);
+        await roundTrip(message, workload);
         const elapsed = performance.now() - start;
         if (sample >= 5) { timings.push(elapsed); payloadBytes.push(bytes); frameCounts.push(messages); }
       }
@@ -101,6 +116,7 @@ async function run(size) {
         median_ms: quantile(timings, 0.5), p95_ms: quantile(timings, 0.95),
         median_json_bytes: quantile(payloadBytes, 0.5), median_messages: quantile(frameCounts, 0.5) }));
     }
+    if (failure) throw failure;
     console.log(JSON.stringify({ rows: size, checkpoint_json_bytes_during_run: checkpointBytes }));
   } finally {
     socket?.close();

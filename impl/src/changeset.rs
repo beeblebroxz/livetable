@@ -25,7 +25,7 @@ use crate::column::ColumnValue;
 use std::collections::HashMap;
 
 /// Represents a single change to a table
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TableChange {
     /// A row was inserted at the given index
     /// Contains: (row_index, row_data)

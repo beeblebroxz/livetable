@@ -183,7 +183,7 @@ For unmatched rows:
 
 `JoinView` maintains a cached output index. `sync()` consumes pending changes
 from both parents and handles inserts, deletes, and key updates. Tables and
-synchronized filters/sorts expose history that Rust joins can replay. If either
+synchronized filters/sorts/aggregates expose history that Rust joins can replay. If either
 parent exposes no changeset, the join instead uses version-checked rebuilds.
 Missing history, structural changes on both sides in one batch, or a key update
 before a structural change on the same side also require a rebuild to avoid

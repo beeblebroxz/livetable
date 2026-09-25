@@ -1,10 +1,26 @@
 # Aggregate Output Changesets — Design
 
 **Date:** 2026-09-23
-**Status:** Proposed
+**Status:** Implemented 2026-09-24
 **Goal:** Give `AggregateView` an output changeset in its own group
 coordinates. Group nodes then receive wire deltas instead of full snapshots, and
 views built on a group update incrementally instead of rebuilding.
+
+Current references: [protocol v4](../../WEBSOCKET_PROTOCOL.md), the
+[recorded group-delta comparison](../../PIPELINE_DELIVERY.md#recorded-comparison-group-deltas-protocol-v4),
+and the contract tests in `impl/tests/aggregate_pipeline.rs`.
+
+Implementation notes (differences from the design below):
+
+- `GroupState::new` takes its position and percentile columns, and `TableChange`
+  derives `PartialEq` so tests compare exact event lists.
+- A mutation check found that the planned contract tests missed stale positions
+  after a group removal; `removing_a_group_shifts_the_index_of_later_groups`
+  covers it.
+- No test pins the v3 → v4 constant: the existing mismatch test already covers
+  the version check, and a constant test would only restate the value.
+- The benchmark harness ends each sample when a declared set of nodes has
+  delivered, and fails on any other delivery.
 
 ## Problem
 

@@ -73,10 +73,12 @@ Requested MIN/MAX can rescan affected groups, and percentiles maintain sorted
 vectors. A sort's 256 input events can produce 512 output events, so a child
 filter/sort with the same 256-input bound can legitimately rebuild.
 
-Views other than filters and sorts still expose no output changeset. The
+At this milestone, views other than filters and sorts exposed no output
+changeset; the later [aggregate output milestone](superpowers/specs/2026-09-23-aggregate-output-changesets-design.md)
+adds aggregate history, so sorts over a group now replay it. The
 WebSocket server emitted full `ViewData` snapshots at this milestone; the subsequent
 [protocol-v3 delivery milestone](PIPELINE_DELIVERY.md) adds bounded base/filter/sort
-deltas with snapshot recovery. The measurements below still exclude Python
+deltas with snapshot recovery, and protocol v4 adds group deltas. The measurements below still exclude Python
 callbacks, serialization, network delivery, and rendering.
 
 ## Reproducible benchmark

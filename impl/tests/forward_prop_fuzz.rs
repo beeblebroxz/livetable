@@ -15,6 +15,10 @@
 //!   MIN/MAX recalculation and MEDIAN/p90 sorted-values maintenance)
 //! - SortedView over a FilterView (chained, incremental batch replay)
 //! - AggregateView over the chained sort (chained-of-chained)
+//! - Filter, sort, and FULL join over AggregateViews (aggregate output history)
+//!
+//! Sort, aggregate, and aggregate-child output history must also replay onto
+//! the pre-tick snapshot and reproduce the post-tick one exactly.
 //!
 //! It also covers multi-consumer min-cursor changeset compaction (filter + the
 //! two direct views all consume the root changeset on the same TickableTable).
@@ -95,19 +99,50 @@ fn snapshot(v: &dyn ReadableTable) -> Vec<Row> {
 }
 
 /// Replaying the output stream must reproduce every column, not just sort
-/// order and the columns aggregated by downstream consumers.
-fn assert_sorted_replay(mut rows: Vec<Row>, cursor: usize, view: &SortedView) {
-    for change in view.changeset().unwrap().changes_from(cursor).expect("small batch history") {
+/// order and the columns aggregated by downstream consumers. A synced view
+/// must also expose history after every tick, including excluded edits.
+fn assert_replay(label: &str, trial: u64, step: usize, mut rows: Vec<Row>, cursor: usize, view: &dyn ReadableTable) {
+    let history = view
+        .changeset()
+        .unwrap_or_else(|| panic!("[{label}] trial {trial} step {step}: no history after tick"));
+    let changes = history
+        .changes_from(cursor)
+        .unwrap_or_else(|| panic!("[{label}] trial {trial} step {step}: small batch history"));
+    for change in changes {
         match change {
             TableChange::RowInserted { index, data } => rows.insert(*index, data.clone()),
-            TableChange::RowDeleted { index, data } => assert_eq!(rows.remove(*index), *data),
+            TableChange::RowDeleted { index, data } => {
+                assert_eq!(rows.remove(*index), *data, "[{label}] trial {trial} step {step}: deletion payload")
+            }
             TableChange::CellUpdated { row, column, old_value, new_value } => {
-                assert_eq!(&rows[*row][column], old_value);
+                assert_eq!(&rows[*row][column], old_value, "[{label}] trial {trial} step {step}: old value");
                 rows[*row].insert(column.clone(), new_value.clone());
             }
         }
     }
-    assert_eq!(rows, snapshot(view));
+    assert_eq!(rows, snapshot(view), "[{label}] trial {trial} step {step}: replayed rows");
+}
+
+/// Views whose history is replayed, with their pre-tick rows and cursors.
+type Replayed = Vec<(&'static str, Rc<RefCell<dyn ReadableTable>>, Vec<Row>, usize)>;
+
+fn capture(views: Vec<(&'static str, Rc<RefCell<dyn ReadableTable>>)>) -> Replayed {
+    views
+        .into_iter()
+        .map(|(label, view)| {
+            let (rows, cursor) = {
+                let v = view.borrow();
+                (snapshot(&*v), v.changeset().expect("synced before mutation").total_len())
+            };
+            (label, view, rows, cursor)
+        })
+        .collect()
+}
+
+fn assert_replays(trial: u64, step: usize, captured: Replayed) {
+    for (label, view, rows, cursor) in captured {
+        assert_replay(label, trial, step, rows, cursor, &*view.borrow());
+    }
 }
 
 /// A detached, independent table holding a copy of `base`'s current rows.
@@ -255,7 +290,39 @@ struct Pipeline {
     agg_filtered: Rc<RefCell<AggregateView>>,
     sorted_direct: Rc<RefCell<SortedView>>,
     agg_direct: Rc<RefCell<AggregateView>>,
+    /// HAVING-style filter over the chained aggregate.
+    having: Rc<RefCell<FilterView>>,
+    /// Groups ranked by total (region breaks ties, so the order is total).
+    ranked_groups: Rc<RefCell<SortedView>>,
+    /// Each order FULL-joined to its region's filtered totals.
+    agg_join: Rc<RefCell<JoinView>>,
     tick: TickableTable,
+}
+
+impl Pipeline {
+    /// Views whose output history must reproduce their next snapshot.
+    fn replayed(&self) -> Vec<(&'static str, Rc<RefCell<dyn ReadableTable>>)> {
+        vec![
+            ("sorted_chain", self.sorted_chain.clone()),
+            ("agg_filtered", self.agg_filtered.clone()),
+            ("agg_direct", self.agg_direct.clone()),
+            ("agg_chain", self.agg_chain.clone()),
+            ("having", self.having.clone()),
+            ("ranked_groups", self.ranked_groups.clone()),
+        ]
+    }
+}
+
+fn big_group(row: &Row) -> bool {
+    matches!(row.get("total"), Some(ColumnValue::Float64(v)) if *v >= 1500.0)
+}
+
+fn group_rank_keys() -> Vec<SortKey> {
+    vec![SortKey::descending("total"), SortKey::ascending("region")]
+}
+
+fn region_join(left: Rc<RefCell<Table>>, right: Rc<RefCell<AggregateView>>, name: &str) -> JoinView {
+    JoinView::new(name.to_string(), left, right, "region".to_string(), "region".to_string(), JoinType::Full).unwrap()
 }
 
 fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
@@ -276,6 +343,12 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
         AggregateView::new("gd".to_string(), base.clone(), vec!["region".to_string()], aggs()).unwrap(),
     ));
 
+    let having = Rc::new(RefCell::new(FilterView::new("having".to_string(), agg_chain.clone(), big_group)));
+    let ranked_groups = Rc::new(RefCell::new(
+        SortedView::new("rg".to_string(), agg_direct.clone(), group_rank_keys()).unwrap(),
+    ));
+    let agg_join = Rc::new(RefCell::new(region_join(base.clone(), agg_filtered.clone(), "aj")));
+
     // Registration order = topological order (parents before children).
     let tick = TickableTable::new(base.clone());
     tick.register_filter(&filter);
@@ -284,8 +357,22 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
     tick.register_aggregate(&agg_direct);
     tick.register_sorted(&sorted_chain);
     tick.register_aggregate(&agg_chain);
+    tick.register_filter(&having);
+    tick.register_sorted(&ranked_groups);
+    tick.register_join_as_left(&agg_join);
 
-    Pipeline { filter, sorted_chain, agg_chain, agg_filtered, sorted_direct, agg_direct, tick }
+    Pipeline {
+        filter,
+        sorted_chain,
+        agg_chain,
+        agg_filtered,
+        sorted_direct,
+        agg_direct,
+        having,
+        ranked_groups,
+        agg_join,
+        tick,
+    }
 }
 
 /// Assert every live view equals a from-scratch rebuild on the current root.
@@ -307,6 +394,24 @@ fn assert_pipeline_matches(trial: u64, step: usize, base: &Rc<RefCell<Table>>, p
     assert_agg_eq("agg_direct", trial, step, "region", &snapshot(&*p.agg_direct.borrow()), &snapshot(&*ogd.borrow()));
     assert_agg_eq("agg_chain", trial, step, "region", &snapshot(&*p.agg_chain.borrow()), &snapshot(&*ogc.borrow()));
     assert_agg_eq("agg_filtered", trial, step, "region", &snapshot(&*p.agg_filtered.borrow()), &snapshot(&*ogc.borrow()));
+
+    // Views over aggregates. Incremental group order is first-appearance order
+    // while a rebuild reorders, so compare filter/join output order-free.
+    let ohaving = FilterView::new("oh".to_string(), ogc.clone(), big_group);
+    assert_agg_eq("having", trial, step, "region", &snapshot(&*p.having.borrow()), &snapshot(&ohaving));
+
+    let oranked = SortedView::new("org".to_string(), ogd.clone(), group_rank_keys()).unwrap();
+    let (live, oracle) = (snapshot(&*p.ranked_groups.borrow()), snapshot(&oranked));
+    let regions = |rows: &[Row]| rows.iter().map(|r| r["region"].clone()).collect::<Vec<_>>();
+    assert_eq!(regions(&live), regions(&oracle), "[ranked_groups] trial {trial} step {step}: order");
+    assert_agg_eq("ranked_groups", trial, step, "region", &live, &oracle);
+
+    let ojoin = region_join(ob.clone(), ogc.clone(), "oaj");
+    assert_eq!(
+        multiset(&snapshot(&*p.agg_join.borrow())),
+        multiset(&snapshot(&ojoin)),
+        "[agg_join] trial {trial} step {step}"
+    );
 }
 
 #[test]
@@ -318,11 +423,10 @@ fn differential_chained_forward_prop_fuzz() {
         let mut next_id: i64 = 0;
 
         for step in 0..200usize {
-            let before = snapshot(&*p.sorted_chain.borrow());
-            let cursor = p.sorted_chain.borrow().changeset().unwrap().total_len();
+            let before = capture(p.replayed());
             apply_random_op(&mut rng, &base, &mut next_id);
             p.tick.tick();
-            assert_sorted_replay(before, cursor, &p.sorted_chain.borrow());
+            assert_replays(trial, step, before);
             assert_pipeline_matches(trial, step, &base, &p);
         }
     }
@@ -337,8 +441,7 @@ fn differential_batched_forward_prop_fuzz() {
         let mut next_id: i64 = 0;
 
         for step in 0..150usize {
-            let before = snapshot(&*p.sorted_chain.borrow());
-            let cursor = p.sorted_chain.borrow().changeset().unwrap().total_len();
+            let before = capture(p.replayed());
             // 1..=6 mutations applied before a single tick() — a multi-change
             // batch. The deferred end-of-batch MIN/MAX recalc must read row
             // indices that match the parent only after all batch shifts apply.
@@ -347,7 +450,7 @@ fn differential_batched_forward_prop_fuzz() {
                 apply_random_op(&mut rng, &base, &mut next_id);
             }
             p.tick.tick();
-            assert_sorted_replay(before, cursor, &p.sorted_chain.borrow());
+            assert_replays(trial, step, before);
             assert_pipeline_matches(trial, step, &base, &p);
         }
     }
@@ -410,6 +513,7 @@ fn differential_int_group_by_fuzz() {
         tick.register_aggregate(&agg);
 
         for step in 0..200usize {
+            let before = capture(vec![("int_agg", agg.clone())]);
             let len = base.borrow().len();
             let roll = rng.pct();
             if len == 0 || roll < 45 {
@@ -428,6 +532,7 @@ fn differential_int_group_by_fuzz() {
                 base.borrow_mut().delete_row(idx).unwrap();
             }
             tick.tick();
+            assert_replays(trial, step, before);
 
             let ob = clone_int_base(&base);
             let og = Rc::new(RefCell::new(

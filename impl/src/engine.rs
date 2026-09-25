@@ -826,18 +826,22 @@ mod tests {
         assert!(
             matches!(&snapshots[0], ServerMessage::ViewDelta { node_id, .. } if node_id == "base")
         );
-        let rows = snapshots
+        // The first West order to pass the filter appends a new group.
+        let changes = snapshots
             .iter()
             .find_map(|message| match message {
-                ServerMessage::ViewData { node_id, rows, .. } if node_id == "totals" => Some(rows),
+                ServerMessage::ViewDelta {
+                    node_id, changes, ..
+                } if node_id == "totals" => Some(changes),
                 _ => None,
             })
-            .unwrap();
-        let west = rows
-            .iter()
-            .find(|row| row.row["region"] == json!("West"))
-            .unwrap();
-        assert_eq!(west.row["total"], json!(300.0));
+            .expect("group delta");
+        let [ViewChange::RowInserted { index: 1, row }] = &changes[..] else {
+            panic!("expected one West group appended after East");
+        };
+        assert_eq!(row.row_id, None);
+        assert_eq!(row.row["region"], json!("West"));
+        assert_eq!(row.row["total"], json!(300.0));
     }
 
     #[test]

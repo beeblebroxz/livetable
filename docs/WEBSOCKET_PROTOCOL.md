@@ -1,14 +1,17 @@
-# WebSocket Protocol v3
+# WebSocket Protocol v4
 
 LiveTable's optional Actix server exposes a JSON-over-WebSocket protocol for
 editing a base table and subscribing to connection-local, server-computed view
 pipelines.
 
-The wire version is `3` (`impl/src/messages.rs::PROTOCOL_VERSION`). The bundled
+The wire version is `4` (`impl/src/messages.rs::PROTOCOL_VERSION`). The bundled
 React client expects the same version. Upgrade server and client together:
 pipeline delivery sequences have changed meaning since v2, and clients must
 handle `ViewDelta`, `PipelineStatus`, and `QueryView`. Flat-table message shapes
 and change-count sequencing are unchanged.
+
+v4 changes no message shape. It sends `ViewDelta`s to `group` nodes, which v3
+clients reject and would repair on every change.
 
 ## Running the server
 
@@ -55,7 +58,7 @@ The server registers the connection for base-table mutation broadcasts and
 replies:
 
 ```json
-{"type":"Subscribed","table_name":"demo","protocol_version":3}
+{"type":"Subscribed","table_name":"demo","protocol_version":4}
 ```
 
 `Subscribe` does not include a snapshot. Send `Query` as well when using the
@@ -206,14 +209,17 @@ required.
 
 The server immediately sends a snapshot for the synthetic `base` node and each
 successfully built node, each at delivery sequence zero. After mutations,
-base/filter/sort nodes send bounded deltas when history is available. Empty
-filter/sort output sends no node payload and does not advance its delivery
-sequence. Groups retain full snapshots when their inherited version changes;
-they may still send a snapshot after an excluded edit.
+base/filter/sort/group nodes send bounded deltas when history is available.
+Empty output sends no node payload and does not advance the node's delivery
+sequence, so an excluded edit sends nothing to a filter's descendants. A group
+delta is a net diff of the batch: `CellUpdated` for each changed aggregate
+result, `RowDeleted` for an emptied group, and `RowInserted` at the end for a
+new group. Group rows keep `row_id: null`.
 
 Missing history, view rebuilds, and oversized deltas produce a new snapshot.
-Filters/sorts below a group may rebuild and therefore also use snapshots. See
-[the internal sorted pipeline contract](INCREMENTAL_SORTED_PIPELINE.md).
+See the internal [sorted](INCREMENTAL_SORTED_PIPELINE.md) and
+[aggregate](superpowers/specs/2026-09-23-aggregate-output-changesets-design.md)
+pipeline contracts.
 
 ```json
 {
@@ -348,8 +354,8 @@ Atomicity is per node/batch, not a simultaneous multi-node browser transaction.
 
 ### Remaining limits
 
-Groups still use snapshots; stable derived-row identity is not implemented.
-Client delta application shallow-copies the row array, so it still has O(N)
+Stable derived-row identity is not implemented: filter, sort, and group rows
+carry `row_id: null` and deltas address them by position. Client delta application shallow-copies the row array, so it still has O(N)
 reference-copy work, and sorted index maintenance can remain O(N). Full initial
 and recovery snapshots are not chunked. Checkpoints support eventual recovery
 after transient delivery loss, not durable replay or an acknowledgement log.

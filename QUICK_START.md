@@ -101,8 +101,8 @@ Open the URL printed by Vite for the [Orders Lab](docs/ORDERS_LAB.md): five guid
 scenarios, 1k–100k deterministic orders, a branching server pipeline, and real
 delivery/recovery inspection. The redesigned editor at `/#editor` has inline
 keyboard edits, local search/sort, a record inspector and server-confirmed saves
-on a separate table. Base/filter/sort nodes receive ordered deltas; groups retain
-snapshots. The `--lab` server is loopback-only and reset affects only shared
+on a separate table. Base/filter/sort/group nodes receive ordered deltas. The
+`--lab` server is loopback-only and reset affects only shared
 synthetic lab data. See [docs/WEBSOCKET_PROTOCOL.md](docs/WEBSOCKET_PROTOCOL.md).
 
 ## Verification

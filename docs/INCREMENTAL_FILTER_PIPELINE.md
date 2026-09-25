@@ -56,14 +56,15 @@ the first incremental update; benchmark warmup includes that cost.
 The subsequent [sorted pipeline milestone](INCREMENTAL_SORTED_PIPELINE.md)
 adds bounded sorted-coordinate output replay and aggregate index remapping.
 The benchmark below records the earlier filter-only milestone, before that
-extension. Other output-view types retain version-checked rebuilds for their
-children. View versions still include ancestors for
+extension. The later [aggregate output milestone](superpowers/specs/2026-09-23-aggregate-output-changesets-design.md)
+adds aggregate history. Projection, computed, and join views still give their
+children version-checked rebuilds. View versions still include ancestors for
 staleness and iterator checks, independently of emitted changes.
 
 At this milestone the server serialized full view snapshots, including after
 excluded edits. The subsequent [protocol-v3 delivery milestone](PIPELINE_DELIVERY.md)
 adds base/filter/sort deltas and suppresses empty filter/sort deliveries;
-aggregate snapshots and periodic checkpoints still produce wire traffic.
+protocol v4 adds group deltas. Periodic checkpoints still produce wire traffic.
 These measurements cover the Rust mutation + tick path, not Python callback time,
 snapshot serialization, network delivery, or browser rendering.
 

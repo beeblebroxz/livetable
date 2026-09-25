@@ -458,8 +458,8 @@ whose left side is a `FilterView`). Tables and synchronized filters/sorts expose
 changesets. Both `filtered.group_by(...)` and `ranked.group_by(...)` update their
 aggregates without rescanning all filtered rows for a scalar SUM/COUNT/AVG
 update that does not move a sorted row or change group membership. Changes that
-stay outside the filter emit no downstream events. Protocol v3 also suppresses
-empty filter/sort wire deliveries; aggregate nodes still use snapshots. Python exposes
+stay outside the filter emit no downstream events. Protocol v4 also suppresses
+empty filter/sort/group wire deliveries and sends groups deltas. Python exposes
 only the chaining methods listed above, not arbitrary Rust DAG construction.
 
 Filter/sort history retains one successful non-empty input batch. Consumers that
@@ -470,8 +470,10 @@ Filters and sorts replay up to 256 pending input events. Sorts use cached
 sort-key columns and index mappings, not full rows. A changed sort key may move a row; ordinary
 non-sort edits forward without reordering or scanning the source. Moves emit
 delete/insert pairs internally and can still require linear-time bookkeeping.
-Other view types expose no output history and their children rebuild when
-their parent version changes. See the [filter contract](INCREMENTAL_FILTER_PIPELINE.md)
+Aggregates also publish group-coordinate history (used by Rust children of an
+aggregate; Python cannot chain views over one). Other view types expose no
+output history and their children rebuild when their parent version changes.
+See the [filter contract](INCREMENTAL_FILTER_PIPELINE.md)
 and [sorted pipeline contract](INCREMENTAL_SORTED_PIPELINE.md).
 
 ### ✅ Serialization (CSV/JSON)
@@ -1072,8 +1074,8 @@ amount = row["right_amount"]     # From right table (prefixed!)
 
 Current project-level gaps include persistence, parallel view execution, SQL
 query planning, and a published API compatibility policy. Pipeline delta
-delivery is implemented for base/filter/sort nodes; groups retain snapshots and
-derived-row identity remains planned. The optional WebSocket server is documented in
+delivery is implemented for base/filter/sort/group nodes; stable derived-row
+identity remains planned. The optional WebSocket server is documented in
 [WEBSOCKET_PROTOCOL.md](WEBSOCKET_PROTOCOL.md).
 
 ## Contributing

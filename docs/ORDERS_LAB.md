@@ -1,6 +1,6 @@
 # LiveTable Orders Lab
 
-A local demonstration of the real Rust engine and protocol-v3 client. It replaces
+A local demonstration of the real Rust engine and protocol-v4 client. It replaces
 the Forward Prop Demo; the redesigned editor lives at `/#editor` on the separate
 `demo` table. No user data is needed.
 
@@ -52,9 +52,9 @@ are business data; only base snapshot `row_id` values authorize mutations.
 Start at the default $1,000 threshold and run each numbered scenario:
 
 1. **Selective propagation:** edit a below-threshold order. Observe a base delta
-   and no filter/sort delivery. A group snapshot can still be sent.
+   and no filter, sort, or group delivery.
 2. **Incremental membership:** promote an order above the threshold. Filter and
-   ranked results receive insertions.
+   ranked results receive insertions; regional totals receive a group delta.
 3. **Incremental ordering:** move a qualifying order to rank one. Inspect the
    ranked delta's delete and insert operations.
 4. **Independent clients:** open client B, defaulting to a $2,500 threshold. Run
@@ -137,8 +137,8 @@ editor. Data is in memory and is lost when the server restarts.
   latency or cross-machine timestamp subtraction.
 - **Trace:** only the latest 80 summaries; raw snapshot payloads are not retained.
 
-Initial/repair snapshots remain O(N), unchunked transfers; groups still send
-snapshots. Client deltas shallow-copy row arrays. Virtualization bounds DOM work,
+Initial/repair snapshots remain O(N), unchunked transfers. Derived rows,
+including groups, have no stable row identity. Client deltas shallow-copy row arrays. Virtualization bounds DOM work,
 not all client-state work. The storage panel points to the separate measured
 [column-layout benchmark](TYPED_COLUMN_STORAGE.md), not a fabricated memory gauge.
 Use the [delivery benchmark](PIPELINE_DELIVERY.md) for controlled comparisons;
@@ -146,7 +146,7 @@ its workload and measurement scope differ. Neither is a latency guarantee.
 
 ## Demo control extension
 
-The additive protocol-v3 `LabCommand` extension cannot select a table: it always
+The additive `LabCommand` extension (since protocol v3) cannot select a table: it always
 targets the opt-in `lab`. Example requests:
 
 ```json

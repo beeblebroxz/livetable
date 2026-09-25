@@ -259,8 +259,8 @@ pub enum ServerMessage {
 }
 
 /// Current server→client wire-protocol version. Bump on breaking changes to
-/// message shapes or semantics.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// message shapes or semantics. v4: group nodes receive `ViewDelta`s.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -273,7 +273,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"protocol_version\":3"), "got: {}", json);
+        assert!(json.contains("\"protocol_version\":4"), "got: {}", json);
         assert!(json.contains("\"type\":\"Subscribed\""), "got: {}", json);
     }
 

@@ -381,6 +381,27 @@ describe('usePipeline', () => {
     expect(repairs(socket)).toHaveLength(0);
   });
 
+  it('applies group deltas: emptied, updated, and new groups', async () => {
+    const nodes: ViewNodeSpec[] = [{ id: 'regions', source_id: 'base', kind: 'group', group_by: ['region'],
+      aggs: [{ alias: 'total', op: 'sum', column: 'amount' }] }];
+    const group = (region: string, total: number) => ({ row_id: null, row: { region, total } });
+    render(<Harness nodes={nodes} />);
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.open();
+      socket.receive({ ...snapshot(), node_id: 'regions', kind: 'group', columns: ['region', 'total'],
+        rows: [group('West', 300), group('East', 200)] });
+      socket.receive({ ...delta(0, [
+        { type: 'RowDeleted', index: 0 },
+        { type: 'CellUpdated', index: 0, column: 'total', value: 250 },
+        { type: 'RowInserted', index: 1, row: group('North', 90) },
+      ]), node_id: 'regions' });
+    });
+    expect(currentSnapshots().regions.rows).toEqual([group('East', 250), group('North', 90)]);
+    expect(currentSnapshots().regions.seq).toBe(1);
+    expect(repairs(socket)).toHaveLength(0);
+  });
+
   it('clears another table’s data immediately and ignores unknown-node errors', async () => {
     const { rerender } = render(<Harness />);
     const first = FakeWebSocket.instances[0];

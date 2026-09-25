@@ -18,14 +18,14 @@ export function labPipeline(threshold: number): ViewNodeSpec[] {
 
 export const SCENARIOS = [
   { id: 'excluded', number: '01', title: 'Change less. Send less.', tag: 'Selective propagation',
-    description: 'Edit an order below your threshold. The base changes, but the filter and ranked view need no delivery.',
-    action: 'Run excluded edit', expected: 'Base delta · no filter or sort delivery · group may snapshot' },
+    description: 'Edit an order below your threshold. The base changes, but the filter, ranked view and regional totals need no delivery.',
+    action: 'Run excluded edit', expected: 'Base delta · no filter, sort or group delivery' },
   { id: 'crossing', number: '02', title: 'Cross the threshold.', tag: 'Incremental membership',
     description: 'Promote a small order into the high-value queue. Follow its insertion into the filter and ranked branch.',
-    action: 'Promote an order', expected: 'Base update · filter insertion · ranked insertion · group snapshot' },
+    action: 'Promote an order', expected: 'Base update · filter insertion · ranked insertion · group delta' },
   { id: 'ranked', number: '03', title: 'Make a move.', tag: 'Incremental ordering',
     description: 'Raise a qualifying order to the top. The ranked view delivers a delete and an insert, not the entire table.',
-    action: 'Move an order to #1', expected: 'Base update · filter update · sorted move · group snapshot' },
+    action: 'Move an order to #1', expected: 'Base update · filter update · sorted move · group delta' },
   { id: 'clients', number: '04', title: 'One source. Two perspectives.', tag: 'Independent clients',
     description: 'Open a second client with a different threshold. Run a mixed batch here and watch both independent pipelines respond.',
     action: 'Run shared batch', expected: 'Shared source data · connection-local views and delivery sequences' },

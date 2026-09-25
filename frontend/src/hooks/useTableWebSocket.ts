@@ -29,7 +29,7 @@ export const MAX_PENDING_DELTAS = 500;
 // Wire-protocol version this client understands. The server reports its own
 // in the Subscribed handshake; a mismatch is logged so protocol drift is
 // visible instead of failing mysteriously.
-export const SUPPORTED_PROTOCOL_VERSION = 3;
+export const SUPPORTED_PROTOCOL_VERSION = 4;
 
 export const MAX_VIEW_DELTA_CHANGES = 512;
 

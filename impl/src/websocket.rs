@@ -617,22 +617,25 @@ mod tests {
         let totals: Vec<_> = messages
             .iter()
             .filter(|message| {
-                matches!(message, ServerMessage::ViewData { node_id, .. } if node_id == "totals")
+                matches!(message, ServerMessage::ViewData { node_id, .. } | ServerMessage::ViewDelta { node_id, .. } if node_id == "totals")
             })
             .collect();
-        assert_eq!(totals.len(), 2, "initial snapshot plus mutation snapshot");
-        let ServerMessage::ViewData {
+        assert_eq!(totals.len(), 2, "initial snapshot plus mutation delta");
+        assert!(matches!(totals[0], ServerMessage::ViewData { .. }));
+        let ServerMessage::ViewDelta {
             pipeline_generation,
-            rows,
+            changes,
             ..
         } = totals[1]
         else {
-            unreachable!()
+            panic!("expected a group delta after the initial snapshot")
         };
         assert_eq!(*pipeline_generation, 9);
-        assert!(rows
-            .iter()
-            .any(|row| { row.row["region"] == json!("West") && row.row["total"] == json!(300.0) }));
+        let [crate::messages::ViewChange::RowInserted { index: 1, row }] = &changes[..] else {
+            panic!("expected one West group appended after East");
+        };
+        assert_eq!(row.row["region"], json!("West"));
+        assert_eq!(row.row["total"], json!(300.0));
     }
 
     #[actix::test]
@@ -682,7 +685,7 @@ mod tests {
         assert!(messages.iter().any(|message| matches!(
             message,
             ServerMessage::Subscribed {
-                protocol_version: 3,
+                protocol_version: 4,
                 ..
             }
         )));

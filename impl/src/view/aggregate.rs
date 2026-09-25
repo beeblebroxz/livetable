@@ -1,6 +1,6 @@
 //! AggregateView — GROUP BY with incrementally maintained aggregates.
 
-use crate::changeset::{IncrementalView, TableChange};
+use crate::changeset::{Changeset, IncrementalView, TableChange};
 use crate::column::{ColumnType, ColumnValue};
 use crate::filter_changes::{row_after_update, MAX_FILTER_REPLAY_CHANGES};
 use crate::readable::ReadableTable;
@@ -48,6 +48,32 @@ pub struct AggregateView {
     sync_count: u64,
     /// Parent version() observed at the last sync/rebuild.
     last_parent_version: u64,
+    /// The latest incremental batch in GROUP coordinates (group_order
+    /// positions). Rebuilds invalidate it; consumers must then refresh.
+    output_changes: Changeset,
+}
+
+/// One group's output row: key columns plus aggregate results.
+type Row = HashMap<String, ColumnValue>;
+
+/// How one incremental batch has touched a group so far. Output is a net diff:
+/// deletions are emitted as they happen, updates and insertions at batch end.
+enum Touch {
+    /// Existed before the batch; holds its output row from before any change.
+    Existing(Row),
+    /// Created during the batch (including re-creating a deleted key).
+    New,
+    /// Removed during the batch; any RowDeleted has already been emitted.
+    Deleted,
+}
+
+/// Result equality for output diffs. Floats compare by bits, so a NaN result
+/// (e.g. SUM of +inf and -inf) is not re-emitted on every touch.
+fn same_value(old: &ColumnValue, new: &ColumnValue) -> bool {
+    match (old, new) {
+        (ColumnValue::Float64(old), ColumnValue::Float64(new)) => old.to_bits() == new.to_bits(),
+        _ => old == new,
+    }
 }
 
 /// Temporary identities for a batch with multiple insertions/deletions. Old
@@ -153,6 +179,7 @@ impl AggregateView {
             last_processed_change_count: change_count,
             sync_count: 0,
             last_parent_version: parent_version,
+            output_changes: Changeset::new(),
         };
         view.rebuild_index();
         Ok(view)
@@ -228,11 +255,10 @@ impl AggregateView {
 
                 // Get or create group state directly with int key
                 let is_new_group = !int_groups.contains_key(&group_val);
-                let state = int_groups.entry(group_val).or_insert_with(|| {
-                    let mut gs = GroupState::new();
-                    gs.percentile_columns = pct_cols.clone();
-                    gs
-                });
+                let position = int_group_order.len();
+                let state = int_groups
+                    .entry(group_val)
+                    .or_insert_with(|| GroupState::new(position, pct_cols.clone()));
                 state.row_indices.insert(row_idx);
 
                 // Add aggregation value(s)
@@ -286,11 +312,11 @@ impl AggregateView {
                     .collect();
 
                 let is_new_group = !self.groups.contains_key(&key);
-                let state = self.groups.entry(key.clone()).or_insert_with(|| {
-                    let mut gs = GroupState::new();
-                    gs.percentile_columns = pct_cols.clone();
-                    gs
-                });
+                let position = self.group_order.len();
+                let state = self
+                    .groups
+                    .entry(key.clone())
+                    .or_insert_with(|| GroupState::new(position, pct_cols.clone()));
                 state.row_indices.insert(row_idx);
 
                 for (source_col, num) in col_values {
@@ -308,6 +334,7 @@ impl AggregateView {
         self.last_synced_generation = generation;
         self.last_processed_change_count = change_count;
         self.last_parent_version = parent_version;
+        self.output_changes.invalidate();
         self.sync_count += 1;
     }
 
@@ -352,8 +379,14 @@ impl AggregateView {
             .collect()
     }
 
-    fn add_row_to_aggregates(&mut self, row_idx: usize, row: &HashMap<String, ColumnValue>) {
+    fn add_row_to_aggregates(
+        &mut self,
+        row_idx: usize,
+        row: &HashMap<String, ColumnValue>,
+        touched: &mut HashMap<GroupKey, Touch>,
+    ) {
         let key = GroupKey::from_row(row, &self.group_by_columns);
+        self.touch_existing(&key, touched);
 
         // Track which group this row belongs to
         self.row_to_group.insert(row_idx, key.clone());
@@ -372,11 +405,11 @@ impl AggregateView {
         // Get or create group state
         let is_new_group = !self.groups.contains_key(&key);
         let pct_cols = self.percentile_source_columns();
-        let state = self.groups.entry(key.clone()).or_insert_with(|| {
-            let mut gs = GroupState::new();
-            gs.percentile_columns = pct_cols;
-            gs
-        });
+        let position = self.group_order.len();
+        let state = self
+            .groups
+            .entry(key.clone())
+            .or_insert_with(|| GroupState::new(position, pct_cols));
 
         // Add row index to group
         state.row_indices.insert(row_idx);
@@ -388,6 +421,7 @@ impl AggregateView {
 
         // Track group order
         if is_new_group {
+            touched.insert(key.clone(), Touch::New);
             self.group_order.push(key);
         }
     }
@@ -397,8 +431,10 @@ impl AggregateView {
         row_idx: usize,
         row: &HashMap<String, ColumnValue>,
         pending_recalc: &mut HashSet<(GroupKey, String)>,
+        touched: &mut HashMap<GroupKey, Touch>,
     ) -> bool {
         let key = GroupKey::from_row(row, &self.group_by_columns);
+        self.touch_existing(&key, touched);
 
         // Remove from row_to_group
         self.row_to_group.remove(&row_idx);
@@ -427,8 +463,7 @@ impl AggregateView {
 
             // If group is now empty, remove it
             if state.row_indices.is_empty() {
-                self.groups.remove(&key);
-                self.group_order.retain(|k| k != &key);
+                self.remove_group(&key, touched);
                 return true;
             }
 
@@ -443,6 +478,93 @@ impl AggregateView {
         } else {
             false
         }
+    }
+
+    /// Record an existing group's output row the first time a batch touches
+    /// it, before any change, as the old side of the batch's net diff.
+    fn touch_existing(&self, key: &GroupKey, touched: &mut HashMap<GroupKey, Touch>) {
+        if !touched.contains_key(key) && self.groups.contains_key(key) {
+            touched.insert(key.clone(), Touch::Existing(self.row_for_key(key)));
+        }
+    }
+
+    /// Remove an emptied group. Groups created in this batch sit after every
+    /// pre-batch group, so an existing group's position here is also its row
+    /// index for a consumer that has applied the deletions emitted so far.
+    fn remove_group(&mut self, key: &GroupKey, touched: &mut HashMap<GroupKey, Touch>) {
+        let Some(state) = self.groups.remove(key) else {
+            return;
+        };
+        let position = state.position;
+        debug_assert!(self.group_order[position] == *key, "stale group position");
+        self.group_order.remove(position);
+        for moved in &self.group_order[position..] {
+            if let Some(state) = self.groups.get_mut(moved) {
+                state.position -= 1;
+            }
+        }
+        if let Some(Touch::Existing(data)) = touched.insert(key.clone(), Touch::Deleted) {
+            self.output_changes.push(TableChange::RowDeleted {
+                index: position,
+                data,
+            });
+        }
+    }
+
+    /// After a batch's structural changes and deferred MIN/MAX recalcs, emit
+    /// changed result cells of surviving groups, then insertions of new ones.
+    /// Ascending positions put every update before the new groups at the tail.
+    fn emit_batch_output(&mut self, touched: HashMap<GroupKey, Touch>) {
+        let mut survivors: Vec<(usize, GroupKey, Option<Row>)> = touched
+            .into_iter()
+            .filter_map(|(key, touch)| {
+                let before = match touch {
+                    Touch::Existing(row) => Some(row),
+                    Touch::New => None,
+                    Touch::Deleted => return None,
+                };
+                let position = self.groups.get(&key)?.position;
+                Some((position, key, before))
+            })
+            .collect();
+        survivors.sort_unstable_by_key(|(position, _, _)| *position);
+
+        for (position, key, before) in survivors {
+            let Some(mut before) = before else {
+                let data = self.row_for_key(&key);
+                self.output_changes.push(TableChange::RowInserted {
+                    index: position,
+                    data,
+                });
+                continue;
+            };
+            let state = &self.groups[&key];
+            for (result_col, source_col, func) in &self.aggregations {
+                let new_value = state.get_result(source_col, *func);
+                let old_value = before.remove(result_col).unwrap_or(ColumnValue::Null);
+                if !same_value(&old_value, &new_value) {
+                    self.output_changes.push(TableChange::CellUpdated {
+                        row: position,
+                        column: result_col.clone(),
+                        old_value,
+                        new_value,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Output row for a group: its key columns plus aggregate results.
+    fn row_for_key(&self, key: &GroupKey) -> Row {
+        let mut result =
+            HashMap::with_capacity(self.group_by_columns.len() + self.aggregations.len());
+        result.extend(key.to_column_values(&self.group_by_columns));
+        if let Some(state) = self.groups.get(key) {
+            for (result_col, source_col, func) in &self.aggregations {
+                result.insert(result_col.clone(), state.get_result(source_col, *func));
+            }
+        }
+        result
     }
 
     fn recalculate_group_column_min_max(&mut self, key: &GroupKey, source_col: &str) {
@@ -535,18 +657,7 @@ impl AggregateView {
             return Err(format!("Index {} out of range [0, {})", index, self.len()));
         }
 
-        let key = &self.group_order[index];
-        let mut result =
-            HashMap::with_capacity(self.group_by_columns.len() + self.aggregations.len());
-        result.extend(key.to_column_values(&self.group_by_columns));
-
-        if let Some(state) = self.groups.get(key) {
-            for (result_col, source_col, func) in &self.aggregations {
-                result.insert(result_col.clone(), state.get_result(source_col, *func));
-            }
-        }
-
-        Ok(result)
+        Ok(self.row_for_key(&self.group_order[index]))
     }
 
     pub fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
@@ -604,6 +715,10 @@ impl AggregateView {
         };
 
         if changes.is_empty() {
+            // A filter can advance its ancestor version without emitting rows
+            // (an excluded edit). Keep retained history, but record the parent
+            // version so children and delivery still see a coherent baseline.
+            self.last_parent_version = parent.version();
             return false;
         }
 
@@ -681,6 +796,9 @@ impl IncrementalView for AggregateView {
         // mid-batch reads misaligned rows and yields a stale MIN/MAX. (Caught
         // by the forward_prop_fuzz differential test.)
         let mut pending_recalc: HashSet<(GroupKey, String)> = HashSet::new();
+        // Past every rebuild fallback: this batch replaces retained history.
+        self.output_changes.clear();
+        let mut touched: HashMap<GroupKey, Touch> = HashMap::new();
 
         for (change_index, change) in changes.iter().enumerate() {
             let row_id = batch_rows.as_ref().map_or_else(
@@ -694,13 +812,18 @@ impl IncrementalView for AggregateView {
                         self.adjust_indices_for_insert(*index);
                     }
                     // Add the new row to aggregates
-                    self.add_row_to_aggregates(row_id, data);
+                    self.add_row_to_aggregates(row_id, data, &mut touched);
                     modified = true;
                 }
 
                 TableChange::RowDeleted { index, data } => {
                     // Remove from aggregates (records any MIN/MAX recalc needed)
-                    self.remove_row_from_aggregates(row_id, data, &mut pending_recalc);
+                    self.remove_row_from_aggregates(
+                        row_id,
+                        data,
+                        &mut pending_recalc,
+                        &mut touched,
+                    );
                     // Adjust remaining row indices
                     if batch_rows.is_none() {
                         self.adjust_indices_for_delete(*index);
@@ -719,8 +842,13 @@ impl IncrementalView for AggregateView {
                         let new_row = &updated_rows[&change_index];
                         let mut old_row = new_row.clone();
                         old_row.insert(column.clone(), old_value.clone());
-                        self.remove_row_from_aggregates(row_id, &old_row, &mut pending_recalc);
-                        self.add_row_to_aggregates(row_id, new_row);
+                        self.remove_row_from_aggregates(
+                            row_id,
+                            &old_row,
+                            &mut pending_recalc,
+                            &mut touched,
+                        );
+                        self.add_row_to_aggregates(row_id, new_row, &mut touched);
                         modified = true;
                     } else {
                         // Check if aggregated column changed
@@ -729,6 +857,7 @@ impl IncrementalView for AggregateView {
                         if affects_aggregation {
                             // Update the aggregate values
                             if let Some(key) = self.row_to_group.get(&row_id).cloned() {
+                                self.touch_existing(&key, &mut touched);
                                 let mut needs_recalc = false;
 
                                 // Remove old value
@@ -792,6 +921,7 @@ impl IncrementalView for AggregateView {
         for (key, col) in &pending_recalc {
             self.recalculate_group_column_min_max(key, col);
         }
+        self.emit_batch_output(touched);
 
         modified
     }
@@ -881,5 +1011,10 @@ impl ReadableTable for AggregateView {
 
     fn version(&self) -> u64 {
         self.sync_count.wrapping_add(self.parent.borrow().version())
+    }
+
+    fn changeset(&self) -> Option<&Changeset> {
+        // Groups built from a stale parent are not a coherent baseline.
+        (self.parent.borrow().version() == self.last_parent_version).then_some(&self.output_changes)
     }
 }

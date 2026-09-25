@@ -178,8 +178,9 @@ The original proposal, rather than feeding directly into a "group by" table:
 2. Then forward propagates into a normal table that can be processed efficiently
 
 The current `AggregateView` instead exposes its own materialized group state
-through `ReadableTable`; it does not populate a separate root table or publish
-output changesets. SUM/COUNT/AVG maintain incremental state; requested extrema
+through `ReadableTable`; it does not populate a separate root table. It does
+publish a group-coordinate output changeset (a net diff per batch), so views
+and wire deliveries downstream of a group update incrementally. SUM/COUNT/AVG maintain incremental state; requested extrema
 may rescan a group, while percentiles maintain sorted values.
 
 ### Parallel Group By
@@ -246,6 +247,7 @@ items below remain original future ideas.
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)
 - [x] Protocol v2 server-computed view pipelines (per-connection filter/sort/group DAGs with generation-scoped snapshots)
 - [x] Protocol v3 base/filter/sort delta delivery, node-local baselines, snapshot fallback, and checkpoint-based resynchronization
+- [x] AggregateView output changesets and protocol v4 group deltas; filter/sort/join children of aggregates replay instead of rebuilding
 - [x] Local [Orders Lab](ORDERS_LAB.md): guided incremental/recovery scenarios, independent clients, virtualized 100k-row inspection and bounded synthetic streaming
 - [x] RIGHT and FULL OUTER joins
 - [x] Multi-column joins (composite key support)
@@ -255,7 +257,8 @@ items below remain original future ideas.
 
 ### Planned
 - [ ] General-purpose fully materialized row views (beyond existing key/group caches)
-- [ ] Aggregate WebSocket deltas and stable derived-row identity (groups still use snapshots)
+- [ ] Stable derived-row identity (filter/sort/group wire rows carry `row_id: null`)
+- [ ] Output changesets for join, projection, and computed views
 - [ ] Persistence and recovery
 - [ ] Parallel view execution
 - [ ] SQL/query-planning layer

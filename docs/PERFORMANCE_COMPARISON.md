@@ -15,7 +15,8 @@ as measurements of the recorded machine, commit, and workload, not guarantees.
 ### Pipeline WebSocket delivery
 
 The [delivery report](PIPELINE_DELIVERY.md) compares snapshot-only protocol v2
-with protocol-v3 deltas at the actual localhost WebSocket boundary. The Node
+with protocol-v3 deltas, and protocol v3 with protocol-v4 group deltas, at the
+actual localhost WebSocket boundary. The Node
 client uses the production delta reducer; timing ends at reconstructed client
 state, not React rendering. It reports JSON payload bytes and latency separately
 from periodic checkpoint traffic, with an identical seed/client harness on both

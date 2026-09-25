@@ -149,14 +149,17 @@ pub(super) struct GroupState {
     pub(super) row_indices: HashSet<usize>,
     /// Source columns that need sorted_values for percentile calculations
     pub(super) percentile_columns: HashSet<String>,
+    /// This group's index in the view's group order (its output row).
+    pub(super) position: usize,
 }
 
 impl GroupState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(position: usize, percentile_columns: HashSet<String>) -> Self {
         GroupState {
             column_stats: HashMap::new(),
             row_indices: HashSet::new(),
-            percentile_columns: HashSet::new(),
+            percentile_columns,
+            position,
         }
     }
 

@@ -39,7 +39,7 @@ This runs:
 
 1. Rust `clippy` for the core library, `server`, and `python` features
 2. Rust library tests with the `server` feature enabled
-3. Rust filter and sorted pipeline contract tests
+3. Rust filter, sorted, and aggregate pipeline contract tests
 4. Python unit and integration tests
 5. Frontend lint, Vitest, and production build
 
@@ -85,7 +85,10 @@ cargo test --features server --test filter_pipeline
 # Sorted-coordinate replay, move batches, downstream consumers, and bounded reads
 cargo test --features server --test sorted_pipeline
 
-# Real TCP/WebSocket protocol-v3 integration test
+# Aggregate group-coordinate history: net diffs, positions, and aggregate children
+cargo test --features server --test aggregate_pipeline
+
+# Real TCP/WebSocket pipeline integration test (protocol v4)
 cargo test --features server --test protocol_v3_websocket
 ```
 
@@ -175,7 +178,8 @@ Rust integration tests under `../impl/tests/`:
 - **forward_prop_fuzz.rs** - Differential randomized view propagation
 - **filter_pipeline.rs** - Filter output coordinates, bounded work, history, and compaction
 - **sorted_pipeline.rs** - Sorted-coordinate replay, move batches, and bounded source reads
-- **protocol_v3_websocket.rs** - Real WebSocket deltas/snapshots, lost-final-update repair, and connection/generation isolation
+- **aggregate_pipeline.rs** - Aggregate net-diff history, group positions, invalidation, and replaying children
+- **protocol_v3_websocket.rs** - Real WebSocket deltas (including groups), lost-final-update repair, and connection/generation isolation
 - **engine/delivery_tests.rs** - Reconstructed clients vs fresh pipelines across mixed batches, bounded-history fallback, and node recovery
 
 ## Test Coverage
@@ -194,7 +198,7 @@ Rust integration tests under `../impl/tests/`:
 ✅ `tick()` view registration and changeset compaction
 ✅ View chaining
 ✅ WebSocket row mutation semantics and snapshot/delta sequencing
-✅ Protocol-v3 pipeline deltas/snapshots and checkpoint-based repair across real TCP/WebSocket connections
+✅ Protocol-v4 pipeline deltas (base/filter/sort/group), snapshots, and checkpoint-based repair across real TCP/WebSocket connections
 ✅ Atomic client batches, stale/duplicate/gapped deliveries, bounded repair retries, generation cleanup, and delta-driven rendering
 ✅ Real-world workflows
 ✅ Performance with 1000+ rows
@@ -264,8 +268,8 @@ It runs:
 2. Rust `clippy` with `-D warnings` for the `server` feature
 3. Rust `clippy` with `-D warnings` for the `python` feature
 4. Rust library tests with the `server` feature enabled
-5. Filter/sorted pipeline contracts and randomized forward-propagation tests
-6. The protocol-v3 real-WebSocket integration test
+5. Filter/sorted/aggregate pipeline contracts and randomized forward-propagation tests
+6. The real-WebSocket pipeline integration test
 7. Python package build plus pytest suite on Python 3.12
 8. Frontend lint, Vitest, and production build
 

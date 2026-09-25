@@ -50,8 +50,8 @@ jobs:
       - name: Check incremental filter pipeline contracts
         run: cargo test --manifest-path impl/Cargo.toml --features server --test filter_pipeline
 
-      - name: Check sorted pipeline contracts and randomized propagation
-        run: cargo test --manifest-path impl/Cargo.toml --features server --test sorted_pipeline --test forward_prop_fuzz
+      - name: Check sorted/aggregate pipeline contracts and randomized propagation
+        run: cargo test --manifest-path impl/Cargo.toml --features server --test sorted_pipeline --test aggregate_pipeline --test forward_prop_fuzz
 
       - name: Build Python wheel
         env:

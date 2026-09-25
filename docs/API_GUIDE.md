@@ -309,6 +309,9 @@ missing history, or an incoherent baseline trigger a full rebuild. Sort moves
 emit a delete/insert pair, so a 256-event input batch can produce 512 events;
 a downstream filter/sort may consequently rebuild. Aggregates batch structural
 index remapping for up to 512 events; requested MIN/MAX can still rescan a group.
+An aggregate's `changeset()` holds each batch's net diff in group coordinates:
+changed result cells, deleted emptied groups, and new groups appended at the end.
+Filters, sorts, and joins built on an aggregate replay that history.
 These are bounded incremental paths, not constant-time guarantees: structural
 changes still shift indices. See the [filter](INCREMENTAL_FILTER_PIPELINE.md)
 and [sorted](INCREMENTAL_SORTED_PIPELINE.md) contracts for limits and measurements.
@@ -331,9 +334,10 @@ counters from different streams.
 |----------|-----------------------------|
 | Table | Root-coordinate mutation events |
 | Synchronized filter/sort | Own-coordinate events; one successful nonempty input batch retained |
-| Projection, computed, join, aggregate | No output changeset; children use version-checked rebuilds |
+| Synchronized aggregate | Group-coordinate net diff of the latest nonempty input batch |
+| Projection, computed, join | No output changeset; children use version-checked rebuilds |
 
-No-op sync preserves filter/sort history. Rebuild/refresh invalidates it even
+No-op sync preserves filter/sort/aggregate history. Rebuild/refresh invalidates it even
 for a caught-up consumer. A child constructed from a stale parent must rebuild
 after that parent synchronizes. Versions include ancestors independently of
 output event counts: a filtered-out mutation can advance a version without

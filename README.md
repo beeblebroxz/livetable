@@ -28,7 +28,7 @@ guarantees. See [Performance and Benchmarking](docs/PERFORMANCE_COMPARISON.md).
 - **Shared-source views** - Views read source rows while caching indices, sort keys, or aggregate state as needed
 - **Reactive updates** - `tick()` incrementally synchronizes registered views
 - **Incremental sorted pipelines** - Small batches propagate through filter → sort → group
-- **Incremental browser delivery** - Protocol-v3 base/filter/sort deltas with snapshot recovery
+- **Incremental browser delivery** - Protocol-v4 base/filter/sort/group deltas with snapshot recovery
 - **Type safety** - Schema-enforced types catch errors early
 - **Pythonic API** - Natural Python syntax with indexing, slicing, and iteration
 
@@ -176,11 +176,12 @@ In Rust, any view can parent any other view — every view implements the
 `ReadableTable` trait (`FilterView`, `SortedView`, `AggregateView`, `JoinView`,
 `ProjectionView`, `ComputedView`, and `Table` itself).
 
-Filters and sorted views publish changesets, allowing
+Filters, sorted views, and aggregates publish changesets, allowing
 `table -> filter -> sort -> group_by` to update incrementally in Rust and Python.
+Rust filters, sorts, and joins over an aggregate replay its changed groups.
 Small batches evaluate only changed rows; an edit that stays outside the filter
-produces no downstream changes in these engine stages. Protocol v3 also suppresses
-empty filter/sort deliveries; aggregate nodes still use snapshots.
+produces no downstream changes in these engine stages. Protocol v4 also suppresses
+empty filter/sort/group deliveries and sends groups deltas.
 Each filter/sort retains one batch of history and rebuilds for more than 256
 input changes or unavailable history. Sorts cache only sort-key columns and
 index mappings, not complete source rows. Non-sort edits forward without a
@@ -375,8 +376,8 @@ recovery. The redesigned table editor lives at `/#editor` on the separate `demo`
 table, with keyboard-first cells, local search/sort, paginated rows, a record
 inspector and visible server confirmations.
 See the [lab guide](docs/ORDERS_LAB.md) for the tour and measurement boundaries.
-Protocol-v3 base/filter/sort nodes receive ordered deltas; groups retain
-snapshots. Pipeline replacement remains debounced and generation-scoped.
+Protocol-v4 base/filter/sort/group nodes receive ordered deltas. Pipeline
+replacement remains debounced and generation-scoped.
 
 Quick launch: `cd frontend && npm install && npm run lab`. This builds the
 release Rust server and runs both services on loopback; Ctrl+C stops them.
@@ -393,7 +394,7 @@ npm install && npm run dev
 
 Open `http://127.0.0.1:5173`. The client connects to `ws://<current-host>:8080/ws` by default. Set
 `VITE_LIVETABLE_WS_URL=ws://host:port/ws` when starting Vite to override it.
-See [WebSocket Protocol v3](docs/WEBSOCKET_PROTOCOL.md) for message schemas and
+See [WebSocket Protocol v4](docs/WEBSOCKET_PROTOCOL.md) for message schemas and
 reconciliation rules.
 
 Lab reset affects shared synthetic `lab` data and requires UI confirmation.
@@ -458,7 +459,7 @@ livetable/
 - [Filter propagation contract](docs/INCREMENTAL_FILTER_PIPELINE.md)
 - [Sorted pipeline contract and benchmarks](docs/INCREMENTAL_SORTED_PIPELINE.md)
 - [Join semantics](docs/JOIN_FEATURE.md)
-- [WebSocket protocol v3](docs/WEBSOCKET_PROTOCOL.md)
+- [WebSocket protocol v4](docs/WEBSOCKET_PROTOCOL.md)
 - [Test matrix](tests/README.md)
 
 ## License

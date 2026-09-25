@@ -227,7 +227,7 @@ async fn protocol_v3_pipeline_crosses_real_websocket_boundary() {
         let message = socket.receive_json().await;
         match message["type"].as_str() {
             Some("Subscribed") => {
-                assert_eq!(message["protocol_version"], 3);
+                assert_eq!(message["protocol_version"], 4);
                 subscribed = true;
             }
             Some("ViewData") => {
@@ -253,7 +253,8 @@ async fn protocol_v3_pipeline_crosses_real_websocket_boundary() {
         }))
         .await;
     let inserted_group = socket.receive_view("g").await;
-    let west = inserted_group["rows"]
+    assert_eq!(inserted_group["type"], "ViewDelta");
+    let west = socket.snapshots["g"]["rows"]
         .as_array()
         .unwrap()
         .iter()
@@ -290,7 +291,8 @@ async fn protocol_v3_pipeline_crosses_real_websocket_boundary() {
         }))
         .await;
     let updated_group = socket.receive_view("g").await;
-    assert!(updated_group["rows"]
+    assert_eq!(updated_group["type"], "ViewDelta");
+    assert!(socket.snapshots["g"]["rows"]
         .as_array()
         .unwrap()
         .iter()
