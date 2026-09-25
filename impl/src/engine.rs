@@ -59,6 +59,8 @@ struct Pipeline {
 struct BaseState {
     table: Rc<RefCell<Table>>,
     tickable: TickableTable,
+    // Strictly increasing: IDs come from next_row_id and are appended only, so
+    // row_index_by_id can binary search.
     row_ids: Vec<u64>,
     next_row_id: u64,
     pipelines: HashMap<ConnId, Pipeline>,
@@ -83,9 +85,7 @@ impl BaseState {
     }
 
     fn row_index_by_id(&self, row_id: u64) -> Option<usize> {
-        self.row_ids
-            .iter()
-            .position(|candidate| *candidate == row_id)
+        self.row_ids.binary_search(&row_id).ok()
     }
 
     fn base_seq(&self) -> u64 {
@@ -929,6 +929,46 @@ mod tests {
         };
         assert!(inserted > deleted);
         assert_eq!(row_id, 3);
+    }
+
+    #[test]
+    fn mutations_reject_ids_that_are_deleted_or_never_assigned() {
+        let mut engine = TableEngine::new();
+        engine
+            .insert_row(
+                "demo",
+                HashMap::from([
+                    ("region".into(), json!("North")),
+                    ("product".into(), json!("New")),
+                    ("amount".into(), json!(50.0)),
+                ]),
+            )
+            .unwrap();
+        engine.delete_row("demo", 2).unwrap(); // live IDs: [1, 3]
+
+        // Below the range, a deleted gap, above the range, and the maximum.
+        for missing in [0, 2, 4, u64::MAX] {
+            let expected = format!("Row '{missing}' not found");
+            assert_eq!(
+                engine
+                    .update_cell("demo", missing, "amount", &json!(9.0))
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(engine.delete_row("demo", missing).unwrap_err(), expected);
+        }
+
+        engine
+            .update_cell("demo", 3, "amount", &json!(7.0))
+            .unwrap();
+        let ServerMessage::TableData { rows, .. } = engine.query_table("demo").unwrap() else {
+            panic!("expected table data")
+        };
+        let ids_and_amounts: Vec<_> = rows
+            .iter()
+            .map(|row| (row.row_id, row.row["amount"].clone()))
+            .collect();
+        assert_eq!(ids_and_amounts, [(1, json!(100.5)), (3, json!(7.0))]);
     }
 
     #[test]

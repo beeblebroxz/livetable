@@ -78,8 +78,8 @@ impl TableEngine {
                 }
                 let base = self.bases.get_mut(LAB_TABLE).unwrap();
                 let old_len = base.row_ids.len();
-                // Tail deletion is O(1) for these buffers and avoids O(N²) ID
-                // lookups. Keep the same table, monotonic IDs and change clock;
+                // Tail deletion is O(1) for these buffers; front deletion would
+                // shift O(N) per row. Keep the same table, monotonic IDs and change clock;
                 // existing clients recover through ordinary fallback snapshots.
                 for index in (0..old_len).rev() {
                     base.table.borrow_mut().delete_row(index)?;

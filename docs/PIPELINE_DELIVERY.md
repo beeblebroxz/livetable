@@ -88,8 +88,9 @@ One connection subscribes to the base plus filter → descending sort → SUM(gr
 pipeline. About half the rows qualify. The seed has repeated region labels,
 numeric amounts, and unique product labels.
 Excluded edits target base ID 1; included product edits and sort-key moves
-target ID 2. These early IDs keep the server's linear ID lookup near its best
-case; the benchmark is not a random-row-access measurement.
+target ID 2. In the recorded runs, these early IDs kept the server's then-linear
+ID lookup near its best case (lookup is now a binary search over sorted IDs);
+the benchmark is not a random-row-access measurement.
 
 Each sample measures sending an update through the real server and receiving,
 parsing, and reconstructing client state through the final group snapshot.
