@@ -432,6 +432,7 @@ impl AggregateView {
         row: &HashMap<String, ColumnValue>,
         pending_recalc: &mut HashSet<(GroupKey, String)>,
         touched: &mut HashMap<GroupKey, Touch>,
+        removed_slots: &mut Vec<usize>,
     ) -> bool {
         let key = GroupKey::from_row(row, &self.group_by_columns);
         self.touch_existing(&key, touched);
@@ -463,7 +464,7 @@ impl AggregateView {
 
             // If group is now empty, remove it
             if state.row_indices.is_empty() {
-                self.remove_group(&key, touched);
+                self.remove_group(&key, touched, removed_slots);
                 return true;
             }
 
@@ -488,26 +489,49 @@ impl AggregateView {
         }
     }
 
-    /// Remove an emptied group. Groups created in this batch sit after every
-    /// pre-batch group, so an existing group's position here is also its row
-    /// index for a consumer that has applied the deletions emitted so far.
-    fn remove_group(&mut self, key: &GroupKey, touched: &mut HashMap<GroupKey, Touch>) {
+    /// Remove an emptied group. Its slot stays in `group_order` until the
+    /// batch ends (`compact_group_order`), so no other position shifts per
+    /// removal. Groups created in this batch sit after every pre-batch group,
+    /// so a pre-batch group's row index, for a consumer that has applied the
+    /// deletions emitted so far, is its slot minus earlier removed slots.
+    fn remove_group(
+        &mut self,
+        key: &GroupKey,
+        touched: &mut HashMap<GroupKey, Touch>,
+        removed_slots: &mut Vec<usize>,
+    ) {
         let Some(state) = self.groups.remove(key) else {
             return;
         };
-        let position = state.position;
-        debug_assert!(self.group_order[position] == *key, "stale group position");
-        self.group_order.remove(position);
-        for moved in &self.group_order[position..] {
-            if let Some(state) = self.groups.get_mut(moved) {
-                state.position -= 1;
-            }
-        }
+        let slot = state.position;
+        debug_assert!(self.group_order[slot] == *key, "stale group position");
+        let removed_before = removed_slots.partition_point(|&removed| removed < slot);
+        removed_slots.insert(removed_before, slot);
         if let Some(Touch::Existing(data)) = touched.insert(key.clone(), Touch::Deleted) {
             self.output_changes.push(TableChange::RowDeleted {
-                index: position,
+                index: slot - removed_before,
                 data,
             });
+        }
+    }
+
+    /// Drop the sorted slots of groups removed during a batch, then renumber
+    /// the groups after the first one once.
+    fn compact_group_order(&mut self, removed_slots: &[usize]) {
+        let Some(&first) = removed_slots.first() else {
+            return;
+        };
+        let mut removed = removed_slots.iter().peekable();
+        let mut slot = 0;
+        self.group_order.retain(|_| {
+            let keep = removed.next_if_eq(&&slot).is_none();
+            slot += 1;
+            keep
+        });
+        for (position, key) in self.group_order.iter().enumerate().skip(first) {
+            if let Some(state) = self.groups.get_mut(key) {
+                state.position = position;
+            }
         }
     }
 
@@ -769,14 +793,19 @@ impl IncrementalView for AggregateView {
         // each event makes even a small batch slower than a rebuild. Simulate
         // bounded batches with cheap vector shifts and rehash just once.
         // The doubled bound also covers 256 sort updates emitting 512 events.
-        let batch_rows = if changes.len() <= MAX_FILTER_REPLAY_CHANGES * 2
-            && changes
-                .iter()
-                .filter(|c| c.shifts_indices())
-                .take(2)
-                .count()
-                == 2
-        {
+        // Beyond it, per-event reindexing costs O(rows) each: rebuild instead.
+        let multiple_shifts = changes
+            .iter()
+            .filter(|c| c.shifts_indices())
+            .take(2)
+            .count()
+            == 2;
+        let batch_rows = if !multiple_shifts {
+            None
+        } else if changes.len() > MAX_FILTER_REPLAY_CHANGES * 2 {
+            self.rebuild_index();
+            return true;
+        } else {
             let prepared = BatchRowMapping::new(self.parent.borrow().len(), changes);
             match prepared {
                 Some(mapping) => Some(mapping),
@@ -785,8 +814,6 @@ impl IncrementalView for AggregateView {
                     return true;
                 }
             }
-        } else {
-            None
         };
         let mut modified = false;
         // MIN/MAX (and sorted_values) recalcs are DEFERRED to the end of the
@@ -799,6 +826,7 @@ impl IncrementalView for AggregateView {
         // Past every rebuild fallback: this batch replaces retained history.
         self.output_changes.clear();
         let mut touched: HashMap<GroupKey, Touch> = HashMap::new();
+        let mut removed_slots: Vec<usize> = Vec::new();
 
         for (change_index, change) in changes.iter().enumerate() {
             let row_id = batch_rows.as_ref().map_or_else(
@@ -823,6 +851,7 @@ impl IncrementalView for AggregateView {
                         data,
                         &mut pending_recalc,
                         &mut touched,
+                        &mut removed_slots,
                     );
                     // Adjust remaining row indices
                     if batch_rows.is_none() {
@@ -847,6 +876,7 @@ impl IncrementalView for AggregateView {
                             &old_row,
                             &mut pending_recalc,
                             &mut touched,
+                            &mut removed_slots,
                         );
                         self.add_row_to_aggregates(row_id, new_row, &mut touched);
                         modified = true;
@@ -921,6 +951,7 @@ impl IncrementalView for AggregateView {
         for (key, col) in &pending_recalc {
             self.recalculate_group_column_min_max(key, col);
         }
+        self.compact_group_order(&removed_slots);
         self.emit_batch_output(touched);
 
         modified

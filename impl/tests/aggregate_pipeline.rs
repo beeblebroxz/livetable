@@ -251,6 +251,46 @@ fn removing_a_group_shifts_the_index_of_later_groups() {
 }
 
 #[test]
+fn out_of_order_removals_index_the_groups_still_present() {
+    let rows = [("A", 1), ("B", 2), ("C", 3), ("D", 4), ("E", 5)];
+    let table = orders(&rows);
+    let mut view = by_region(table.clone());
+    let changes = sync_replayed(&mut view, || {
+        let mut table = table.borrow_mut();
+        table.delete_row(3).unwrap(); // D
+        table.append_row(order("F", 6)).unwrap();
+        table.delete_row(4).unwrap(); // F, created and emptied in the batch
+        table.delete_row(1).unwrap(); // B
+        table.delete_row(2).unwrap(); // E
+    });
+    let deleted = |index, region, amount: i32| TableChange::RowDeleted {
+        index,
+        data: group(region, amount.into(), 1, amount.into()),
+    };
+    assert_eq!(
+        changes,
+        [deleted(3, "D", 4), deleted(1, "B", 2), deleted(2, "E", 5)]
+    );
+}
+
+#[test]
+fn shifting_batches_over_the_replay_bound_rebuild() {
+    let rows: Vec<(String, i32)> = (0..600).map(|i| (format!("g{i}"), i)).collect();
+    let rows: Vec<(&str, i32)> = rows.iter().map(|(g, v)| (g.as_str(), *v)).collect();
+    let table = orders(&rows);
+    let mut view = by_region(table.clone());
+    let cursor = view.changeset().unwrap().total_len();
+    for _ in 0..513 {
+        table.borrow_mut().delete_row(0).unwrap();
+    }
+    view.sync();
+    // Reindexing per event costs O(rows) each; a rebuild invalidates history.
+    assert!(view.changeset().unwrap().changes_from(cursor).is_none());
+    assert_eq!(view.len(), 87);
+    assert_eq!(view.get_row(0).unwrap(), group("g513", 513.0, 1, 513.0));
+}
+
+#[test]
 fn moving_a_row_between_groups_updates_both_in_group_order() {
     let table = orders(&[("West", 10), ("East", 20), ("West", 30)]);
     let mut view = by_region(table.clone());

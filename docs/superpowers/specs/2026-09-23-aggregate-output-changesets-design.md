@@ -21,6 +21,15 @@ Implementation notes (differences from the design below):
   the version check, and a constant test would only restate the value.
 - The benchmark harness ends each sample when a declared set of nodes has
   delivered, and fails on any other delivery.
+- Follow-up (2026-09-27): measurement confirmed the removal-cost risk. With
+  100k single-row groups, a batch that removed 512 of them took 6.3 s to sync,
+  against about 0.1 s for a rebuild. Removed groups now keep their slots until the batch
+  ends: each `RowDeleted` index subtracts earlier removed slots (binary search
+  in a sorted list), then one compaction renumbers the groups after the first removal. The
+  same 512-group batch syncs in 30 ms. Batches with two or more structural events and more than 512
+  events now rebuild instead of reindexing rows per event (2,048 deletes on 10k
+  groups: 14.2 s before, 41 ms after). Emitted history is unchanged; see
+  `out_of_order_removals_index_the_groups_still_present`.
 
 ## Problem
 

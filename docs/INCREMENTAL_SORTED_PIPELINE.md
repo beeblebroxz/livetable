@@ -52,8 +52,9 @@ table.tick()  # syncs parents before children
   identities and inserted rows get fresh identities. Aggregate values update
   incrementally; index hashes are remapped once before any MIN/MAX rescan.
   This avoids repeated hash-map rebuilding for each sorted delete/insert pair.
-  Unchanged final identity mappings skip even that final remap. Existing
-  group-key-update fallbacks remain in place above 256 events.
+  Unchanged final identity mappings skip even that final remap. Larger inputs
+  with at least two structural events rebuild, as do inputs with group-key
+  updates above 256 events.
 - Python `ranked.group_by(by, agg)` accepts the same columns and aggregation
   strings as `table.group_by()`. It registers the sort once before its child;
   this also registers an explicitly constructed, previously manual-sync sort.
