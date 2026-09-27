@@ -88,6 +88,9 @@ cargo test --features server --test sorted_pipeline
 # Aggregate group-coordinate history: net diffs, positions, and aggregate children
 cargo test --features server --test aggregate_pipeline
 
+# Join-coordinate history: per-event emission, fan-out, overflow, and join children
+cargo test --features server --test join_pipeline
+
 # Real TCP/WebSocket pipeline integration test (protocol v4)
 cargo test --features server --test protocol_v3_websocket
 ```
@@ -179,6 +182,7 @@ Rust integration tests under `../impl/tests/`:
 - **filter_pipeline.rs** - Filter output coordinates, bounded work, history, and compaction
 - **sorted_pipeline.rs** - Sorted-coordinate replay, move batches, and bounded source reads
 - **aggregate_pipeline.rs** - Aggregate net-diff history, group positions, invalidation, and replaying children
+- **join_pipeline.rs** - Join output history: per-mutation events, value fan-out, value-only side first, overflow/rebuild invalidation, and replaying children
 - **protocol_v3_websocket.rs** - Real WebSocket deltas (including groups), lost-final-update repair, and connection/generation isolation
 - **engine/delivery_tests.rs** - Reconstructed clients vs fresh pipelines across mixed batches, bounded-history fallback, and node recovery
 

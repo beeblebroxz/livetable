@@ -5,11 +5,11 @@
 //! are held as `Rc<RefCell<dyn ReadableTable>>`; an `Rc<RefCell<Table>>`
 //! coerces implicitly at call sites.
 //!
-//! Root tables and synchronized filters/sorts expose changesets in their own
-//! row coordinates. Filters/sorts retain one bounded batch; a rebuild invalidates
-//! the previous history. Consumers refresh if their cursor is outside the retained
-//! window. Other view types expose no output history and their children use
-//! version-checked rebuilds. Version still includes ancestors for stale-read
+//! Root tables and synchronized filters/sorts/aggregates/joins expose changesets
+//! in their own row coordinates. Views retain one bounded batch; a rebuild
+//! invalidates the previous history. Consumers refresh if their cursor is outside
+//! the retained window. Projection and computed views expose no output history
+//! and their children use version-checked rebuilds. Version still includes ancestors for stale-read
 //! and iterator guards; an unchanged output stream can skip downstream sync
 //! work even when an ancestor's version advanced.
 //!

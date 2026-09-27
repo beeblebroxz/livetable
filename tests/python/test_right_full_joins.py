@@ -228,6 +228,16 @@ class TestSyncExposed:
         result = joined.sync()
         assert result is True
 
+    def test_join_sync_reports_value_only_edits(self):
+        """sync() returns True after a non-key edit: joined values changed."""
+        users, orders = make_users_orders()
+        joined = livetable.JoinView(
+            "value_sync", users, orders, "user_id", "user_id", livetable.JoinType.LEFT
+        )
+        users.set_value(0, "name", "Renamed")
+        assert joined.sync() is True
+        assert joined.sync() is False
+
 
 class TestIterationAndSlicing:
     """Tests for iteration and indexing on RIGHT/FULL join views."""

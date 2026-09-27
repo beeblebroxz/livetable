@@ -2,14 +2,14 @@
 //!
 //! [`ReadableTable`] is the common read interface for [`Table`] and all views.
 //! Mutate root tables, then synchronize stateful views in parent-before-child
-//! order, either directly or through [`TickableTable`]. Filters and sorts publish
-//! bounded changesets in their own row coordinates; children of other view types
-//! use version-checked rebuilds. Views retain derived indices, cached keys, or
+//! order, either directly or through [`TickableTable`]. Filters, sorts,
+//! aggregates, and joins publish bounded changesets in their own row coordinates;
+//! children of projection and computed views use version-checked rebuilds. Views retain derived indices, cached keys, or
 //! aggregate state rather than another complete source table.
 //!
 //! The core has no default features. Enable `python` for PyO3 bindings or `server`
-//! for the Actix/WebSocket service. Protocol v3 delivers bounded base/filter/sort
-//! deltas with snapshot recovery; groups retain snapshot delivery.
+//! for the Actix/WebSocket service. Protocol v4 delivers bounded
+//! base/filter/sort/group deltas with snapshot recovery.
 
 pub mod changeset;
 pub mod column;

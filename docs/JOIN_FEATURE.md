@@ -188,8 +188,18 @@ parent exposes no changeset, the join instead uses version-checked rebuilds.
 Missing history, structural changes on both sides in one batch, or a key update
 before a structural change on the same side also require a rebuild to avoid
 mixing row-coordinate frames. Always synchronize parents first; `refresh()`
-unconditionally rebuilds from their current state. Joins themselves do not
-publish output changesets, so children use version-checked rebuilds.
+unconditionally rebuilds from their current state.
+
+Joins publish output history in their own coordinates, so filters, sorts,
+aggregates, and joins built on a join replay it instead of rebuilding. Each
+batch records one event per output-index change: inserted and deleted joined
+rows carry full payloads (right columns `right_`-prefixed), a LEFT/FULL
+placeholder that gains a match emits `CellUpdated` from Null, and a non-key
+edit becomes a `CellUpdated` on every output row of that parent row. The side
+with only value edits is applied first, so payloads agree with what children
+have already applied. A batch that would emit more than 512 events, or any
+rebuild, invalidates the history, and children then refresh. `sync()` returns
+true when output rows or values changed, including value-only edits.
 
 Construction and a full refresh are O(N + M + R), where `N` and `M` are parent
 sizes and `R` is the output size. Output can be much larger than either parent

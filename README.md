@@ -176,17 +176,18 @@ In Rust, any view can parent any other view — every view implements the
 `ReadableTable` trait (`FilterView`, `SortedView`, `AggregateView`, `JoinView`,
 `ProjectionView`, `ComputedView`, and `Table` itself).
 
-Filters, sorted views, and aggregates publish changesets, allowing
+Filters, sorted views, aggregates, and joins publish changesets, allowing
 `table -> filter -> sort -> group_by` to update incrementally in Rust and Python.
-Rust filters, sorts, and joins over an aggregate replay its changed groups.
+Rust filters, sorts, and joins over an aggregate replay its changed groups, and
+Rust filters, sorts, aggregates, and joins over a join replay its changed rows.
 Small batches evaluate only changed rows; an edit that stays outside the filter
 produces no downstream changes in these engine stages. Protocol v4 also suppresses
 empty filter/sort/group deliveries and sends groups deltas.
 Each filter/sort retains one batch of history and rebuilds for more than 256
 input changes or unavailable history. Sorts cache only sort-key columns and
 index mappings, not complete source rows. Non-sort edits forward without a
-scan; row moves can still shift linear-time bookkeeping. Children of other
-view types use version-checked rebuilds. See the
+scan; row moves can still shift linear-time bookkeeping. Children of
+projection and computed views use version-checked rebuilds. See the
 [filter contract](docs/INCREMENTAL_FILTER_PIPELINE.md) and
 [sorted pipeline contract and benchmarks](docs/INCREMENTAL_SORTED_PIPELINE.md).
 

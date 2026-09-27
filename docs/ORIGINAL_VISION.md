@@ -239,7 +239,7 @@ items below remain original future ideas.
 - [x] String interning with reference counting
 - [x] Changesets and incremental view propagation
 - [x] Automatic view propagation via `tick()` method
-- [x] View-over-view composition (DAG): all views implement `ReadableTable`; tables, filters, and sorts emit changesets so filter-to-sort-to-aggregate chains update incrementally, while children of other views use version-checked refresh
+- [x] View-over-view composition (DAG): all views implement `ReadableTable`; tables, filters, sorts, aggregates, and joins emit changesets so chains through them update incrementally, while children of projection and computed views use version-checked refresh
 - [x] Shared Rust/Python filter replay for bounded mixed batches, with derived-coordinate changesets, bounded history, and rebuild invalidation
 - [x] Sorted-coordinate batch replay with cached keys, stable ties, row-move events, and Python SortedView.group_by(); aggregate index remapping batched for structural changes
 - [x] CSV/JSON serialization with type inference
@@ -248,6 +248,7 @@ items below remain original future ideas.
 - [x] Protocol v2 server-computed view pipelines (per-connection filter/sort/group DAGs with generation-scoped snapshots)
 - [x] Protocol v3 base/filter/sort delta delivery, node-local baselines, snapshot fallback, and checkpoint-based resynchronization
 - [x] AggregateView output changesets and protocol v4 group deltas; filter/sort/join children of aggregates replay instead of rebuilding
+- [x] JoinView output changesets; filter/sort/aggregate/join children of joins replay instead of rebuilding
 - [x] Local [Orders Lab](ORDERS_LAB.md): guided incremental/recovery scenarios, independent clients, virtualized 100k-row inspection and bounded synthetic streaming
 - [x] RIGHT and FULL OUTER joins
 - [x] Multi-column joins (composite key support)
@@ -258,7 +259,7 @@ items below remain original future ideas.
 ### Planned
 - [ ] General-purpose fully materialized row views (beyond existing key/group caches)
 - [ ] Stable derived-row identity (filter/sort/group wire rows carry `row_id: null`)
-- [ ] Output changesets for join, projection, and computed views
+- [ ] Output changesets for projection and computed views
 - [ ] Persistence and recovery
 - [ ] Parallel view execution
 - [ ] SQL/query-planning layer

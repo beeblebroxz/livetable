@@ -861,7 +861,8 @@ joined = livetable.JoinView("j", sales, targets,
 - `get_row(index: int) -> dict` - Get joined row
 - `view[index]` - Same as `get_row(index)` (indexing support)
 - `get_value(row: int, column: str)` - Get value
-- `sync()` - Incremental update after table changes, returns bool
+- `sync()` - Incremental update after table changes; returns True when joined
+  rows or values changed, including edits to non-key columns
 - `refresh()` - Full rebuild
 
 **Notes:**

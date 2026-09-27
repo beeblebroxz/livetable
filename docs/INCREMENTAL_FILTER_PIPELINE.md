@@ -57,8 +57,9 @@ The subsequent [sorted pipeline milestone](INCREMENTAL_SORTED_PIPELINE.md)
 adds bounded sorted-coordinate output replay and aggregate index remapping.
 The benchmark below records the earlier filter-only milestone, before that
 extension. The later [aggregate output milestone](superpowers/specs/2026-09-23-aggregate-output-changesets-design.md)
-adds aggregate history. Projection, computed, and join views still give their
-children version-checked rebuilds. View versions still include ancestors for
+adds aggregate history, and the [join output milestone](superpowers/specs/2026-09-27-join-output-changesets-design.md)
+adds join history. Projection and computed views still give their children
+version-checked rebuilds. View versions still include ancestors for
 staleness and iterator checks, independently of emitted changes.
 
 At this milestone the server serialized full view snapshots, including after
