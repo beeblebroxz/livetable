@@ -1,36 +1,35 @@
 #!/bin/bash
 # Keeps Python tests from running against a stale livetable extension.
 # The test runner only checks importability, so an old installed build passes silently.
-#   PostToolUse Edit/Write on impl/src/**/*.rs or impl/Cargo.toml -> mark stale
-#   PostToolUse Bash that installs the extension                   -> clear
-#   PreToolUse  Bash that runs Python tests while stale            -> deny with rebuild steps
+# PreToolUse Bash: before pytest or run_all.sh, deny if any impl/src/**/*.rs or
+# impl/Cargo.toml is newer than the installed extension. Comparing mtimes catches every
+# way a source can change (Edit, sed, git pull/checkout/stash) without tracking state.
 input=$(cat)
-event=$(jq -r '.hook_event_name // empty' <<<"$input")
-tool=$(jq -r '.tool_name // empty' <<<"$input")
-root="${CLAUDE_PROJECT_DIR:-$(pwd)}"
-marker="$root/.git/claude-pyext-stale"
-shopt -s nocasematch  # sessions start from both ~/projects and ~/Projects
+cmd=$(jq -r '.tool_input.command // empty' <<<"$input")
+grep -qE '(^|[^[:alnum:]_-])pytest([^[:alnum:]_-]|$)|run_all\.sh' <<<"$cmd" || exit 0
 
-case "$event:$tool" in
-  PostToolUse:Edit | PostToolUse:Write | PostToolUse:MultiEdit)
-    file=$(jq -r '.tool_input.file_path // empty' <<<"$input")
-    case "$file" in
-      "$root"/impl/src/*.rs | "$root"/impl/Cargo.toml) touch "$marker" ;;
-    esac
-    ;;
-  PostToolUse:Bash)
-    cmd=$(jq -r '.tool_input.command // empty' <<<"$input")
-    if grep -qE 'install\.sh|maturin develop|pip3? install[^;&|]*livetable' <<<"$cmd"; then
-      rm -f "$marker"
-    fi
-    ;;
-  PreToolUse:Bash)
-    [ -f "$marker" ] || exit 0
-    cmd=$(jq -r '.tool_input.command // empty' <<<"$input")
-    if grep -qE '(^|[^[:alnum:]_-])pytest([^[:alnum:]_-]|$)|run_all\.sh' <<<"$cmd"; then
-      reason='Rust sources under impl/src changed since the Python extension was last installed, so these Python tests would run against a stale build. Rebuild and install first: `cd impl && ./install.sh`. If `import livetable` then fails with "mis-aligned LINKEDIT", read the python-extension-load-failure.md project memory and use its exact SDKROOT build command (the full SDK path, not a bare name); touch impl/src/lib.rs first so cargo relinks. If you already rebuilt another way, delete .git/claude-pyext-stale and rerun.'
-      jq -n --arg r "$reason" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
-    fi
-    ;;
-esac
-exit 0
+root="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+py=python3
+[[ "$cmd" == *.venv/* && -x "$root/.venv/bin/python3" ]] && py="$root/.venv/bin/python3"
+
+# find_spec locates the package without importing it, so a broken build can't crash this.
+so=$("$py" - 2>/dev/null <<'EOF'
+import glob, importlib.util, os
+spec = importlib.util.find_spec("livetable")
+if spec and spec.origin and spec.origin.endswith(".so"):
+    print(spec.origin)
+elif spec:
+    for d in spec.submodule_search_locations or []:
+        found = glob.glob(os.path.join(d, "*.so"))
+        if found:
+            print(found[0])
+            break
+EOF
+)
+[ -n "$so" ] || exit 0  # not installed: the test runner's import check reports that
+
+newer=$(find "$root/impl/src" "$root/impl/Cargo.toml" \( -name '*.rs' -o -name Cargo.toml \) -newer "$so" 2>/dev/null | head -1)
+[ -n "$newer" ] || exit 0
+
+reason="${newer#"$root"/} changed after the installed Python extension ($so) was built, so these tests would run against a stale build. Rebuild and install first: \`cd impl && ./install.sh\`. If \`import livetable\` then fails with \"mis-aligned LINKEDIT\", read the python-extension-load-failure.md project memory and use its exact SDKROOT build command (the full SDK path, not a bare name); touch impl/src/lib.rs first so cargo relinks."
+jq -n --arg r "$reason" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
