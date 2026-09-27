@@ -16,9 +16,12 @@
 //! - SortedView over a FilterView (chained, incremental batch replay)
 //! - AggregateView over the chained sort (chained-of-chained)
 //! - Filter, sort, and FULL join over AggregateViews (aggregate output history)
+//! - Filter, sort, and aggregate over a LEFT join to a static dimension table
+//!   (join output history)
 //!
-//! Sort, aggregate, and aggregate-child output history must also replay onto
-//! the pre-tick snapshot and reproduce the post-tick one exactly.
+//! Sort, aggregate, aggregate-child, join, and join-child output history must
+//! also replay onto the pre-tick snapshot and reproduce the post-tick one
+//! exactly.
 //!
 //! It also covers multi-consumer min-cursor changeset compaction (filter + the
 //! two direct views all consume the root changeset on the same TickableTable).
@@ -143,6 +146,28 @@ fn assert_replays(trial: u64, step: usize, captured: Replayed) {
     for (label, view, rows, cursor) in captured {
         assert_replay(label, trial, step, rows, cursor, &*view.borrow());
     }
+}
+
+/// Replay history when the batch kept it and report whether it did. Rebuilds
+/// (both join parents changed structure, or a key update preceded a shift)
+/// invalidate it instead.
+fn replay_unless_invalidated(
+    label: &str,
+    trial: u64,
+    step: usize,
+    rows: Vec<Row>,
+    cursor: usize,
+    view: &dyn ReadableTable,
+) -> bool {
+    let kept = view
+        .changeset()
+        .unwrap_or_else(|| panic!("[{label}] trial {trial} step {step}: no history after sync"))
+        .changes_from(cursor)
+        .is_some();
+    if kept {
+        assert_replay(label, trial, step, rows, cursor, view);
+    }
+    kept
 }
 
 /// A detached, independent table holding a copy of `base`'s current rows.
@@ -296,6 +321,13 @@ struct Pipeline {
     ranked_groups: Rc<RefCell<SortedView>>,
     /// Each order FULL-joined to its region's filtered totals.
     agg_join: Rc<RefCell<JoinView>>,
+    /// Static dimension table joined to every order (never mutated).
+    dim: Rc<RefCell<Table>>,
+    /// Orders LEFT-joined to region tiers, with children over the join.
+    dim_join: Rc<RefCell<JoinView>>,
+    join_filter: Rc<RefCell<FilterView>>,
+    join_sorted: Rc<RefCell<SortedView>>,
+    join_groups: Rc<RefCell<AggregateView>>,
     tick: TickableTable,
 }
 
@@ -311,6 +343,17 @@ impl Pipeline {
             ("ranked_groups", self.ranked_groups.clone()),
         ]
     }
+
+    /// The dimension join and its children. The join rebuilds when a batch
+    /// updates a region before inserting or deleting an order.
+    fn join_replayed(&self) -> Vec<(&'static str, Rc<RefCell<dyn ReadableTable>>)> {
+        vec![
+            ("dim_join", self.dim_join.clone()),
+            ("join_filter", self.join_filter.clone()),
+            ("join_sorted", self.join_sorted.clone()),
+            ("join_groups", self.join_groups.clone()),
+        ]
+    }
 }
 
 fn big_group(row: &Row) -> bool {
@@ -323,6 +366,30 @@ fn group_rank_keys() -> Vec<SortKey> {
 
 fn region_join(left: Rc<RefCell<Table>>, right: Rc<RefCell<AggregateView>>, name: &str) -> JoinView {
     JoinView::new(name.to_string(), left, right, "region".to_string(), "region".to_string(), JoinType::Full).unwrap()
+}
+
+/// Region tiers for a LEFT join. South has no tier, so its orders carry Null
+/// right columns and group under a Null tier.
+fn region_dim() -> Rc<RefCell<Table>> {
+    let mut dim = Table::new(
+        "regions".to_string(),
+        Schema::new(vec![
+            ("region".to_string(), ColumnType::String, false),
+            ("tier".to_string(), ColumnType::Int32, false),
+        ]),
+    );
+    for (region, tier) in [("West", 1), ("East", 2), ("North", 1)] {
+        dim.append_row(HashMap::from([
+            ("region".to_string(), ColumnValue::String(region.to_string())),
+            ("tier".to_string(), ColumnValue::Int32(tier)),
+        ]))
+        .unwrap();
+    }
+    Rc::new(RefCell::new(dim))
+}
+
+fn dim_join(base: Rc<RefCell<Table>>, dim: Rc<RefCell<Table>>, name: &str) -> JoinView {
+    JoinView::new(name.to_string(), base, dim, "region".to_string(), "region".to_string(), JoinType::Left).unwrap()
 }
 
 fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
@@ -348,6 +415,15 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
         SortedView::new("rg".to_string(), agg_direct.clone(), group_rank_keys()).unwrap(),
     ));
     let agg_join = Rc::new(RefCell::new(region_join(base.clone(), agg_filtered.clone(), "aj")));
+    let dim = region_dim();
+    let dim_join_view = Rc::new(RefCell::new(dim_join(base.clone(), dim.clone(), "dj")));
+    let join_filter = Rc::new(RefCell::new(FilterView::new("jf".to_string(), dim_join_view.clone(), passes)));
+    let join_sorted = Rc::new(RefCell::new(
+        SortedView::new("js".to_string(), dim_join_view.clone(), sort_keys()).unwrap(),
+    ));
+    let join_groups = Rc::new(RefCell::new(
+        AggregateView::new("jg".to_string(), dim_join_view.clone(), vec!["right_tier".to_string()], aggs()).unwrap(),
+    ));
 
     // Registration order = topological order (parents before children).
     let tick = TickableTable::new(base.clone());
@@ -360,6 +436,10 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
     tick.register_filter(&having);
     tick.register_sorted(&ranked_groups);
     tick.register_join_as_left(&agg_join);
+    tick.register_join_as_left(&dim_join_view);
+    tick.register_filter(&join_filter);
+    tick.register_sorted(&join_sorted);
+    tick.register_aggregate(&join_groups);
 
     Pipeline {
         filter,
@@ -371,6 +451,11 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
         having,
         ranked_groups,
         agg_join,
+        dim,
+        dim_join: dim_join_view,
+        join_filter,
+        join_sorted,
+        join_groups,
         tick,
     }
 }
@@ -412,6 +497,24 @@ fn assert_pipeline_matches(trial: u64, step: usize, base: &Rc<RefCell<Table>>, p
         multiset(&snapshot(&ojoin)),
         "[agg_join] trial {trial} step {step}"
     );
+
+    let odj = Rc::new(RefCell::new(dim_join(ob.clone(), p.dim.clone(), "odj")));
+    assert_eq!(
+        multiset(&snapshot(&*p.dim_join.borrow())),
+        multiset(&snapshot(&*odj.borrow())),
+        "[dim_join] trial {trial} step {step}"
+    );
+    // Join order may differ from a rebuild, so compare the filter order-free.
+    let ojf = FilterView::new("ojf".to_string(), odj.clone(), passes);
+    assert_eq!(
+        multiset(&snapshot(&*p.join_filter.borrow())),
+        multiset(&snapshot(&ojf)),
+        "[join_filter] trial {trial} step {step}"
+    );
+    let ojs = SortedView::new("ojs".to_string(), odj.clone(), sort_keys()).unwrap();
+    assert_ordered_eq("join_sorted", trial, step, &snapshot(&*p.join_sorted.borrow()), &snapshot(&ojs));
+    let ojg = AggregateView::new("ojg".to_string(), odj.clone(), vec!["right_tier".to_string()], aggs()).unwrap();
+    assert_agg_eq("join_groups", trial, step, "right_tier", &snapshot(&*p.join_groups.borrow()), &snapshot(&ojg));
 }
 
 #[test]
@@ -424,9 +527,11 @@ fn differential_chained_forward_prop_fuzz() {
 
         for step in 0..200usize {
             let before = capture(p.replayed());
+            let join_before = capture(p.join_replayed());
             apply_random_op(&mut rng, &base, &mut next_id);
             p.tick.tick();
             assert_replays(trial, step, before);
+            assert_replays(trial, step, join_before);
             assert_pipeline_matches(trial, step, &base, &p);
         }
     }
@@ -442,6 +547,7 @@ fn differential_batched_forward_prop_fuzz() {
 
         for step in 0..150usize {
             let before = capture(p.replayed());
+            let join_before = capture(p.join_replayed());
             // 1..=6 mutations applied before a single tick() — a multi-change
             // batch. The deferred end-of-batch MIN/MAX recalc must read row
             // indices that match the parent only after all batch shifts apply.
@@ -451,6 +557,9 @@ fn differential_batched_forward_prop_fuzz() {
             }
             p.tick.tick();
             assert_replays(trial, step, before);
+            for (label, view, rows, cursor) in join_before {
+                replay_unless_invalidated(label, trial, step, rows, cursor, &*view.borrow());
+            }
             assert_pipeline_matches(trial, step, &base, &p);
         }
     }
@@ -614,6 +723,8 @@ fn differential_join_fuzz() {
             let mut next_rid: i64 = 0;
 
             for step in 0..160usize {
+                let before = snapshot(&joined);
+                let cursor = joined.changeset().expect("synced join exposes history").total_len();
                 let llen = left.borrow().len();
                 let rlen = right.borrow().len();
                 let roll = rng.pct();
@@ -665,6 +776,9 @@ fn differential_join_fuzz() {
                 }
 
                 joined.sync();
+                // One parent change per step: never a rebuild, so history
+                // must always replay.
+                assert_replay(&format!("join:{jt_name}"), trial, step, before, cursor, &joined);
 
                 // Oracle: a from-scratch join on the current parent states.
                 let ol = clone_table(&left, left_schema());
@@ -836,6 +950,7 @@ fn differential_join_batched_fuzz() {
         ("full", JoinType::Full),
     ];
     for (jt_name, jt) in join_types {
+        let (mut kept, mut steps) = (0usize, 0usize);
         for trial in 0..30u64 {
             let mut rng = Lcg(0x0F1E_2D3C_4B5A_6978 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let left = Rc::new(RefCell::new(Table::new("left".to_string(), left_schema())));
@@ -848,12 +963,18 @@ fn differential_join_batched_fuzz() {
             let mut next_rid: i64 = 0;
 
             for step in 0..120usize {
+                let before = snapshot(&joined);
+                let cursor = joined.changeset().expect("synced join exposes history").total_len();
                 // Multi-change batch (1..=5 mutations) before one sync().
                 let batch = 1 + rng.below(5);
                 for _ in 0..batch {
                     join_random_op(&mut rng, &left, &right, &mut next_lid, &mut next_rid);
                 }
                 joined.sync();
+                steps += 1;
+                if replay_unless_invalidated(&format!("join_batched:{jt_name}"), trial, step, before, cursor, &joined) {
+                    kept += 1;
+                }
 
                 let ol = clone_table(&left, left_schema());
                 let or = clone_table(&right, right_schema());
@@ -870,5 +991,11 @@ fn differential_join_batched_fuzz() {
                 );
             }
         }
+        // An implementation that always invalidated would pass the replay
+        // check; most small batches must keep history.
+        assert!(
+            kept * 4 >= steps,
+            "[join_batched:{jt_name}] history kept in only {kept}/{steps} batches"
+        );
     }
 }
