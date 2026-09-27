@@ -36,5 +36,9 @@ frontend/playwright-report/
 *.whl
 
 # Claude Code settings (local only)
-.claude/
+.claude/*
+!.claude/rules/
+!.claude/skills/
+!.claude/hooks/
+!.claude/settings.json
 benchmark_results.json

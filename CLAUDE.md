@@ -6,6 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 LiveTable is a columnar table system written in Rust with Python bindings via PyO3. It focuses on typed row operations, shared-source view DAGs, and incremental change propagation; benchmark claims must be tied to the checked-in harnesses and a recorded environment. Views keep indices, cached keys, or aggregate state; reads and event payloads clone values/rows, so do not claim blanket zero-copy behavior.
 
+## Working Style
+
+Solo project: no PR workflows, no review checkpoints, minimal commit formality. In this repo these rules override the superpowers workflow skills:
+
+- Ask design questions only at a genuine fork, all in one message. Otherwise pick the option that best fits the design vision and say why.
+- Once I approve a spec, write the plan and implement it without further checkpoints. Execute plans inline; don't ask me to choose an execution mode.
+- When a piece of work is done, don't offer merge or PR options: commit on `master` and say what was tested.
+- Keep writing specs and plans to `docs/superpowers/`; they are how the next session sees what is done and what is next.
+
 ## Original Design Vision
 
 Before adding new features, consult the original design document:
@@ -21,32 +30,9 @@ Key principles from the original vision:
 - Incremental change propagation through changesets
 - String interning for memory efficiency
 
-## Documentation Maintenance
+## Documentation
 
-**IMPORTANT**: When adding new features or making API changes, always update:
-
-1. **README.md** - Features list and Example section
-2. **CLAUDE.md** - Python API Usage section (this file)
-3. **docs/PYTHON_BINDINGS_README.md** - Full API reference and examples
-4. **docs/ORIGINAL_VISION.md** - Mark implemented features as complete
-5. **docs/WEBSOCKET_PROTOCOL.md** - Wire changes, sequencing, and limits (server feature only)
-6. **QUICK_START.md**, **docs/GETTING_STARTED.md**, **docs/START_HERE.md** - Onboarding and runnable examples
-7. **docs/API_GUIDE.md**, **docs/JOIN_FEATURE.md**, **tests/README.md** - Rust/API contracts and actual local/CI checks
-8. **docs/INCREMENTAL_*_PIPELINE.md**, **docs/PERFORMANCE_COMPARISON.md** - Propagation limits and reproducible benchmarks; preserve measured commit/environment provenance
-
-Plans/specs under `docs/superpowers/` are historical records, not current task
-instructions. Keep their implementation status and current-reference links
-accurate without rewriting original checklists as if they were executed today.
-
-**Checklist for new features:**
-- [ ] Add to README.md Features section
-- [ ] Add example code to README.md Example section
-- [ ] Add to CLAUDE.md Python API Usage
-- [ ] Add full documentation to docs/PYTHON_BINDINGS_README.md
-- [ ] Add API reference (constructor, methods, parameters)
-- [ ] Update docs/ORIGINAL_VISION.md Implementation Status
-- [ ] Update Future Enhancements if applicable
-- [ ] Add Python tests in tests/python/
+When a feature or API change is done, use the `feature-docs` skill before committing; it lists every doc to update. Plans/specs under `docs/superpowers/` are historical records, not current task instructions.
 
 
 ## Build Commands
@@ -116,47 +102,22 @@ cd frontend && npm install && npm run dev
 - **engine.rs** + **engine/delivery.rs** + **pipeline_spec.rs** - Single-threaded server table owner, bounded wire-spec → real-view construction, and cursor-checked pipeline delivery
 - **websocket.rs** + **messages.rs** - Actix transport and protocol-v4 real-time sync
 
-### Key Patterns
-- `ColumnData` selects `Sequence<T>` once per column; never reintroduce a per-cell enum or an interned-string placeholder buffer. `ColumnValue` stays at API/event boundaries. Numeric `get_f64()` must preserve NULL/type semantics and float bits.
-- `NullBitmap` packs array flags into u64 words; tiered flags use circular bit blocks with O(1) addressing and amortized O(sqrt(N)) middle edits. A flat shifting bitmap would regress the tiered backend. Keep masks/value buffers aligned through growth, shrink, and rollback.
-- Column mutations prevalidate type/bounds and acquire fallible interner locks before changing any state. Updates acquire a new string reference before releasing the old; delete/truncate/drop release owned IDs. Drop also locks the shared interner: callers must not hold its mutex while destroying a column. See `docs/TYPED_COLUMN_STORAGE.md`.
-- Views use `Rc<RefCell<>>` for shared source access, with their own derived state
-- View parents are `Rc<RefCell<dyn ReadableTable>>`. Tables and synchronized filters/sorts/aggregates/joins expose changesets in their own row coordinates; children of projection/computed views use version-checked full refresh. A view's `version()` includes its parents for staleness/iterator guards and is independent of its output changeset sequence. Always sync parents before children (tick registration order is topological).
-- Consumer cursors belong to their immediate parent's stream. Use `root_changeset_cursor()` / `root_changeset_cursors()` for tick compaction; they return `usize::MAX` for derived sources. Never compare a filter's output cursor with a root table's cursor. A consumer created while a filter is stale has no coherent baseline and must refresh after the parent syncs.
-- `filter_changes.rs` shares replay and output emission between native/Python filters. It reconstructs historical updated rows across later shifts/deletes and emits filter-coordinate events. Batches up to 256 changes replay; larger batches rebuild. One successful non-empty input batch is retained; a no-op sync preserves history, and rebuild uses `Changeset::invalidate()` to force even caught-up consumers to refresh. Python callbacks are evaluated before committing indices/history, so errors are retryable. See `docs/INCREMENTAL_FILTER_PIPELINE.md` and `impl/tests/filter_pipeline.rs`.
-- Aggregate group-key updates use the same historical-row reconstruction. SUM/COUNT/AVG updates do not trigger unused MIN/MAX rescans; requested extrema may rescan the affected group.
-- SortedView caches only sort keys in parent coordinates plus forward/inverse index mappings. Small batches (up to 256 input events) replay against historical keys, never live-parent comparisons. A moved row emits delete(old full row) + insert(new full row); stationary edits emit CellUpdated. Ties follow parent order, NaNs sort after numbers ascending (before descending), and signed zero ties are stable. History/invalidation follow the filter contract. See `docs/INCREMENTAL_SORTED_PIPELINE.md`.
-- Aggregate batches with multiple structural events (up to 512 total events) use temporary row identities and remap index hashes once before MIN/MAX rescans. This avoids rehashing all rows for each delete/insert pair emitted by a sort. It uses O(N+B) temporary index storage, not a table snapshot. Larger multi-structural batches rebuild. Emptied groups keep their `group_order` slot until batch end (`compact_group_order`); never shift/renumber the tail per removal (O(k·groups)).
-- AggregateView publishes history in group coordinates (`group_order` positions, kept in `GroupState::position`). Each incremental batch is a net diff: removing a pre-batch group emits `RowDeleted` with its full pre-batch row; at batch end, after deferred MIN/MAX recalcs, surviving groups emit `CellUpdated` only for changed result columns (floats compared by bits) and new groups emit tail `RowInserted`s. New groups only append, so pre-batch positions stay valid for consumers mid-batch. An empty input batch must record the parent version, or an excluded upstream edit hides history. Otherwise history/invalidation follow the filter contract. See `impl/tests/aggregate_pipeline.rs`.
-- Python filter/computed callbacks still execute Python; they are not compiled into native predicates. Filter callbacks are fallible and must return a bool.
-- Join construction/refresh costs O(N+M+R), where R is output size. Rust joins replay table/filter/sort/aggregate/join history when available; parents without output history require version-checked rebuilds. JoinView publishes history in join coordinates (`join_index` positions, `right_`-prefixed right columns): one event per index mutation (placeholder fills are `CellUpdated` from Null), non-key updates fanned out to every output row of the parent row, and the value-only side applied first so the structural side reads the other parent live. Key updates rebuild before/after rows with `row_after_update`. Batches over 512 output events invalidate; rebuilds (both sides structural, key update before a shift, unreadable rows) invalidate. `sync()` returns true for value-only edits. See `impl/tests/join_pipeline.rs`. Float join keys are bitwise, so -0.0 and +0.0 differ (unlike sorting/grouping).
-- WebSocket base protocol: `Subscribe`, `Query`, `InsertRow`, `UpdateCell`, and `DeleteRow`; successful mutations broadcast `RowInserted`, `CellUpdated`, and `RowDeleted` to base subscribers
-- Flat-table WebSocket reconciliation: every `TableData` and flat-table delta carries a monotonic `seq` (the table's `Changeset::total_len`, captured in the same serialized engine operation as the snapshot/mutation). The client drops any delta with `seq <= snapshot_seq` (already reflected) and buffers deltas that arrive before the snapshot. Pipeline delivery uses a separate sequence domain.
-- WebSocket gap recovery: deltas only apply contiguously (`seq == applied + 1`); if a gap persists for `SEQ_GAP_REQUERY_MS` the client re-sends `Query` and re-baselines from the fresh snapshot (`useTableWebSocket.ts`). The pending-delta buffer is capped at `MAX_PENDING_DELTAS` (oldest evicted; the resulting gap heals via re-query). Cell edits are server-authoritative: on blur the input snaps back to the last confirmed value and only the `CellUpdated` broadcast echo moves it forward, so rejected updates (e.g. null into a non-nullable column) self-heal.
-- WebSocket `Subscribed` carries `protocol_version` (`messages::PROTOCOL_VERSION`); the client warns on mismatch with `SUPPORTED_PROTOCOL_VERSION`. Bump both on breaking wire changes.
-- Pipeline state is scoped by connection/table/generation/node. `pipeline_generation` must increase when replacing an installed pipeline. Each node's delivery `seq` starts at zero and advances once per emitted delta or later snapshot, independently of view versions and changeset cursors. `usePipeline` clears old baselines and repairs on new generations, ignores wrong tables/unknown nodes/stale sockets, and uses own-property-safe node maps.
-- `ViewData` uses `WireViewRow { row_id: Option<u64>, row }`; derived rows without stable identity serialize `row_id: null`. Never use `u64::MAX` as a JavaScript sentinel. Pipeline `count` is `COUNT(column)` and every aggregate spec therefore requires a source `column`.
-- `ViewDelta` is an atomic ordered batch of 1–512 node-coordinate operations, accepted only on exactly `from_seq` (`seq == from_seq + 1`). Filters/sorts/groups emit their retained output history; empty output sends nothing and keeps the delivery sequence unchanged. Missing/invalidated history (and >512 operations) falls back to snapshots. Protocol v4 added group deltas; v3 clients reject them. The base journal captures IDs and coordinates at mutation time, before root compaction; it is bounded at 512 events and drained on collection. Never scan/diff full node snapshots to build a delta or clone all base row IDs on every tick.
-- `QueryView` returns a fresh snapshot and advances only that connection/node's sequence, even without a data change. One-second `PipelineStatus` checkpoints detect lost final/initial deliveries. The client requests repair on gaps, invalid operations, or missing baselines; it retains coherent rows, ignores further deltas while repairing, and retries at 3-second checks without buffering delta history. Do not advance snapshot baselines on failed reads. See `docs/PIPELINE_DELIVERY.md` and `docs/WEBSOCKET_PROTOCOL.md`.
-- Run `pipeline_spec::validate_pipeline_spec()` before allocating views. It enforces ordered/acyclic sources, unique non-reserved node IDs, required node fields, and protocol resource limits.
-- The canonical wire reference is `docs/WEBSOCKET_PROTOCOL.md`; update it whenever message shapes, limits, generation rules, or sequence semantics change.
-- `Table::from_json`/`from_csv` infer each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null/empty → STRING); values are then converted against the inferred schema, not in isolation. JSON rejects incompatible mixes (number + string) at inference with a clear error; CSV falls back to STRING since every CSV value is a string at heart.
-- Iterator mutation guards: table/filter/projection/computed iterators capture the root table version; join/sort/aggregate iterators use `ReadableTable::version()` including ancestors and their own sync counter. All detect root mutations; the latter also detect view-version advances on sync/refresh. Filter-only refresh without root mutation is not detected. No-op sync does not invalidate an iterator.
-- Python chaining supports `FilterView.sort()/group_by()`, `SortedView.group_by()`, and `JoinView.filter()/sort()/group_by()`, not every Rust DAG. Simplified stateful methods auto-register. Views chained on a join register on both joined tables (after the join, once per distinct registry via `register_on_roots`), so either table's `tick()` updates them. Explicit constructors normally do not register; `SortedView.group_by()` registers its sort parent once and an explicit `JoinView` registers itself on first chaining, but children of an explicit filter still require that filter to be synced manually first. The Python filter (`PyFilterViewInner`) accepts any `ReadableTable` parent and translates its cursor with `root_changeset_cursor()` for compaction; tick registries hold weak references, so keep chained views alive. Root `tick()` does nothing without pending root changes: after a manual parent refresh, sync children directly.
-- JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
-- Interned string buffers (`ColumnData::StringIds`) use `NULL_STRING_ID` (u32::MAX) as null sentinel — never use 0
-- `Column::check_value_type(&value)` validates without consuming — use before batch mutations
-- Expression parser (`expr.rs`): Lexer has `input: Vec<char>` + `pos: usize`, supports negative literals
-- `filter_expr` uses SQL NULL semantics: all comparisons with NULL return false, use IS NULL/IS NOT NULL
-- `Table.__new__` Python API: `storage=` accepts "fast_reads"|"fast_updates", `use_string_interning=` is bool
+### Invariants
+
+Subsystem invariants live in `.claude/rules/` and load automatically when you read or edit matching files:
+- `tables-and-columns.md` - column storage, NULL masks, string interning, mutation safety, type inference, expressions
+- `views-and-propagation.md` - view DAG, changesets and cursors, filter/sort/aggregate/join incremental contracts, iterator guards
+- `python-bindings.md` - Python callbacks, chaining and tick registration, constructor options
+- `server-and-protocol.md` - WebSocket protocol, sequencing and gap recovery, pipeline delivery, Orders Lab
+
+When a change alters an invariant, update its rule file.
 
 ### Frontend (frontend/src/)
 - React 18 + TypeScript + Vite + Tailwind CSS
 - `hooks/useTableWebSocket.ts` - Flat-table WebSocket connection management
 - `hooks/usePipeline.ts` + `lib/pipelineReconciliation.ts` - Generation-aware pipeline connection management, atomic deltas, and snapshot recovery
 - `components/LiveTable.tsx` - Real-time table rendering with TanStack Table
-- `pages/OrdersLab.tsx` + `hooks/useLab.ts` - Default synthetic Orders Lab, five guided scenarios, virtualized results, actual delivery counters and bounded mixed streaming. `/#editor` opens the redesigned flat-table workspace (separate `demo` data), with local search/sort, 25-row pagination, row inspector and keyboard edits. Generic writes remain server-authoritative; confirmation matches server state, not request IDs. See `docs/ORDERS_LAB.md`.
-- `engine/lab.rs` - Opt-in `lab` table and deterministic reset/step/update controls; never target `demo`. Reset preserves source identity, monotonically increasing IDs and delivery baselines. `LabComplete` is a command/delivery reply, not a browser-paint acknowledgement.
+- `pages/OrdersLab.tsx` + `hooks/useLab.ts` - Default synthetic Orders Lab; `/#editor` opens the flat-table workspace. See `docs/ORDERS_LAB.md`.
 - `npm run test:e2e` - Isolated real Rust server + installed headless Chrome tests on ports 8087/5180. Browser outputs are ignored under `frontend/test-results/`.
 
 ## Critical Notes
@@ -182,191 +143,6 @@ cd frontend && npm install && npm run dev
 
 9. **Timezone-aware datetimes are rejected**: `datetime_to_ms_since_epoch` raises `ValueError` for aware datetimes (storage is naive ms-since-epoch; reading wall-clock fields would silently drop the offset). The pandas path falls back to `.timestamp()`, which converts aware values correctly.
 
-## Python API Usage
+## Python API
 
-These are independent API fragments assuming tables with the indicated columns,
-not a single runnable program. For a complete chain, see
-[Getting Started](docs/GETTING_STARTED.md).
-
-```python
-import livetable
-
-# Create schema and table
-schema = livetable.Schema([
-    ("id", livetable.ColumnType.INT32, False),      # (name, type, nullable)
-    ("name", livetable.ColumnType.STRING, False),
-    ("score", livetable.ColumnType.FLOAT64, True),
-])
-table = livetable.Table("students", schema)
-
-# Storage hints - choose backend optimized for your workload
-# Default: "fast_reads" (ArraySequence) - O(1) access, O(N) insert/delete
-# Option: "fast_updates" (TieredVectorSequence) - O(1) access, O(√N) insert/delete
-orderbook = livetable.Table("orderbook", schema, storage="fast_updates")
-
-# CRUD operations
-table.append_row({"id": 1, "name": "Alice", "score": 95.5})
-table.set_value(0, "score", 97.0)
-row = table[0]           # Indexing: table[idx]
-row = table.get_row(0)   # Same as above
-table.delete_row(0)
-
-# Views (shared source, derived state)
-filtered = table.filter(lambda row: row["score"] is not None and row["score"] >= 90)
-projected = table.select(["name", "score"])
-computed = table.add_computed_column("grade", lambda row: "A" if row["score"] is not None and row["score"] >= 90 else "B")
-
-# Expression-based filtering (runs in Rust without a Python callback)
-indices = table.filter_expr("score >= 90 AND name != 'Test'")
-# Supports: =, !=, <, >, <=, >=, AND, OR, NOT, IS NULL, IS NOT NULL
-
-# Sorting (simplified API)
-sorted_table = table.sort("score")                    # Ascending (default)
-sorted_table = table.sort("score", descending=True)   # Descending
-sorted_table = table.sort(["score", "name"], descending=[True, False])  # Multi-column
-
-# Sorting (explicit SortedView constructor)
-sorted_view = livetable.SortedView("by_score", table, [livetable.SortKey.descending("score")])
-
-# Group below a sort; group_by registers the sort before its children for tick().
-by_name = sorted_view.group_by("name", agg=[("total", "score", "sum")])
-table.tick()  # table -> sort -> group
-
-# Joins (simplified API)
-joined = students.join(grades, on="id")                                    # Same column name
-joined = students.join(enrollments, left_on="id", right_on="student_id")   # Different names
-joined = students.join(enrollments, left_on="id", right_on="student_id", how="inner")
-joined = sales.join(targets, on=["year", "month"])                         # Multi-column
-
-# Joins (explicit JoinView constructor)
-joined = livetable.JoinView("result", table1, table2, "id", "ref_id", livetable.JoinType.LEFT)
-joined = livetable.JoinView("result", sales, targets,
-    ["year", "month", "region"],  # Left keys
-    ["target_year", "target_month", "target_region"],  # Right keys
-    livetable.JoinType.INNER)
-
-# RIGHT JOIN - all rows from right table
-joined = students.join(grades, on="id", how="right")
-
-# FULL OUTER JOIN - all rows from both tables
-joined = students.join(grades, on="id", how="full")
-joined = students.join(grades, on="id", how="outer")       # alias
-joined = students.join(grades, on="id", how="full_outer")   # alias
-
-# Explicit constructors
-joined = livetable.JoinView("result", t1, t2, "id", "id", livetable.JoinType.RIGHT)
-joined = livetable.JoinView("result", t1, t2, "id", "id", livetable.JoinType.FULL)
-
-# Incremental sync (also available on JoinView)
-joined.sync()     # Incremental update, returns bool
-joined.refresh()  # Full rebuild
-
-# Views over a join (registered on both tables: tick either one)
-enriched = orders.join(customers, left_on="cust", right_on="cid")
-big_by_tier = enriched.filter(lambda r: r["amount"] >= 50).group_by(
-    "right_tier", agg=[("total", "amount", "sum")]
-)
-ranked = enriched.sort("amount", descending=True)
-customers.set_value(0, "tier", 2)
-customers.tick()  # join, filter, group, and sort all update
-
-# Simple aggregations
-total = table.sum("score")
-avg = table.avg("score")
-min_val = table.min("score")
-max_val = table.max("score")
-count = table.count_non_null("score")
-
-# GROUP BY (simplified API)
-grouped = table.group_by("department", agg=[
-    ("total", "salary", "sum"),
-    ("average", "salary", "avg"),      # Aliases: avg, average, mean
-    ("headcount", "salary", "count"),
-    ("min_sal", "salary", "min"),
-    ("max_sal", "salary", "max"),
-])
-
-# Percentile / Median aggregations
-stats = table.group_by("month", agg=[
-    ("median_tokens", "tokens_used", "median"),
-    ("p95_tokens", "tokens_used", "p95"),
-    ("p99_latency", "latency_ms", "p99"),
-    ("p25_tokens", "tokens_used", "percentile(0.25)"),  # Explicit percentile
-])
-# Shorthand strings: median, p25, p50, p75, p90, p95, p99, percentile(X.XX)
-
-# GROUP BY (explicit AggregateView constructor)
-agg = livetable.AggregateView("by_name", table, ["name"], [
-    ("total", "score", livetable.AggregateFunction.SUM),
-    ("average", "score", livetable.AggregateFunction.AVG),
-    ("p95", "score", livetable.AggregateFunction.PERCENTILE(0.95)),
-    ("median", "score", livetable.AggregateFunction.MEDIAN),
-])
-agg.sync()  # Incremental update after table changes
-
-# Automatic view propagation with tick()
-# Views created via simplified API (filter, sort, group_by) are auto-registered
-filtered = table.filter(lambda row: row["amount"] > 500)
-sorted_view = table.sort("amount", descending=True)
-grouped = table.group_by("region", agg=[("total", "amount", "sum")])
-
-# After table changes, call tick() to update all views at once
-table.append_row({"region": "South", "amount": 1500})
-table.tick()  # All registered views are now updated
-
-# Check how many views are registered
-count = table.registered_view_count()  # 3 if only the three views above are registered
-
-# View composition - chain views on filtered results (views over views)
-big = table.filter(lambda row: row["amount"] >= 100)
-ranked = big.sort("amount", descending=True)     # SortedView over the filter
-by_region = ranked.group_by("region", agg=[("total", "amount", "sum")])
-table.append_row({"region": "South", "amount": 900})
-table.tick()  # Propagates root -> filter -> sort -> aggregate in one call
-
-# Serialization - export
-csv_string = table.to_csv()
-json_string = table.to_json()
-
-# Serialization - import (types are auto-inferred)
-table_from_csv = livetable.Table.from_csv("imported", csv_string)
-table_from_json = livetable.Table.from_json("imported", json_string)
-
-# Iterator protocol - works with all tables and views
-for row in table:
-    print(f"{row['name']}: {row['score']}")
-
-# Use with comprehensions and built-ins
-names = [row["name"] for row in filtered]
-total = sum(row["score"] for row in table)
-
-# Bulk operations - insert many rows efficiently
-rows = [
-    {"id": 1, "name": "Alice", "score": 95.5},
-    {"id": 2, "name": "Bob", "score": 87.0},
-]
-count = table.append_rows(rows)  # Returns number inserted
-
-# Date and DateTime columns
-from datetime import date, datetime
-
-date_schema = livetable.Schema([
-    ("id", livetable.ColumnType.INT32, False),
-    ("birth_date", livetable.ColumnType.DATE, False),
-    ("created_at", livetable.ColumnType.DATETIME, True),
-])
-events = livetable.Table("events", date_schema)
-events.append_row({
-    "id": 1,
-    "birth_date": date(1990, 5, 15),
-    "created_at": datetime(2024, 1, 15, 10, 30, 0),
-})
-
-# Dates serialize as ISO 8601 strings in CSV/JSON
-csv = events.to_csv()  # birth_date becomes "1990-05-15"
-
-# Pandas interop
-import pandas as pd
-df = table.to_pandas()  # Table → DataFrame
-table = livetable.Table.from_pandas("name", df)  # DataFrame → Table
-```
+The full reference with examples is [docs/PYTHON_BINDINGS_README.md](docs/PYTHON_BINDINGS_README.md); a complete runnable chain is in [Getting Started](docs/GETTING_STARTED.md).
