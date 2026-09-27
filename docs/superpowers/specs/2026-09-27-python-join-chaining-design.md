@@ -1,7 +1,7 @@
 # Python Chaining over Joins — Design
 
 **Date:** 2026-09-27
-**Status:** Approved design; not yet implemented
+**Status:** Implemented 2026-09-27
 **Goal:** Python users can build filters, sorts, and aggregates on a join, and
 `tick()` keeps the whole chain current, so the join output changesets
 ([spec](2026-09-27-join-output-changesets-design.md)) benefit Python.

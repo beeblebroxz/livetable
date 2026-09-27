@@ -180,6 +180,8 @@ Filters, sorted views, aggregates, and joins publish changesets, allowing
 `table -> filter -> sort -> group_by` to update incrementally in Rust and Python.
 Rust filters, sorts, and joins over an aggregate replay its changed groups, and
 Rust filters, sorts, aggregates, and joins over a join replay its changed rows.
+Python chains `joined.filter()`, `.sort()`, and `.group_by()` on a join; they
+register on both joined tables, so either table's `tick()` updates them.
 Small batches evaluate only changed rows; an edit that stays outside the filter
 produces no downstream changes in these engine stages. Protocol v4 also suppresses
 empty filter/sort/group deliveries and sends groups deltas.
@@ -234,6 +236,14 @@ joined = students.join(grades, on="id", how="full")   # also: "outer", "full_out
 
 # Multi-column join
 joined = sales.join(targets, on=["year", "month"])
+
+# Views over a join: either table's tick() updates the whole chain
+enrolled = students.join(enrollments, left_on="id", right_on="student_id", how="inner")
+honors = enrolled.filter(lambda r: r["score"] is not None and r["score"] >= 90)
+per_course = enrolled.group_by("right_course", agg=[("students", "id", "count")])
+ranked = enrolled.sort("score", descending=True)
+enrollments.append_row({"student_id": 1, "course": "Math"})
+enrollments.tick()
 ```
 
 ### Aggregations

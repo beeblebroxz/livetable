@@ -140,8 +140,10 @@ orders.tick()
 assert totals[0]["total"] == 900.0
 ```
 
-Python supports `FilterView.sort()`, `FilterView.group_by()`, and
-`SortedView.group_by()`; arbitrary view composition is available in Rust.
+Python supports `FilterView.sort()`, `FilterView.group_by()`,
+`SortedView.group_by()`, and `JoinView.filter()/sort()/group_by()`; arbitrary
+view composition is available in Rust. Views chained on a join register on
+both joined tables, so tick whichever table you mutated.
 Registering happens in creation order, so this chain updates parent-first.
 Filters and sorts replay up to 256 input events, retaining one batch of output.
 Missing history, oversized batches, and explicit refresh use rebuild fallbacks.
@@ -151,6 +153,8 @@ Explicit constructors normally require manual `sync()`/`refresh()`. Calling
 `group_by()` on an explicit sort also registers that sort before the new child.
 An explicitly constructed filter still needs manual synchronization even when
 its child is registered; prefer `table.filter()` for fully automatic chains.
+An explicit `JoinView` registers itself on both tables the first time you
+chain a view on it.
 After a refresh without a root mutation, manually sync descendants because
 `tick()` returns immediately when the root has no pending mutations.
 

@@ -864,6 +864,19 @@ joined = livetable.JoinView("j", sales, targets,
 - `sync()` - Incremental update after table changes; returns True when joined
   rows or values changed, including edits to non-key columns
 - `refresh()` - Full rebuild
+- `filter(predicate)` - FilterView over the joined rows. The predicate receives
+  each row as `joined[i]` returns it: right columns prefixed `"right_"`, and
+  `None` for every column of an unmatched side
+- `sort(by, descending=None)` - SortedView over the joined rows (same
+  arguments as `Table.sort`)
+- `group_by(by, agg)` - AggregateView over the joined rows (same arguments as
+  `Table.group_by`)
+
+Views chained on a join (including further `.sort()`/`.group_by()` on the
+results) register for `tick()` on both joined tables, after the join. Tick the
+table you mutated: either table's `tick()` updates the join and its chain. An
+explicit `JoinView` registers itself the first time a view is chained on it.
+Registries hold weak references, so keep the chained views you use alive.
 
 **Notes:**
 - Right table columns are prefixed with `"right_"` to avoid conflicts

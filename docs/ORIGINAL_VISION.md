@@ -249,6 +249,7 @@ items below remain original future ideas.
 - [x] Protocol v3 base/filter/sort delta delivery, node-local baselines, snapshot fallback, and checkpoint-based resynchronization
 - [x] AggregateView output changesets and protocol v4 group deltas; filter/sort/join children of aggregates replay instead of rebuilding
 - [x] JoinView output changesets; filter/sort/aggregate/join children of joins replay instead of rebuilding
+- [x] Python chaining over joins (`JoinView.filter/sort/group_by`, registered on both joined tables)
 - [x] Local [Orders Lab](ORDERS_LAB.md): guided incremental/recovery scenarios, independent clients, virtualized 100k-row inspection and bounded synthetic streaming
 - [x] RIGHT and FULL OUTER joins
 - [x] Multi-column joins (composite key support)

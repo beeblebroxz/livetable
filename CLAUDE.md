@@ -142,7 +142,7 @@ cd frontend && npm install && npm run dev
 - The canonical wire reference is `docs/WEBSOCKET_PROTOCOL.md`; update it whenever message shapes, limits, generation rules, or sequence semantics change.
 - `Table::from_json`/`from_csv` infer each column's type by scanning all rows and unifying (INT32 → INT64 → FLOAT64, DATE → DATETIME, date-ish ⊔ plain string → STRING; all-null/empty → STRING); values are then converted against the inferred schema, not in isolation. JSON rejects incompatible mixes (number + string) at inference with a clear error; CSV falls back to STRING since every CSV value is a string at heart.
 - Iterator mutation guards: table/filter/projection/computed iterators capture the root table version; join/sort/aggregate iterators use `ReadableTable::version()` including ancestors and their own sync counter. All detect root mutations; the latter also detect view-version advances on sync/refresh. Filter-only refresh without root mutation is not detected. No-op sync does not invalidate an iterator.
-- Python chaining supports `FilterView.sort()`, `FilterView.group_by()`, and `SortedView.group_by()`, not every Rust DAG. Simplified stateful methods auto-register. Explicit constructors normally do not; `SortedView.group_by()` registers its sort parent once, but children of an explicit filter still require that filter to be synced manually first. Root `tick()` does nothing without pending root changes: after a manual parent refresh, sync children directly.
+- Python chaining supports `FilterView.sort()/group_by()`, `SortedView.group_by()`, and `JoinView.filter()/sort()/group_by()`, not every Rust DAG. Simplified stateful methods auto-register. Views chained on a join register on both joined tables (after the join, once per distinct registry via `register_on_roots`), so either table's `tick()` updates them. Explicit constructors normally do not register; `SortedView.group_by()` registers its sort parent once and an explicit `JoinView` registers itself on first chaining, but children of an explicit filter still require that filter to be synced manually first. The Python filter (`PyFilterViewInner`) accepts any `ReadableTable` parent and translates its cursor with `root_changeset_cursor()` for compaction; tick registries hold weak references, so keep chained views alive. Root `tick()` does nothing without pending root changes: after a manual parent refresh, sync children directly.
 - JoinView registers with both parent tables for tick() propagation via JoinLeft/JoinRight variants
 - Interned string buffers (`ColumnData::StringIds`) use `NULL_STRING_ID` (u32::MAX) as null sentinel — never use 0
 - `Column::check_value_type(&value)` validates without consuming — use before batch mutations
@@ -260,6 +260,15 @@ joined = livetable.JoinView("result", t1, t2, "id", "id", livetable.JoinType.FUL
 # Incremental sync (also available on JoinView)
 joined.sync()     # Incremental update, returns bool
 joined.refresh()  # Full rebuild
+
+# Views over a join (registered on both tables: tick either one)
+enriched = orders.join(customers, left_on="cust", right_on="cid")
+big_by_tier = enriched.filter(lambda r: r["amount"] >= 50).group_by(
+    "right_tier", agg=[("total", "amount", "sum")]
+)
+ranked = enriched.sort("amount", descending=True)
+customers.set_value(0, "tier", 2)
+customers.tick()  # join, filter, group, and sort all update
 
 # Simple aggregations
 total = table.sum("score")
