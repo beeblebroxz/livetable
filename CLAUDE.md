@@ -8,12 +8,7 @@ LiveTable is a columnar table system written in Rust with Python bindings via Py
 
 ## Working Style
 
-Solo project: no PR workflows, no review checkpoints, minimal commit formality. In this repo these rules override the superpowers workflow skills:
-
-- Ask design questions only at a genuine fork, all in one message. Otherwise pick the option that best fits the design vision and say why.
-- Once I approve a spec, write the plan and implement it without further checkpoints. Execute plans inline; don't ask me to choose an execution mode.
-- When a piece of work is done, don't offer merge or PR options: commit on `master` and say what was tested.
-- Keep writing specs and plans to `docs/superpowers/`; they are how the next session sees what is done and what is next.
+The Working Style in `~/projects/CLAUDE.md` applies. Keep writing specs and plans to `docs/superpowers/`; they are how the next session sees what is done and what is next.
 
 ## Original Design Vision
 
