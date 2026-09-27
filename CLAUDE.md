@@ -91,6 +91,7 @@ cd frontend && npm install && npm run dev
 - **column.rs** + **column/** - Public ColumnValue API over native-width typed buffers, packed array/tiered NULL masks, and ID-only interned strings; storage/bitmap model tests live alongside the implementation
 - **table.rs** - Row-level CRUD operations on column collections
 - **readable.rs** - `ReadableTable` trait: the read surface shared by `Table` and every view, enabling views-over-views (DAG composition)
+- **changeset.rs** - `TableChange` events and the `Changeset` history that every incremental view consumes and publishes
 - **view.rs** + **view/** - Shared-source views, one file per type: `FilterView`, `ProjectionView`, `ComputedView`, `JoinView` (LEFT/INNER/RIGHT/FULL), `SortedView`, `AggregateView`, `TickableTable`; view.rs holds shared typed join-key machinery; tests in view/tests.rs
 - **filter_changes.rs** - Shared historical-row reconstruction and filter replay for Rust/Python; also used by sort/aggregate consumers
 - **python_bindings.rs** - PyO3 bindings exposing Rust types as Python classes
