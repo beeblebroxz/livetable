@@ -1,10 +1,12 @@
 //! JoinView — LEFT/INNER/RIGHT/FULL joins with incremental sync.
 
-use crate::changeset::TableChange;
+use crate::changeset::{Changeset, TableChange};
 use crate::column::ColumnValue;
+use crate::filter_changes::{row_after_update, MAX_FILTER_REPLAY_CHANGES};
 use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 
 use super::{column_value_into_join_key_part, column_value_to_join_key_part, JoinKey, JoinKeyPart};
@@ -20,6 +22,60 @@ pub enum JoinType {
     Right,
     /// Full outer join: All rows from both tables (nulls where no match on either side)
     Full,
+}
+
+type Row = HashMap<String, ColumnValue>;
+/// (left row, right row); `None` is the unmatched side.
+type Entry = (Option<usize>, Option<usize>);
+
+/// A batch whose output would exceed this invalidates its history instead:
+/// consumers rebuild above their own replay bounds anyway.
+const MAX_JOIN_OUTPUT_CHANGES: usize = MAX_FILTER_REPLAY_CHANGES * 2;
+
+/// One incremental batch's output events. Past the bound it stops recording,
+/// and building payloads; the batch then invalidates history.
+#[derive(Default)]
+struct JoinOutput {
+    changes: Vec<TableChange>,
+    overflowed: bool,
+}
+
+impl JoinOutput {
+    fn record(
+        &mut self,
+        change: impl FnOnce() -> Result<TableChange, String>,
+    ) -> Result<(), String> {
+        if self.overflowed {
+            return Ok(());
+        }
+        if self.changes.len() == MAX_JOIN_OUTPUT_CHANGES {
+            self.overflowed = true;
+            self.changes = Vec::new();
+            return Ok(());
+        }
+        self.changes.push(change()?);
+        Ok(())
+    }
+
+    fn emitted(&self) -> bool {
+        self.overflowed || !self.changes.is_empty()
+    }
+}
+
+/// Where one half of an emitted output row comes from.
+#[derive(Clone, Copy)]
+enum Half<'a> {
+    /// The parent row as of the change being applied, from its changeset.
+    Given(&'a Row),
+    /// Read live from the parent; `None` is all Nulls.
+    Live(Option<usize>),
+}
+
+/// A right-parent row with its columns named as the join outputs them.
+fn prefix_right(row: Row) -> Row {
+    row.into_iter()
+        .map(|(column, value)| (format!("right_{column}"), value))
+        .collect()
 }
 
 /// A JoinView combines two tables based on matching column values.
@@ -94,6 +150,9 @@ pub struct JoinView {
     /// Parent versions observed at the last sync/rebuild.
     last_left_parent_version: u64,
     last_right_parent_version: u64,
+    /// The latest incremental batch in JOIN coordinates (join_index
+    /// positions). Rebuilds and oversized batches invalidate it.
+    output_changes: Changeset,
 }
 
 impl JoinView {
@@ -216,6 +275,7 @@ impl JoinView {
             sync_count: 0,
             last_left_parent_version: left_version,
             last_right_parent_version: right_version,
+            output_changes: Changeset::new(),
         };
 
         view.rebuild_index();
@@ -333,6 +393,7 @@ impl JoinView {
         self.last_right_parent_version = right.version();
         drop(left);
         drop(right);
+        self.output_changes.invalidate();
         self.sync_count += 1;
     }
 
@@ -421,6 +482,469 @@ impl JoinView {
             })
     }
 
+    /// An output row: left columns plus `right_`-prefixed right columns.
+    fn output_row(&self, left: Half, right: Half) -> Result<Row, String> {
+        let mut row = match left {
+            Half::Given(row) => row.clone(),
+            Half::Live(Some(l)) => self.left_table.borrow().get_row(l)?,
+            Half::Live(None) => self
+                .left_column_names
+                .iter()
+                .map(|column| (column.clone(), ColumnValue::Null))
+                .collect(),
+        };
+        match right {
+            Half::Given(right) => row.extend(prefix_right(right.clone())),
+            Half::Live(Some(r)) => row.extend(prefix_right(self.right_table.borrow().get_row(r)?)),
+            Half::Live(None) => row.extend(
+                self.right_column_names
+                    .iter()
+                    .map(|column| (format!("right_{column}"), ColumnValue::Null)),
+            ),
+        }
+        Ok(row)
+    }
+
+    /// Positions of left row `l`'s entries: contiguous, since `join_index` is
+    /// sorted by left row.
+    fn left_range(&self, l: usize) -> Range<usize> {
+        let start = self
+            .join_index
+            .partition_point(|(el, _)| el.is_some_and(|el| el < l));
+        start..self.find_left_insert_position(l)
+    }
+
+    /// Ascending positions of right row `r`'s entries (scattered).
+    fn right_positions(&self, r: usize) -> Vec<usize> {
+        (0..self.join_index.len())
+            .filter(|&p| self.join_index[p].1 == Some(r))
+            .collect()
+    }
+
+    /// Right row → ascending positions, for a right batch that only updates
+    /// values (no position moves while it applies).
+    fn right_position_map(&self) -> HashMap<usize, Vec<usize>> {
+        let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (p, &(_, r)) in self.join_index.iter().enumerate() {
+            if let Some(r) = r {
+                map.entry(r).or_default().push(p);
+            }
+        }
+        map
+    }
+
+    fn insert_entry(
+        &mut self,
+        pos: usize,
+        entry: Entry,
+        left: Half,
+        right: Half,
+        out: &mut JoinOutput,
+    ) -> Result<(), String> {
+        self.join_index.insert(pos, entry);
+        out.record(|| {
+            Ok(TableChange::RowInserted {
+                index: pos,
+                data: self.output_row(left, right)?,
+            })
+        })
+    }
+
+    /// Remove left row `l`'s entries, recorded with `left` as the left half.
+    /// Returns the right rows they matched.
+    fn remove_left_entries(
+        &mut self,
+        l: usize,
+        left: &Row,
+        out: &mut JoinOutput,
+    ) -> Result<Vec<usize>, String> {
+        let range = self.left_range(l);
+        let removed: Vec<Entry> = self.join_index.drain(range.clone()).collect();
+        for &(_, r) in &removed {
+            out.record(|| {
+                Ok(TableChange::RowDeleted {
+                    index: range.start,
+                    data: self.output_row(Half::Given(left), Half::Live(r))?,
+                })
+            })?;
+        }
+        Ok(removed.into_iter().filter_map(|(_, r)| r).collect())
+    }
+
+    /// Remove right row `r`'s entries in ascending order, each recorded at its
+    /// index after the removals before it. Returns the left rows they matched.
+    fn remove_right_entries(
+        &mut self,
+        r: usize,
+        right: &Row,
+        out: &mut JoinOutput,
+    ) -> Result<Vec<usize>, String> {
+        let positions = self.right_positions(r);
+        for (removed, &p) in positions.iter().enumerate() {
+            let left = self.join_index[p].0;
+            out.record(|| {
+                Ok(TableChange::RowDeleted {
+                    index: p - removed,
+                    data: self.output_row(Half::Live(left), Half::Given(right))?,
+                })
+            })?;
+        }
+        let lefts = positions
+            .iter()
+            .filter_map(|&p| self.join_index[p].0)
+            .collect();
+        self.join_index.retain(|&(_, er)| er != Some(r));
+        Ok(lefts)
+    }
+
+    /// RIGHT/FULL: right rows that lost their last match become unmatched
+    /// entries in the tail, which is sorted by right row.
+    fn orphan_unmatched(&mut self, rights: Vec<usize>, out: &mut JoinOutput) -> Result<(), String> {
+        if !matches!(self.join_type, JoinType::Right | JoinType::Full) {
+            return Ok(());
+        }
+        for r in rights {
+            let still_matched = self
+                .join_index
+                .iter()
+                .any(|&(l, er)| l.is_some() && er == Some(r));
+            if !still_matched {
+                let pos = self.find_orphan_insert_position(r);
+                self.insert_entry(
+                    pos,
+                    (None, Some(r)),
+                    Half::Live(None),
+                    Half::Live(Some(r)),
+                    out,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// LEFT/FULL: left rows that lost their last match get a placeholder.
+    fn placehold_unmatched(
+        &mut self,
+        lefts: Vec<usize>,
+        out: &mut JoinOutput,
+    ) -> Result<(), String> {
+        if !matches!(self.join_type, JoinType::Left | JoinType::Full) {
+            return Ok(());
+        }
+        for l in lefts {
+            let range = self.left_range(l);
+            if range.is_empty() {
+                let pos = range.start;
+                self.insert_entry(
+                    pos,
+                    (Some(l), None),
+                    Half::Live(Some(l)),
+                    Half::Live(None),
+                    out,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert left row `l`'s entries: one per matching right row (claiming
+    /// any RIGHT/FULL orphan first), or the LEFT/FULL placeholder.
+    fn insert_left_matches(
+        &mut self,
+        l: usize,
+        matching: Option<&Vec<usize>>,
+        left: &Row,
+        out: &mut JoinOutput,
+    ) -> Result<(), String> {
+        match matching {
+            Some(rights) => {
+                if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                    for &r in rights {
+                        let orphan = self
+                            .join_index
+                            .iter()
+                            .position(|&(el, er)| el.is_none() && er == Some(r));
+                        if let Some(pos) = orphan {
+                            out.record(|| {
+                                Ok(TableChange::RowDeleted {
+                                    index: pos,
+                                    data: self.output_row(Half::Live(None), Half::Live(Some(r)))?,
+                                })
+                            })?;
+                            self.join_index.remove(pos);
+                        }
+                    }
+                }
+                let pos = self.find_left_insert_position(l);
+                for (offset, &r) in rights.iter().enumerate() {
+                    self.insert_entry(
+                        pos + offset,
+                        (Some(l), Some(r)),
+                        Half::Given(left),
+                        Half::Live(Some(r)),
+                        out,
+                    )?;
+                }
+            }
+            None if matches!(self.join_type, JoinType::Left | JoinType::Full) => {
+                let pos = self.find_left_insert_position(l);
+                self.insert_entry(
+                    pos,
+                    (Some(l), None),
+                    Half::Given(left),
+                    Half::Live(None),
+                    out,
+                )?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Insert right row `r`'s entries: fill LEFT/FULL placeholders in place,
+    /// add matched entries, or the RIGHT/FULL unmatched entry.
+    fn insert_right_matches(
+        &mut self,
+        r: usize,
+        matching: Option<&Vec<usize>>,
+        right: &Row,
+        out: &mut JoinOutput,
+    ) -> Result<(), String> {
+        match matching {
+            Some(lefts) => {
+                for &l in lefts {
+                    let placeholder = self.left_range(l).find(|&p| self.join_index[p].1.is_none());
+                    if let Some(pos) = placeholder {
+                        self.join_index[pos] = (Some(l), Some(r));
+                        for column in &self.right_column_names {
+                            let value = right.get(column).cloned().unwrap_or(ColumnValue::Null);
+                            if value != ColumnValue::Null {
+                                out.record(|| {
+                                    Ok(TableChange::CellUpdated {
+                                        row: pos,
+                                        column: format!("right_{column}"),
+                                        old_value: ColumnValue::Null,
+                                        new_value: value,
+                                    })
+                                })?;
+                            }
+                        }
+                    } else {
+                        let pos = self.find_right_insert_position(l, r);
+                        self.insert_entry(
+                            pos,
+                            (Some(l), Some(r)),
+                            Half::Live(Some(l)),
+                            Half::Given(right),
+                            out,
+                        )?;
+                    }
+                }
+            }
+            None if matches!(self.join_type, JoinType::Right | JoinType::Full) => {
+                let pos = self.find_orphan_insert_position(r);
+                self.insert_entry(
+                    pos,
+                    (None, Some(r)),
+                    Half::Live(None),
+                    Half::Given(right),
+                    out,
+                )?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Record one value update at each output position.
+    fn update_cells(
+        positions: impl IntoIterator<Item = usize>,
+        column: String,
+        old_value: &ColumnValue,
+        new_value: &ColumnValue,
+        out: &mut JoinOutput,
+    ) -> Result<(), String> {
+        for pos in positions {
+            out.record(|| {
+                Ok(TableChange::CellUpdated {
+                    row: pos,
+                    column: column.clone(),
+                    old_value: old_value.clone(),
+                    new_value: new_value.clone(),
+                })
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Apply the left parent's batch in order, recording output events. The
+    /// right side has no structural changes, so it is read live.
+    fn apply_left_changes(
+        &mut self,
+        changes: &[TableChange],
+        out: &mut JoinOutput,
+    ) -> Result<(), String> {
+        let mut right_lookup: Option<HashMap<JoinKey, Vec<usize>>> = None;
+        for (t, change) in changes.iter().enumerate() {
+            match change {
+                TableChange::RowDeleted { index, data } => {
+                    let rights = self.remove_left_entries(*index, data, out)?;
+                    for (l, _) in self.join_index.iter_mut() {
+                        if let Some(l) = l {
+                            if *l > *index {
+                                *l -= 1;
+                            }
+                        }
+                    }
+                    self.orphan_unmatched(rights, out)?;
+                }
+                TableChange::RowInserted { index, data } => {
+                    // Tail-insert fast path: join_index is sorted by left row
+                    // with None-left entries last, so the max existing left row
+                    // is the last Some(l) — usually found in O(1) from the end.
+                    let max_existing_left = self.join_index.iter().rev().find_map(|(l, _)| *l);
+                    if max_existing_left.is_some_and(|max_l| max_l >= *index) {
+                        for (l, _) in self.join_index.iter_mut() {
+                            if let Some(l) = l {
+                                if *l >= *index {
+                                    *l += 1;
+                                }
+                            }
+                        }
+                    }
+                    let key = Self::build_composite_key(data, &self.left_keys);
+                    let lookup = right_lookup.get_or_insert_with(|| self.build_right_lookup());
+                    self.insert_left_matches(*index, key.and_then(|k| lookup.get(&k)), data, out)?;
+                }
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    new_value,
+                } if self.left_keys.contains(column) => {
+                    let after =
+                        row_after_update(changes, t, |i| self.left_table.borrow().get_row(i))?;
+                    let mut before = after.clone();
+                    before.insert(column.clone(), old_value.clone());
+                    let new_key = Self::build_composite_key(&after, &self.left_keys);
+                    if Self::build_composite_key(&before, &self.left_keys) == new_key {
+                        let at = self.left_range(*row);
+                        Self::update_cells(at, column.clone(), old_value, new_value, out)?;
+                        continue;
+                    }
+                    let rights = self.remove_left_entries(*row, &before, out)?;
+                    self.orphan_unmatched(rights, out)?;
+                    let lookup = right_lookup.get_or_insert_with(|| self.build_right_lookup());
+                    self.insert_left_matches(
+                        *row,
+                        new_key.and_then(|k| lookup.get(&k)),
+                        &after,
+                        out,
+                    )?;
+                }
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    new_value,
+                } => {
+                    let at = self.left_range(*row);
+                    Self::update_cells(at, column.clone(), old_value, new_value, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the right parent's batch in order, recording output events. The
+    /// left side has no structural changes, so it is read live. A value-only
+    /// batch (`structural == false`) maps right rows to positions once.
+    fn apply_right_changes(
+        &mut self,
+        changes: &[TableChange],
+        structural: bool,
+        out: &mut JoinOutput,
+    ) -> Result<(), String> {
+        let mut left_lookup: Option<HashMap<JoinKey, Vec<usize>>> = None;
+        let mut positions: Option<HashMap<usize, Vec<usize>>> = None;
+        for (t, change) in changes.iter().enumerate() {
+            match change {
+                TableChange::RowDeleted { index, data } => {
+                    let lefts = self.remove_right_entries(*index, data, out)?;
+                    for (_, r) in self.join_index.iter_mut() {
+                        if let Some(r) = r {
+                            if *r > *index {
+                                *r -= 1;
+                            }
+                        }
+                    }
+                    self.placehold_unmatched(lefts, out)?;
+                }
+                TableChange::RowInserted { index, data } => {
+                    // Right rows are not monotonic in join_index (sorted by
+                    // left), so the shift is a single conditional pass.
+                    for (_, r) in self.join_index.iter_mut() {
+                        if let Some(r) = r {
+                            if *r >= *index {
+                                *r += 1;
+                            }
+                        }
+                    }
+                    let key = Self::build_composite_key(data, &self.right_keys);
+                    let lookup = left_lookup.get_or_insert_with(|| self.build_left_lookup());
+                    self.insert_right_matches(*index, key.and_then(|k| lookup.get(&k)), data, out)?;
+                }
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    new_value,
+                } if self.right_keys.contains(column) => {
+                    let after =
+                        row_after_update(changes, t, |i| self.right_table.borrow().get_row(i))?;
+                    let mut before = after.clone();
+                    before.insert(column.clone(), old_value.clone());
+                    let new_key = Self::build_composite_key(&after, &self.right_keys);
+                    if Self::build_composite_key(&before, &self.right_keys) == new_key {
+                        let at = self.right_positions(*row);
+                        Self::update_cells(
+                            at,
+                            format!("right_{column}"),
+                            old_value,
+                            new_value,
+                            out,
+                        )?;
+                        continue;
+                    }
+                    let lefts = self.remove_right_entries(*row, &before, out)?;
+                    self.placehold_unmatched(lefts, out)?;
+                    let lookup = left_lookup.get_or_insert_with(|| self.build_left_lookup());
+                    self.insert_right_matches(
+                        *row,
+                        new_key.and_then(|k| lookup.get(&k)),
+                        &after,
+                        out,
+                    )?;
+                }
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    new_value,
+                } => {
+                    let at = if structural {
+                        self.right_positions(*row)
+                    } else {
+                        let map = positions.get_or_insert_with(|| self.right_position_map());
+                        map.get(row).cloned().unwrap_or_default()
+                    };
+                    Self::update_cells(at, format!("right_{column}"), old_value, new_value, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the number of rows in the joined result
     pub fn len(&self) -> usize {
         self.join_index.len()
@@ -436,38 +960,11 @@ impl JoinView {
     /// The returned row contains all columns from both tables.
     /// For left joins where no right match exists, right columns will be Null.
     pub fn get_row(&self, index: usize) -> Result<HashMap<String, ColumnValue>, String> {
-        if index >= self.join_index.len() {
-            return Err(format!("Index {} out of range [0, {})", index, self.len()));
-        }
-
-        let (left_idx_opt, right_idx_opt) = self.join_index[index];
-
-        let mut result =
-            HashMap::with_capacity(self.left_column_names.len() + self.right_column_names.len());
-
-        // Add all columns from left table (or nulls if no left match)
-        if let Some(left_idx) = left_idx_opt {
-            let left_row = self.left_table.borrow().get_row(left_idx)?;
-            result.extend(left_row);
-        } else {
-            for col_name in &self.left_column_names {
-                result.insert(col_name.clone(), ColumnValue::Null);
-            }
-        }
-
-        // Add columns from right table (or nulls if no match), prefixing with "right_"
-        if let Some(right_idx) = right_idx_opt {
-            let right_row = self.right_table.borrow().get_row(right_idx)?;
-            for (col_name, value) in right_row {
-                result.insert(format!("right_{}", col_name), value);
-            }
-        } else {
-            for col_name in &self.right_column_names {
-                result.insert(format!("right_{}", col_name), ColumnValue::Null);
-            }
-        }
-
-        Ok(result)
+        let &(left, right) = self
+            .join_index
+            .get(index)
+            .ok_or_else(|| format!("Index {} out of range [0, {})", index, self.len()))?;
+        self.output_row(Half::Live(left), Half::Live(right))
     }
 
     /// Gets a specific value from the joined view
@@ -567,8 +1064,9 @@ impl JoinView {
         false
     }
 
-    /// Incrementally sync with both parent tables' changes
-    /// Returns true if any changes were applied
+    /// Incrementally sync with both parents' changes, recording output
+    /// history. Returns true if the output changed (rows moved or any value
+    /// changed).
     ///
     /// Single-side batches (all structural changes on one parent) are handled
     /// incrementally. Batches that mix reference frames fall back to a full
@@ -616,27 +1114,29 @@ impl JoinView {
 
         let left_changes: Vec<TableChange> = left_changes.to_vec();
         let right_changes: Vec<TableChange> = right_changes.to_vec();
+        let parent_versions = (left_table.version(), right_table.version());
         drop(left_table);
         drop(right_table);
 
         if left_changes.is_empty() && right_changes.is_empty() {
+            // An upstream view can advance a parent's version without emitting
+            // rows (a filter's excluded edit). Keep history, but record the
+            // versions so children still see a coherent baseline.
+            (
+                self.last_left_parent_version,
+                self.last_right_parent_version,
+            ) = parent_versions;
             return false;
         }
 
-        // Frame-mixing guard. The insert/key-update handlers below match new
-        // rows against LIVE parent lookups (post-batch indices), while the
-        // per-change shift loops treat existing join_index entries as
-        // pre-batch. Two batch shapes mix those frames irreparably:
-        //   1. Structural changes on BOTH sides in one batch — pairs added by
-        //      the left pass carry live right indices, which the right-insert
-        //      pass then re-shifts (and the de-dup against raw changeset
-        //      indices misses shifted new lefts).
-        //   2. A key update recorded BEFORE an insert/delete on the same side
-        //      — the handler reads live row data at the recorded index, which
-        //      the later change has already shifted.
-        // Both are rare under tick()-driven usage (each side's queue is
-        // consumed promptly); a full rebuild is correct by construction and
-        // advances both cursors.
+        // Frame-mixing guard. The insert/key-update handlers match new rows
+        // against LIVE lookups of the other parent, while shifts treat
+        // existing join_index entries as pre-batch. Two batch shapes mix those
+        // frames irreparably:
+        //   1. Structural changes on BOTH sides in one batch.
+        //   2. A key update recorded BEFORE an insert/delete on the same side.
+        // Both are rare under tick()-driven usage; a full rebuild is correct
+        // by construction and advances both cursors.
         let left_structural = Self::has_structural_changes(&left_changes, &self.left_keys);
         let right_structural = Self::has_structural_changes(&right_changes, &self.right_keys);
         if (left_structural && right_structural)
@@ -647,458 +1147,29 @@ impl JoinView {
             return true;
         }
 
-        // Single-side batches: all RowInserted, RowDeleted, and key-column
-        // CellUpdated changes are handled incrementally below. (Non-key
-        // CellUpdated never requires join_index changes — views read live
-        // data via get_row.)
-
-        let mut modified = false;
-
-        // Handle left table inserts — build right lookup once, not per insert
-        let has_left_inserts = left_changes
-            .iter()
-            .any(|c| matches!(c, TableChange::RowInserted { .. }));
-        let right_lookup = if has_left_inserts {
-            Some(self.build_right_lookup())
+        // Past every rebuild fallback: this batch replaces retained history.
+        self.output_changes.clear();
+        let mut out = JoinOutput::default();
+        // The value-only side goes first, so the structural side reads the
+        // other parent live in the state consumers have already applied.
+        let applied = if left_structural {
+            self.apply_right_changes(&right_changes, false, &mut out)
+                .and_then(|()| self.apply_left_changes(&left_changes, &mut out))
         } else {
-            None
+            self.apply_left_changes(&left_changes, &mut out)
+                .and_then(|()| self.apply_right_changes(&right_changes, right_structural, &mut out))
         };
-
-        for change in &left_changes {
-            match change {
-                TableChange::RowDeleted { index: del_idx, .. } => {
-                    // Step 1: capture right indices that were matched by this
-                    // left row — needed for RIGHT/FULL orphan handling below.
-                    let removed_right_indices: Vec<usize> = self
-                        .join_index
-                        .iter()
-                        .filter_map(|(l, r)| if *l == Some(*del_idx) { *r } else { None })
-                        .collect();
-
-                    // Step 2: remove all join_index entries pointing at the
-                    // deleted left row (matched entries AND LEFT/FULL placeholders).
-                    let before_len = self.join_index.len();
-                    self.join_index.retain(|(l, _)| *l != Some(*del_idx));
-                    if self.join_index.len() != before_len {
-                        modified = true;
-                    }
-
-                    // Step 3: shift remaining left indices > del_idx down by 1.
-                    for (l_opt, _) in self.join_index.iter_mut() {
-                        if let Some(l) = l_opt {
-                            if *l > *del_idx {
-                                *l -= 1;
-                            }
-                        }
-                    }
-
-                    // Step 4: RIGHT/FULL only — any right row that was
-                    // previously matched by the deleted left and is no longer
-                    // matched by ANY remaining left becomes unmatched: insert
-                    // (None, Some(right_idx)) at the sorted position within the
-                    // None-left tail to match rebuild_index's ordering.
-                    if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
-                        for r_idx in removed_right_indices {
-                            let still_matched = self
-                                .join_index
-                                .iter()
-                                .any(|(l, r)| l.is_some() && *r == Some(r_idx));
-                            if !still_matched {
-                                let pos = self.find_orphan_insert_position(r_idx);
-                                self.join_index.insert(pos, (None, Some(r_idx)));
-                                modified = true;
-                            }
-                        }
-                    }
-                }
-
-                TableChange::RowInserted { index, data } => {
-                    // Tail-insert fast path. join_index is sorted (Some(l) entries
-                    // first, ascending by l; None-left entries last). The max
-                    // existing left_idx is the last Some(l) before the None-left
-                    // tail — found in O(K) by scanning from the end, where K is
-                    // typically 0 (INNER) or small (LEFT/FULL with few unmatched).
-                    let max_existing_left = self.join_index.iter().rev().find_map(|(l, _)| *l);
-                    let needs_shift = max_existing_left.is_some_and(|max_l| max_l >= *index);
-
-                    if needs_shift {
-                        for (left_idx_opt, _) in self.join_index.iter_mut() {
-                            if let Some(left_idx) = left_idx_opt {
-                                if *left_idx >= *index {
-                                    *left_idx += 1;
-                                }
-                            }
-                        }
-                    }
-
-                    // Find matches for the new left row
-                    if let Some(key) = Self::build_composite_key(data, &self.left_keys) {
-                        let lookup = right_lookup.as_ref().unwrap();
-
-                        if let Some(matching_indices) = lookup.get(&key) {
-                            // For RIGHT/FULL joins: matched right rows may currently exist
-                            // as unmatched entries (None, Some(right_idx)) in the tail section.
-                            // Remove those before inserting the proper matched entries.
-                            if self.join_type == JoinType::Right || self.join_type == JoinType::Full
-                            {
-                                for &right_idx in matching_indices {
-                                    if let Some(pos) = self
-                                        .join_index
-                                        .iter()
-                                        .position(|(l, r)| l.is_none() && *r == Some(right_idx))
-                                    {
-                                        self.join_index.remove(pos);
-                                    }
-                                }
-                                // insert_pos is computed *after* removals so it reflects
-                                // the post-removal join_index layout.
-                            }
-                            let insert_pos = self.find_left_insert_position(*index);
-                            for (offset, &right_idx) in matching_indices.iter().enumerate() {
-                                self.join_index
-                                    .insert(insert_pos + offset, (Some(*index), Some(right_idx)));
-                                modified = true;
-                            }
-                        } else if self.join_type == JoinType::Left
-                            || self.join_type == JoinType::Full
-                        {
-                            let insert_pos = self.find_left_insert_position(*index);
-                            self.join_index.insert(insert_pos, (Some(*index), None));
-                            modified = true;
-                        }
-                    } else {
-                        // NULL key — matches nothing, but LEFT/FULL include the row
-                        if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
-                            let insert_pos = self.find_left_insert_position(*index);
-                            self.join_index.insert(insert_pos, (Some(*index), None));
-                            modified = true;
-                        }
-                    }
-                }
-                TableChange::CellUpdated {
-                    row,
-                    column,
-                    old_value,
-                    ..
-                } if self.left_keys.contains(column) => {
-                    // Key column changed: rematch this left row.
-                    // Reconstruct the pre-update row by swapping in old_value.
-                    let current_row = match self.left_table.borrow().get_row(*row) {
-                        Ok(r) => r,
-                        Err(_) => continue, // unreadable — skip; matches old fallback semantic
-                    };
-                    let mut old_row = current_row.clone();
-                    old_row.insert(column.clone(), old_value.clone());
-
-                    let old_key = Self::build_composite_key(&old_row, &self.left_keys);
-                    let new_key = Self::build_composite_key(&current_row, &self.left_keys);
-
-                    if old_key == new_key {
-                        // The single changed cell didn't move the composite key
-                        // (e.g., a Null↔Null no-op or equivalent typed value).
-                        continue;
-                    }
-
-                    // ---- Remove old matches for this left row ----
-                    let removed_right_indices: Vec<usize> = self
-                        .join_index
-                        .iter()
-                        .filter_map(|(l, r)| if *l == Some(*row) { *r } else { None })
-                        .collect();
-
-                    let before_len = self.join_index.len();
-                    self.join_index.retain(|(l, _)| *l != Some(*row));
-                    if self.join_index.len() != before_len {
-                        modified = true;
-                    }
-
-                    // RIGHT/FULL: resurrect any newly orphaned right rows.
-                    if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
-                        for r_idx in removed_right_indices {
-                            let still_matched = self
-                                .join_index
-                                .iter()
-                                .any(|(l, r)| l.is_some() && *r == Some(r_idx));
-                            if !still_matched {
-                                let pos = self.find_orphan_insert_position(r_idx);
-                                self.join_index.insert(pos, (None, Some(r_idx)));
-                                modified = true;
-                            }
-                        }
-                    }
-
-                    // ---- Add new matches for the updated row ----
-                    if let Some(new_key_val) = new_key {
-                        let right_lookup = self.build_right_lookup();
-                        if let Some(matching_right) = right_lookup.get(&new_key_val) {
-                            // RIGHT/FULL: any orphan (None, Some(r)) for the
-                            // now-matched right rows must be removed first.
-                            if self.join_type == JoinType::Right || self.join_type == JoinType::Full
-                            {
-                                for &r_idx in matching_right {
-                                    self.join_index
-                                        .retain(|(l, r)| !(l.is_none() && *r == Some(r_idx)));
-                                }
-                            }
-                            let insert_pos = self.find_left_insert_position(*row);
-                            for (offset, &r_idx) in matching_right.iter().enumerate() {
-                                self.join_index
-                                    .insert(insert_pos + offset, (Some(*row), Some(r_idx)));
-                                modified = true;
-                            }
-                        } else if self.join_type == JoinType::Left
-                            || self.join_type == JoinType::Full
-                        {
-                            let insert_pos = self.find_left_insert_position(*row);
-                            self.join_index.insert(insert_pos, (Some(*row), None));
-                            modified = true;
-                        }
-                    } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
-                        // New key is None (NULL or NaN): LEFT/FULL keeps the row
-                        // with a None-right placeholder.
-                        let insert_pos = self.find_left_insert_position(*row);
-                        self.join_index.insert(insert_pos, (Some(*row), None));
-                        modified = true;
-                    }
-                }
-                _ => {
-                    // CellUpdated on a non-key column: no join_index change
-                    // (views read live data on get_row).
-                }
-            }
+        if applied.is_err() {
+            // An unreadable parent row: rebuild rather than guess.
+            self.rebuild_index();
+            return true;
         }
-
-        // Handle right table inserts — build LEFT lookup once, not per right insert.
-        // Mirrors the existing right_lookup pattern used for left-insert handling.
-        // Was O(left.len()) per right insert via linear scan; now O(matches) via hash lookup.
-        //
-        // No de-duplication against same-batch new lefts is needed: the
-        // frame-mixing guard above rebuilds whenever both sides have
-        // structural changes, so right inserts here never coexist with left
-        // inserts.
-        let has_right_inserts = right_changes
-            .iter()
-            .any(|c| matches!(c, TableChange::RowInserted { .. }));
-        let left_lookup = if has_right_inserts {
-            Some(self.build_left_lookup())
+        let emitted = out.emitted();
+        if out.overflowed {
+            self.output_changes.invalidate();
         } else {
-            None
-        };
-
-        for change in &right_changes {
-            match change {
-                TableChange::RowDeleted { index: del_idx, .. } => {
-                    // Symmetric to the left-delete handler.
-                    // Step 1: capture left indices that were matched by this
-                    // right row — needed for LEFT/FULL orphan handling below.
-                    let removed_left_indices: Vec<usize> = self
-                        .join_index
-                        .iter()
-                        .filter_map(|(l, r)| if *r == Some(*del_idx) { *l } else { None })
-                        .collect();
-
-                    // Step 2: remove all join_index entries pointing at the
-                    // deleted right row.
-                    let before_len = self.join_index.len();
-                    self.join_index.retain(|(_, r)| *r != Some(*del_idx));
-                    if self.join_index.len() != before_len {
-                        modified = true;
-                    }
-
-                    // Step 3: shift remaining right indices > del_idx down by 1.
-                    for (_, r_opt) in self.join_index.iter_mut() {
-                        if let Some(r) = r_opt {
-                            if *r > *del_idx {
-                                *r -= 1;
-                            }
-                        }
-                    }
-
-                    // Step 4: LEFT/FULL only — any left row that was previously
-                    // matched by the deleted right and is no longer matched by
-                    // ANY remaining right becomes a (Some(left_idx), None)
-                    // placeholder at its sorted position.
-                    if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
-                        for l_idx in removed_left_indices {
-                            let still_matched = self
-                                .join_index
-                                .iter()
-                                .any(|(l, r)| *l == Some(l_idx) && r.is_some());
-                            if !still_matched {
-                                let pos = self.find_left_insert_position(l_idx);
-                                self.join_index.insert(pos, (Some(l_idx), None));
-                                modified = true;
-                            }
-                        }
-                    }
-                }
-                TableChange::RowInserted {
-                    index: right_idx,
-                    data,
-                } => {
-                    // Adjust existing right indices. Unlike left, right_idx
-                    // values are not monotonic in join_index (which is sorted
-                    // primarily by left), so we can't shortcut detection in
-                    // sub-linear time; the existing single-pass conditional
-                    // shift is already optimal for this layout.
-                    for (_, right_opt) in self.join_index.iter_mut() {
-                        if let Some(r_idx) = right_opt {
-                            if *r_idx >= *right_idx {
-                                *r_idx += 1;
-                            }
-                        }
-                    }
-
-                    // Find left rows that match this new right row via the precomputed lookup
-                    if let Some(right_key) = Self::build_composite_key(data, &self.right_keys) {
-                        let lookup = left_lookup.as_ref().unwrap();
-                        let candidate_lefts: Vec<usize> =
-                            lookup.get(&right_key).cloned().unwrap_or_default();
-                        let any_match = !candidate_lefts.is_empty();
-
-                        if !candidate_lefts.is_empty() {
-                            for left_idx in candidate_lefts.iter().copied() {
-                                // For LEFT/FULL: may need to replace a (Some(left_idx), None)
-                                // placeholder rather than insert a new entry.
-                                if self.join_type == JoinType::Left
-                                    || self.join_type == JoinType::Full
-                                {
-                                    let existing_null = self
-                                        .join_index
-                                        .iter()
-                                        .position(|(l, r)| *l == Some(left_idx) && r.is_none());
-
-                                    if let Some(pos) = existing_null {
-                                        self.join_index[pos] = (Some(left_idx), Some(*right_idx));
-                                    } else {
-                                        let insert_pos =
-                                            self.find_right_insert_position(left_idx, *right_idx);
-                                        self.join_index
-                                            .insert(insert_pos, (Some(left_idx), Some(*right_idx)));
-                                    }
-                                } else {
-                                    let insert_pos =
-                                        self.find_right_insert_position(left_idx, *right_idx);
-                                    self.join_index
-                                        .insert(insert_pos, (Some(left_idx), Some(*right_idx)));
-                                }
-                                modified = true;
-                            }
-                        }
-
-                        // RIGHT/FULL: if no left match, insert as unmatched right
-                        // row at the sorted position within the None-left tail.
-                        // (Push-at-end happened to produce sorted output today
-                        // because parent right indices are monotonic, but the
-                        // invariant should be structural, not incidental.)
-                        if !any_match
-                            && (self.join_type == JoinType::Right
-                                || self.join_type == JoinType::Full)
-                        {
-                            let pos = self.find_orphan_insert_position(*right_idx);
-                            self.join_index.insert(pos, (None, Some(*right_idx)));
-                            modified = true;
-                        }
-                    } else {
-                        // NULL key on right — for RIGHT/FULL, add as unmatched.
-                        if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
-                            let pos = self.find_orphan_insert_position(*right_idx);
-                            self.join_index.insert(pos, (None, Some(*right_idx)));
-                            modified = true;
-                        }
-                    }
-                }
-                TableChange::CellUpdated {
-                    row,
-                    column,
-                    old_value,
-                    ..
-                } if self.right_keys.contains(column) => {
-                    // Symmetric to the left-key-update handler.
-                    let current_row = match self.right_table.borrow().get_row(*row) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    let mut old_row = current_row.clone();
-                    old_row.insert(column.clone(), old_value.clone());
-
-                    let old_key = Self::build_composite_key(&old_row, &self.right_keys);
-                    let new_key = Self::build_composite_key(&current_row, &self.right_keys);
-
-                    if old_key == new_key {
-                        continue;
-                    }
-
-                    // ---- Remove old matches that pointed at this right row ----
-                    let removed_left_indices: Vec<usize> = self
-                        .join_index
-                        .iter()
-                        .filter_map(|(l, r)| if *r == Some(*row) { *l } else { None })
-                        .collect();
-
-                    let before_len = self.join_index.len();
-                    self.join_index.retain(|(_, r)| *r != Some(*row));
-                    if self.join_index.len() != before_len {
-                        modified = true;
-                    }
-
-                    // LEFT/FULL: resurrect any newly orphaned left rows.
-                    if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
-                        for l_idx in removed_left_indices {
-                            let still_matched = self
-                                .join_index
-                                .iter()
-                                .any(|(l, r)| *l == Some(l_idx) && r.is_some());
-                            if !still_matched {
-                                let pos = self.find_left_insert_position(l_idx);
-                                self.join_index.insert(pos, (Some(l_idx), None));
-                                modified = true;
-                            }
-                        }
-                    }
-
-                    // ---- Add new matches for the updated right row ----
-                    if let Some(new_key_val) = new_key {
-                        let left_lookup = self.build_left_lookup();
-                        if let Some(matching_left) = left_lookup.get(&new_key_val) {
-                            for &l_idx in matching_left {
-                                // LEFT/FULL: a (Some(l_idx), None) placeholder
-                                // for this left is no longer correct (the left
-                                // just gained a match) — replace it in place.
-                                let existing_null = self
-                                    .join_index
-                                    .iter()
-                                    .position(|(l, r)| *l == Some(l_idx) && r.is_none());
-                                if let Some(pos) = existing_null {
-                                    self.join_index[pos] = (Some(l_idx), Some(*row));
-                                } else {
-                                    let insert_pos = self.find_right_insert_position(l_idx, *row);
-                                    self.join_index
-                                        .insert(insert_pos, (Some(l_idx), Some(*row)));
-                                }
-                                modified = true;
-                            }
-                        } else if self.join_type == JoinType::Right
-                            || self.join_type == JoinType::Full
-                        {
-                            // No left match: RIGHT/FULL adds an orphan entry.
-                            let pos = self.find_orphan_insert_position(*row);
-                            self.join_index.insert(pos, (None, Some(*row)));
-                            modified = true;
-                        }
-                    } else if self.join_type == JoinType::Right || self.join_type == JoinType::Full
-                    {
-                        // New key is None (NULL or NaN): RIGHT/FULL keeps the
-                        // row as an unmatched orphan.
-                        let pos = self.find_orphan_insert_position(*row);
-                        self.join_index.insert(pos, (None, Some(*row)));
-                        modified = true;
-                    }
-                }
-                _ => {
-                    // CellUpdated on a non-key column: no join_index change
-                    // (views read live data on get_row).
-                }
+            for change in out.changes {
+                self.output_changes.push(change);
             }
         }
 
@@ -1116,7 +1187,7 @@ impl JoinView {
         drop(right_table);
         self.sync_count += 1;
 
-        modified
+        emitted
     }
 }
 
@@ -1145,5 +1216,13 @@ impl ReadableTable for JoinView {
         self.sync_count
             .wrapping_add(self.left_table.borrow().version())
             .wrapping_add(self.right_table.borrow().version())
+    }
+
+    fn changeset(&self) -> Option<&Changeset> {
+        // A child built while this join is stale has no coherent delta
+        // baseline. It must refresh once we synchronize the parents.
+        (self.left_table.borrow().version() == self.last_left_parent_version
+            && self.right_table.borrow().version() == self.last_right_parent_version)
+            .then_some(&self.output_changes)
     }
 }
