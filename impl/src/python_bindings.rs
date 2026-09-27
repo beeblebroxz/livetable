@@ -131,9 +131,33 @@ impl RegisteredView {
     }
 }
 
+/// Push `entry` once into each distinct registry among `roots` (a self-join
+/// lists one table twice), skipping a registry where `present` already
+/// matches. Call after the view's parent is registered, so tick() syncs
+/// parents before children.
+fn register_on_roots(
+    roots: &[PyTable],
+    entry: &RegisteredView,
+    present: impl Fn(&RegisteredView) -> bool,
+) {
+    let mut seen: Vec<&Rc<RefCell<Vec<RegisteredView>>>> = Vec::new();
+    for root in roots {
+        let registry = &root.registered_views;
+        if seen.iter().any(|done| Rc::ptr_eq(done, registry)) {
+            continue;
+        }
+        seen.push(registry);
+        let mut views = registry.borrow_mut();
+        if !views.iter().any(&present) {
+            views.push(entry.clone());
+        }
+    }
+}
+
 /// Inner state for PyFilterView that can be shared with the view registry
 struct PyFilterViewInner {
-    table_inner: Rc<RefCell<RustTable>>,
+    /// The filtered parent: a root table or a view such as a join.
+    parent: Rc<RefCell<dyn crate::readable::ReadableTable>>,
     predicate: PyObject,
     indices: Vec<usize>,
     output_changes: crate::changeset::Changeset,
@@ -179,13 +203,16 @@ impl PyFilterViewInner {
     /// Rebuild atomically: callback failures preserve the previous index and
     /// output history, allowing callers to correct the predicate and retry.
     fn refresh(&mut self, py: Python) -> PyResult<()> {
-        let (rows, generation, change_count, version) = {
-            let table = self.table_inner.borrow();
-            let rows = (0..table.len())
-                .map(|i| table.get_row(i))
+        let (rows, cursor, version) = {
+            let parent = self.parent.borrow();
+            let rows = (0..parent.len())
+                .map(|i| parent.get_row(i))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(PyValueError::new_err)?;
-            (rows, table.changeset_generation(), table.changeset().total_len(), table.version())
+            let cursor = parent
+                .changeset()
+                .map(|cs| (cs.generation(), cs.total_len()));
+            (rows, cursor, parent.version())
         };
         let mut indices = Vec::new();
         for (index, row) in rows.iter().enumerate() {
@@ -197,15 +224,22 @@ impl PyFilterViewInner {
         self.check_parent_version(version)?;
         self.indices = indices;
         self.output_changes.invalidate();
-        self.last_synced_generation = generation;
-        self.last_processed_change_count = change_count;
+        // A parent without history (a stale join) gives no cursor: the next
+        // sync refreshes once the parent has synchronized.
+        match cursor {
+            Some((generation, total)) => {
+                self.last_synced_generation = generation;
+                self.last_processed_change_count = total;
+            }
+            None => self.last_processed_change_count = usize::MAX,
+        }
         self.last_parent_version = version;
         self.sync_count += 1;
         Ok(())
     }
 
     fn check_parent_version(&self, expected: u64) -> PyResult<()> {
-        if self.table_inner.borrow().version() != expected {
+        if self.parent.borrow().version() != expected {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "Table mutated during filter predicate — predicates must not mutate the parent",
             ));
@@ -217,32 +251,51 @@ impl PyFilterViewInner {
         use crate::filter_changes::{
             apply_filter_changes, prepare_filter_changes, MAX_FILTER_REPLAY_CHANGES,
         };
-        let table = self.table_inner.borrow();
-        let changes = match table.changeset().changes_from(self.last_processed_change_count) {
+        let parent = self.parent.borrow();
+        let Some(changeset) = parent.changeset() else {
+            // A view parent without coherent history: version-checked refresh.
+            let stale = parent.version() != self.last_parent_version;
+            drop(parent);
+            if !stale {
+                return Ok(false);
+            }
+            self.refresh(py)?;
+            return Ok(true);
+        };
+        let changes = match changeset.changes_from(self.last_processed_change_count) {
             Some(changes) => changes,
             None => {
-                drop(table);
+                drop(parent);
                 self.refresh(py)?;
                 return Ok(true);
             }
         };
         if changes.is_empty() {
+            // A view parent can advance its version without emitting rows (a
+            // join edit with no output). Record it so this filter's history
+            // stays visible to its children.
+            self.last_parent_version = parent.version();
             return Ok(false);
         }
         if changes.len() > MAX_FILTER_REPLAY_CHANGES {
-            drop(table);
+            drop(parent);
             self.refresh(py)?;
             return Ok(true);
         }
         let changes = changes.to_vec();
-        let generation = table.changeset_generation();
-        let change_count = table.changeset().total_len();
-        let version = table.version();
-        drop(table);
+        let generation = changeset.generation();
+        let change_count = changeset.total_len();
+        let version = parent.version();
+        drop(parent);
 
         let prepared = prepare_filter_changes(
             &changes,
-            |index| self.table_inner.borrow().get_row(index).map_err(PyValueError::new_err),
+            |index| {
+                self.parent
+                    .borrow()
+                    .get_row(index)
+                    .map_err(PyValueError::new_err)
+            },
             |row| {
                 let matched = self.evaluate(py, row)?;
                 self.check_parent_version(version)?;
@@ -257,6 +310,18 @@ impl PyFilterViewInner {
         self.sync_count += 1;
         Ok(modified)
     }
+
+    /// This filter's consumed position translated for root compaction: the
+    /// cursor itself over a table, `usize::MAX` over a view.
+    fn root_cursor(&self) -> usize {
+        self.parent
+            .borrow()
+            .root_changeset_cursor(self.last_processed_change_count)
+    }
+
+    fn parent_version(&self) -> u64 {
+        self.parent.borrow().version()
+    }
 }
 
 /// Lets chained Rust views (SortedView, AggregateView) read through the
@@ -264,7 +329,7 @@ impl PyFilterViewInner {
 /// does), so no GIL is needed here.
 impl crate::readable::ReadableTable for PyFilterViewInner {
     fn changeset(&self) -> Option<&crate::changeset::Changeset> {
-        (self.table_inner.borrow().version() == self.last_parent_version)
+        (self.parent.borrow().version() == self.last_parent_version)
             .then_some(&self.output_changes)
     }
 
@@ -273,19 +338,15 @@ impl crate::readable::ReadableTable for PyFilterViewInner {
     }
 
     fn column_names(&self) -> Vec<String> {
-        crate::readable::ReadableTable::column_names(&*self.table_inner.borrow())
+        self.parent.borrow().column_names()
     }
 
     fn column_index(&self, name: &str) -> Option<usize> {
-        self.table_inner.borrow().schema().get_column_index(name)
+        self.parent.borrow().column_index(name)
     }
 
     fn column_type(&self, col_idx: usize) -> Option<crate::column::ColumnType> {
-        self.table_inner
-            .borrow()
-            .schema()
-            .get_column_info(col_idx)
-            .map(|(_, t, _)| t)
+        self.parent.borrow().column_type(col_idx)
     }
 
     fn get_row(
@@ -296,7 +357,7 @@ impl crate::readable::ReadableTable for PyFilterViewInner {
             .indices
             .get(index)
             .ok_or_else(|| format!("Index {} out of range [0, {})", index, self.indices.len()))?;
-        self.table_inner.borrow().get_row(parent_index)
+        self.parent.borrow().get_row(parent_index)
     }
 
     fn get_value(&self, row: usize, column: &str) -> Result<RustColumnValue, String> {
@@ -304,7 +365,7 @@ impl crate::readable::ReadableTable for PyFilterViewInner {
             .indices
             .get(row)
             .ok_or_else(|| format!("Row {} out of range [0, {})", row, self.indices.len()))?;
-        self.table_inner.borrow().get_value(parent_index, column)
+        self.parent.borrow().get_value(parent_index, column)
     }
 
     fn get_value_by_index(&self, row: usize, col_idx: usize) -> Result<RustColumnValue, String> {
@@ -312,14 +373,14 @@ impl crate::readable::ReadableTable for PyFilterViewInner {
             .indices
             .get(row)
             .ok_or_else(|| format!("Row {} out of range [0, {})", row, self.indices.len()))?;
-        self.table_inner
+        self.parent
             .borrow()
             .get_value_by_index(parent_index, col_idx)
     }
 
     fn version(&self) -> u64 {
         self.sync_count
-            .wrapping_add(self.table_inner.borrow().version())
+            .wrapping_add(self.parent.borrow().version())
     }
 }
 
@@ -817,9 +878,11 @@ impl PyTable {
         let view = PyFilterView::new(self.clone(), predicate)?;
 
         // Register the view's inner state for automatic tick() propagation
-        self.registered_views
-            .borrow_mut()
-            .push(RegisteredView::Filter(Rc::downgrade(&view.inner)));
+        register_on_roots(
+            std::slice::from_ref(self),
+            &RegisteredView::Filter(Rc::downgrade(&view.inner)),
+            |_| false,
+        );
 
         Ok(view)
     }
@@ -902,7 +965,7 @@ impl PyTable {
 
         Ok(PySortedView {
             inner,
-            table: self.clone(),
+            roots: vec![self.clone()],
         })
     }
 
@@ -1003,7 +1066,11 @@ impl PyTable {
             .borrow_mut()
             .push(RegisteredView::JoinRight(Rc::downgrade(&join_rc)));
 
-        Ok(PyJoinView { inner: join_rc })
+        Ok(PyJoinView {
+            inner: join_rc,
+            left: self.clone(),
+            right: other,
+        })
     }
 
     /// Group table by columns and compute aggregations.
@@ -1391,7 +1458,7 @@ impl PyTable {
             match view {
                 ActiveRegisteredView::Filter(inner) => {
                     inner.borrow_mut().sync(py)?;
-                    min_cursor = min_cursor.min(inner.borrow().last_processed_change_count);
+                    min_cursor = min_cursor.min(inner.borrow().root_cursor());
                     synced_count += 1;
                 }
                 ActiveRegisteredView::Sorted(inner) => {
@@ -1455,36 +1522,21 @@ impl PyTable {
 /// FilterView uses shared inner state so tick() can update registered views.
 #[pyclass(name = "FilterView", unsendable)]
 pub struct PyFilterView {
-    /// Reference to the parent table (for get_row operations)
-    table: PyTable,
-    /// Shared inner state (can be registered with table for tick())
+    /// Shared inner state (registered with root tables for tick())
     inner: Rc<RefCell<PyFilterViewInner>>,
+    /// Root tables whose tick() syncs this filter's chain.
+    roots: Vec<PyTable>,
+    /// Parent name, the base for chained view names.
+    name: String,
 }
 
 #[pymethods]
 impl PyFilterView {
     #[new]
     fn new(table: PyTable, predicate: PyObject) -> PyResult<Self> {
-        let generation = table.inner.borrow().changeset_generation();
-        let change_count = table.inner.borrow().changeset().total_len();
-        let inner = Rc::new(RefCell::new(PyFilterViewInner {
-            table_inner: Rc::clone(&table.inner),
-            predicate,
-            indices: Vec::new(),
-            output_changes: crate::changeset::Changeset::new(),
-            last_parent_version: 0,
-            last_synced_generation: generation,
-            last_processed_change_count: change_count,
-            sync_count: 0,
-        }));
-
-        // Initial refresh
-        Python::with_gil(|py| -> PyResult<()> {
-            inner.borrow_mut().refresh(py)?;
-            Ok(())
-        })?;
-
-        Ok(PyFilterView { table, inner })
+        let parent: Rc<RefCell<dyn crate::readable::ReadableTable>> = table.inner.clone();
+        let name = table.inner.borrow().name().to_string();
+        PyFilterView::over(parent, name, vec![table], predicate)
     }
 
     fn __len__(&self) -> usize {
@@ -1500,14 +1552,15 @@ impl PyFilterView {
     }
 
     fn get_row(&self, py: Python, index: usize) -> PyResult<PyObject> {
-        let inner = self.inner.borrow();
-        if index >= inner.indices.len() {
-            return Err(PyIndexError::new_err("Index out of range"));
-        }
-
-        let actual_index = inner.indices[index];
-        drop(inner); // Release borrow before calling table method
-        self.table.get_row(py, actual_index)
+        let row = {
+            let inner = self.inner.borrow();
+            if index >= inner.indices.len() {
+                return Err(PyIndexError::new_err("Index out of range"));
+            }
+            crate::readable::ReadableTable::get_row(&*inner, index)
+                .map_err(PyValueError::new_err)?
+        };
+        row_to_py(py, &row)
     }
 
     /// Index access with negative indexing and slicing support
@@ -1555,14 +1608,15 @@ impl PyFilterView {
     }
 
     fn get_value(&self, py: Python, row: usize, column: &str) -> PyResult<PyObject> {
-        let inner = self.inner.borrow();
-        if row >= inner.indices.len() {
-            return Err(PyIndexError::new_err("Index out of range"));
-        }
-
-        let actual_index = inner.indices[row];
-        drop(inner); // Release borrow before calling table method
-        self.table.get_value(py, actual_index, column)
+        let value = {
+            let inner = self.inner.borrow();
+            if row >= inner.indices.len() {
+                return Err(PyIndexError::new_err("Index out of range"));
+            }
+            crate::readable::ReadableTable::get_value(&*inner, row, column)
+                .map_err(PyKeyError::new_err)?
+        };
+        column_value_to_py(py, &value)
     }
 
     /// Incrementally sync with parent table changes
@@ -1582,7 +1636,7 @@ impl PyFilterView {
     /// Enables: `for row in filter_view:`
     fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyFilterViewIterator> {
         let length = slf.inner.borrow().indices.len();
-        let start_version = slf.table.inner.borrow().version();
+        let start_version = slf.parent_version();
         Ok(PyFilterViewIterator {
             view: slf.into_py(py).extract(py)?,
             index: 0,
@@ -1601,20 +1655,14 @@ impl PyFilterView {
         descending: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PySortedView> {
         let sort_keys = build_sort_keys(by, descending)?;
-        let name = format!("{}_filtered_sorted", self.table.inner.borrow().name());
-
+        let name = format!("{}_filtered_sorted", self.name);
         let parent: Rc<RefCell<dyn crate::readable::ReadableTable>> = self.inner.clone();
         let view = RustSortedView::new(name, parent, sort_keys).map_err(PyValueError::new_err)?;
         let inner = Rc::new(RefCell::new(view));
-
-        self.table
-            .registered_views
-            .borrow_mut()
-            .push(RegisteredView::Sorted(Rc::downgrade(&inner)));
-
+        register_on_roots(&self.roots, &RegisteredView::Sorted(Rc::downgrade(&inner)), |_| false);
         Ok(PySortedView {
             inner,
-            table: self.table.clone(),
+            roots: self.roots.clone(),
         })
     }
 
@@ -1627,19 +1675,43 @@ impl PyFilterView {
     ) -> PyResult<PyAggregateView> {
         let group_cols = extract_string_or_list(by)?;
         let aggregations = parse_agg_specs(&agg)?;
-        let name = format!("{}_filtered_grouped", self.table.inner.borrow().name());
+        let name = format!("{}_filtered_grouped", self.name);
 
         let parent: Rc<RefCell<dyn crate::readable::ReadableTable>> = self.inner.clone();
         let view = RustAggregateView::new(name, parent, group_cols, aggregations)
             .map_err(PyValueError::new_err)?;
         let inner = Rc::new(RefCell::new(view));
 
-        self.table
-            .registered_views
-            .borrow_mut()
-            .push(RegisteredView::Aggregate(Rc::downgrade(&inner)));
+        register_on_roots(&self.roots, &RegisteredView::Aggregate(Rc::downgrade(&inner)), |_| false);
 
         Ok(PyAggregateView { inner })
+    }
+}
+
+impl PyFilterView {
+    /// A filter over any parent. `roots` are the tables whose tick() syncs it.
+    fn over(
+        parent: Rc<RefCell<dyn crate::readable::ReadableTable>>,
+        name: String,
+        roots: Vec<PyTable>,
+        predicate: PyObject,
+    ) -> PyResult<Self> {
+        let inner = Rc::new(RefCell::new(PyFilterViewInner {
+            parent,
+            predicate,
+            indices: Vec::new(),
+            output_changes: crate::changeset::Changeset::new(),
+            last_parent_version: 0,
+            last_synced_generation: 0,
+            last_processed_change_count: usize::MAX,
+            sync_count: 0,
+        }));
+        Python::with_gil(|py| inner.borrow_mut().refresh(py))?;
+        Ok(PyFilterView { inner, roots, name })
+    }
+
+    fn parent_version(&self) -> u64 {
+        self.inner.borrow().parent_version()
     }
 }
 
@@ -1973,6 +2045,9 @@ impl PyJoinType {
 #[pyclass(name = "JoinView", unsendable)]
 pub struct PyJoinView {
     inner: Rc<RefCell<RustJoinView>>,
+    /// The joined tables: either one's tick() syncs this join and its chain.
+    left: PyTable,
+    right: PyTable,
 }
 
 #[pymethods]
@@ -2011,6 +2086,8 @@ impl PyJoinView {
 
         Ok(PyJoinView {
             inner: Rc::new(RefCell::new(join)),
+            left: left_table,
+            right: right_table,
         })
     }
 
@@ -2107,6 +2184,18 @@ impl PyJoinView {
         self.inner.borrow_mut().sync()
     }
 
+    /// Filter joined rows with a Python predicate. The predicate receives the
+    /// row as `joined[i]` returns it (right columns prefixed `right_`, `None`
+    /// for an unmatched side). Registered for tick() on both joined tables.
+    fn filter(&self, predicate: PyObject) -> PyResult<PyFilterView> {
+        let parent: Rc<RefCell<dyn crate::readable::ReadableTable>> = self.inner.clone();
+        let name = self.inner.borrow().name().to_string();
+        let view = PyFilterView::over(parent, name, self.roots(), predicate)?;
+        self.ensure_registered();
+        register_on_roots(&view.roots, &RegisteredView::Filter(Rc::downgrade(&view.inner)), |_| false);
+        Ok(view)
+    }
+
     /// Return an iterator over the joined rows.
     /// Enables: `for row in join_view:`
     fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyJoinViewIterator> {
@@ -2123,6 +2212,27 @@ impl PyJoinView {
             length,
             start_version,
         })
+    }
+}
+
+impl PyJoinView {
+    fn roots(&self) -> Vec<PyTable> {
+        vec![self.left.clone(), self.right.clone()]
+    }
+
+    /// Register this join for tick() on both tables unless already there:
+    /// `table.join()` registers at creation; an explicit JoinView registers
+    /// the first time a view is chained on it.
+    fn ensure_registered(&self) {
+        let join = Rc::downgrade(&self.inner);
+        let left = |view: &RegisteredView| {
+            matches!(view, RegisteredView::JoinLeft(existing) if existing.ptr_eq(&join))
+        };
+        register_on_roots(std::slice::from_ref(&self.left), &RegisteredView::JoinLeft(join.clone()), left);
+        let right = |view: &RegisteredView| {
+            matches!(view, RegisteredView::JoinRight(existing) if existing.ptr_eq(&join))
+        };
+        register_on_roots(std::slice::from_ref(&self.right), &RegisteredView::JoinRight(join.clone()), right);
     }
 }
 
@@ -2241,8 +2351,8 @@ impl PySortKey {
 #[pyclass(name = "SortedView", unsendable)]
 pub struct PySortedView {
     inner: Rc<RefCell<RustSortedView>>,
-    /// Root registry for children created through group_by().
-    table: PyTable,
+    /// Root tables whose tick() syncs this sort's chain.
+    roots: Vec<PyTable>,
 }
 
 #[pymethods]
@@ -2256,7 +2366,7 @@ impl PySortedView {
 
         Ok(PySortedView {
             inner: Rc::new(RefCell::new(view)),
-            table,
+            roots: vec![table],
         })
     }
 
@@ -2362,13 +2472,11 @@ impl PySortedView {
             .map_err(PyValueError::new_err)?;
         let inner = Rc::new(RefCell::new(view));
         let sorted = Rc::downgrade(&self.inner);
-        let mut registry = self.table.registered_views.borrow_mut();
-        if !registry.iter().any(|view| {
+        let registered = |view: &RegisteredView| {
             matches!(view, RegisteredView::Sorted(existing) if existing.ptr_eq(&sorted))
-        }) {
-            registry.push(RegisteredView::Sorted(sorted));
-        }
-        registry.push(RegisteredView::Aggregate(Rc::downgrade(&inner)));
+        };
+        register_on_roots(&self.roots, &RegisteredView::Sorted(sorted.clone()), registered);
+        register_on_roots(&self.roots, &RegisteredView::Aggregate(Rc::downgrade(&inner)), |_| false);
         Ok(PyAggregateView { inner })
     }
 

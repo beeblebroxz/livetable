@@ -53,7 +53,7 @@ impl PyFilterViewIterator {
             return Ok(None);
         }
         let view = self.view.borrow(py);
-        if view.table.inner.borrow().version() != self.start_version {
+        if view.parent_version() != self.start_version {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "Parent table mutated during iteration",
             ));

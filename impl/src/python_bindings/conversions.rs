@@ -447,3 +447,12 @@ fn pandas_value_to_column_value(
         expected_type
     )))
 }
+
+/// A row as a Python dict.
+fn row_to_py(py: Python, row: &HashMap<String, RustColumnValue>) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    for (key, value) in row {
+        dict.set_item(key, column_value_to_py(py, value)?)?;
+    }
+    Ok(dict.to_object(py))
+}
