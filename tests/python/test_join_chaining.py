@@ -178,3 +178,108 @@ def test_filter_over_a_stale_join_refreshes():
     # The stale refresh left no cursor, so the filter rebaselines.
     assert rich.sync() is True
     assert canon(rich) == canon(r for r in oracle_rows(orders, customers) if big(r))
+
+
+def oracle_groups(rows, key, column):
+    totals = {}
+    for row in rows:
+        totals[row[key]] = totals.get(row[key], 0.0) + row[column]
+    return totals
+
+
+def groups(view, key):
+    return {row[key]: row["total"] for row in view}
+
+
+def test_sort_and_group_over_join_follow_both_tables():
+    orders, customers = make_tables()
+    joined = join(orders, customers)
+    ranked = joined.sort("amount", descending=True)
+    by_tier = joined.group_by("right_tier", agg=[("total", "amount", "sum")])
+    orders.append_row({"oid": 6, "cust": 3, "amount": 40.0})
+    orders.tick()
+    customers.set_value(0, "tier", 2)
+    customers.tick()
+    rows = oracle_rows(orders, customers)
+    assert [r["oid"] for r in ranked] == [
+        r["oid"] for r in sorted(rows, key=lambda r: -r["amount"])
+    ]
+    assert groups(by_tier, "right_tier") == oracle_groups(rows, "right_tier", "amount")
+
+
+def test_two_level_chains_over_a_join():
+    orders, customers = make_tables()
+    joined = join(orders, customers)
+    rich_ranked = joined.filter(big).sort("amount")
+    rich_by_name = joined.filter(big).group_by(
+        "right_name", agg=[("total", "amount", "sum")]
+    )
+    ranked_by_tier = joined.sort("amount").group_by(
+        "right_tier", agg=[("total", "amount", "sum")]
+    )
+    orders.set_value(0, "amount", 70.0)
+    orders.tick()
+    customers.set_value(2, "name", "Cyd")
+    customers.set_value(2, "tier", 2)
+    customers.tick()
+    rows = oracle_rows(orders, customers)
+    rich = [r for r in rows if big(r)]
+    assert [r["oid"] for r in rich_ranked] == [
+        r["oid"] for r in sorted(rich, key=lambda r: r["amount"])
+    ]
+    assert groups(rich_by_name, "right_name") == oracle_groups(rich, "right_name", "amount")
+    assert groups(ranked_by_tier, "right_tier") == oracle_groups(rows, "right_tier", "amount")
+
+
+def test_explicit_join_registers_itself_once():
+    orders, customers = make_tables()
+    explicit = livetable.JoinView(
+        "explicit", orders, customers, "cust", "cid", livetable.JoinType.LEFT
+    )
+    assert (orders.registered_view_count(), customers.registered_view_count()) == (0, 0)
+    with pytest.raises(ValueError):
+        explicit.sort("missing")
+    assert (orders.registered_view_count(), customers.registered_view_count()) == (0, 0)
+    ranked = explicit.sort("amount")
+    totals = explicit.group_by("right_name", agg=[("total", "amount", "sum")])
+    rich = explicit.filter(big)
+    # The join once on each table, then its three children.
+    assert (orders.registered_view_count(), customers.registered_view_count()) == (4, 4)
+    customers.set_value(1, "name", "Bea")
+    customers.tick()
+    rows = oracle_rows(orders, customers)
+    assert groups(totals, "right_name") == oracle_groups(rows, "right_name", "amount")
+    assert canon(rich) == canon(r for r in rows if big(r))
+    assert [r["oid"] for r in ranked] == [
+        r["oid"] for r in sorted(rows, key=lambda r: r["amount"])
+    ]
+
+
+def test_self_join_children_register_once():
+    staff = livetable.Table("staff", livetable.Schema([
+        ("sid", livetable.ColumnType.INT32, False),
+        ("boss", livetable.ColumnType.INT32, False),
+        ("pay", livetable.ColumnType.FLOAT64, False),
+    ]))
+    for sid, boss, pay in [(1, 1, 100.0), (2, 1, 50.0), (3, 2, 40.0)]:
+        staff.append_row({"sid": sid, "boss": boss, "pay": pay})
+    managed = staff.join(staff, left_on="boss", right_on="sid", how="inner")
+    team_pay = managed.group_by("right_sid", agg=[("total", "pay", "sum")])
+    # JoinLeft and JoinRight share the registry; the aggregate appears once.
+    assert staff.registered_view_count() == 3
+    staff.set_value(2, "pay", 45.0)
+    staff.tick()
+    assert groups(team_pay, "right_sid") == {1: 150.0, 2: 45.0}
+
+
+def test_children_survive_dropping_the_join_object():
+    orders, customers = make_tables()
+    totals = join(orders, customers).group_by(
+        "right_name", agg=[("total", "amount", "sum")]
+    )
+    gc.collect()
+    orders.append_row({"oid": 6, "cust": 2, "amount": 5.0})
+    orders.tick()
+    assert groups(totals, "right_name") == oracle_groups(
+        oracle_rows(orders, customers), "right_name", "amount"
+    )

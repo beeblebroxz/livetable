@@ -2196,6 +2196,41 @@ impl PyJoinView {
         Ok(view)
     }
 
+    /// Sort joined rows. Registered for tick() on both joined tables.
+    #[pyo3(signature = (by, descending=None))]
+    fn sort(
+        &self,
+        by: &Bound<'_, PyAny>,
+        descending: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PySortedView> {
+        let sort_keys = build_sort_keys(by, descending)?;
+        let name = format!("{}_sorted", self.inner.borrow().name());
+        let view = RustSortedView::new(name, self.inner.clone(), sort_keys)
+            .map_err(PyValueError::new_err)?;
+        let inner = Rc::new(RefCell::new(view));
+        self.ensure_registered();
+        let roots = self.roots();
+        register_on_roots(&roots, &RegisteredView::Sorted(Rc::downgrade(&inner)), |_| false);
+        Ok(PySortedView { inner, roots })
+    }
+
+    /// Group joined rows. Registered for tick() on both joined tables.
+    fn group_by(
+        &self,
+        by: &Bound<'_, PyAny>,
+        agg: Vec<(String, String, String)>,
+    ) -> PyResult<PyAggregateView> {
+        let group_cols = extract_string_or_list(by)?;
+        let aggregations = parse_agg_specs(&agg)?;
+        let name = format!("{}_grouped", self.inner.borrow().name());
+        let view = RustAggregateView::new(name, self.inner.clone(), group_cols, aggregations)
+            .map_err(PyValueError::new_err)?;
+        let inner = Rc::new(RefCell::new(view));
+        self.ensure_registered();
+        register_on_roots(&self.roots(), &RegisteredView::Aggregate(Rc::downgrade(&inner)), |_| false);
+        Ok(PyAggregateView { inner })
+    }
+
     /// Return an iterator over the joined rows.
     /// Enables: `for row in join_view:`
     fn __iter__(slf: PyRef<'_, Self>, py: Python) -> PyResult<PyJoinViewIterator> {
