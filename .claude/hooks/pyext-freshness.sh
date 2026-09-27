@@ -6,7 +6,12 @@
 # way a source can change (Edit, sed, git pull/checkout/stash) without tracking state.
 input=$(cat)
 cmd=$(jq -r '.tool_input.command // empty' <<<"$input")
-grep -qE '(^|[^[:alnum:]_-])pytest([^[:alnum:]_-]|$)|run_all\.sh' <<<"$cmd" || exit 0
+# Match pytest/run_all.sh only where a command starts (after ^ ; & | or '('), optionally
+# behind VAR=value, sh/bash, python -m, or a path, so `grep pytest ...` does not trigger.
+seg='(^|[;&|(])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*'
+path='([^[:space:];&|()]*/)?'
+runner="(${path}((ba)?sh|python3?[[:space:]]+-m)[[:space:]]+)?"
+grep -qE "${seg}${runner}${path}(pytest|run_all\.sh)([[:space:];&|)]|\$)" <<<"$cmd" || exit 0
 
 root="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 py=python3
