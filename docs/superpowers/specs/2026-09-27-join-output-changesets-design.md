@@ -1,10 +1,36 @@
 # Join Output Changesets — Design
 
 **Date:** 2026-09-27
-**Status:** Approved design; not yet implemented
+**Status:** Implemented 2026-09-27
 **Goal:** Give `JoinView` an output changeset in its own coordinates, so
 filters, sorts, aggregates, and joins built over a join replay its history
 instead of rebuilding on every tick.
+
+Current references: the contract tests in `impl/tests/join_pipeline.rs` and
+the join replay checks in `impl/tests/forward_prop_fuzz.rs`.
+
+Implementation notes (differences from the design below, and measurements):
+
+- LEFT/FULL placeholder checks use the left row's contiguous range (binary
+  search) instead of scanning `join_index`, and a key update reuses the
+  batch's lookup of the other parent instead of rebuilding it per update.
+  The other side cannot change structure during the pass, so one lookup is
+  valid for the whole pass.
+- The mutation checks all fail the suite. The empty-batch version record is
+  caught only by its contract test: no fuzz join has a filter parent.
+- The batched join fuzz keeps history in 47% of batches (both parents
+  changing structure, or a key update before a shift, rebuild the rest).
+- Measured on Apple silicon, release build, 100k orders INNER-joined to 10k
+  customers, with a filter and a SUM-by-name aggregate over the join:
+
+  | Edit | Children replay | Children rebuild |
+  |---|---|---|
+  | One left value edit | 16 µs | 128 ms |
+  | One left insert | 195 µs | 127 ms |
+
+  The join's own sync for 256 right value edits (2,560 output updates, so the
+  history overflows and invalidates) took 3.2 ms, against 8.2 ms for its
+  rebuild.
 
 ## Problem
 
