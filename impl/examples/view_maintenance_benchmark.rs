@@ -1,10 +1,11 @@
 //! Per-view tick costs for single edits, inserts and deletes, on both storage
-//! hints. Prints one JSON line per (rows, storage, view, workload).
+//! hints, plus a join whose two parents change in the same tick. Prints one
+//! JSON line per (rows, storage, view, workload).
 //! Run: cargo run --release --example view_maintenance_benchmark -- 10000 100000 1000000
 //! See docs/VIEW_MAINTENANCE_BENCHMARK.md.
 use livetable::{
-    AggregateFunction, AggregateView, ColumnType, ColumnValue, FilterView, ReadableTable, Schema,
-    SortKey, SortedView, StorageHint, Table, TickableTable,
+    AggregateFunction, AggregateView, ColumnType, ColumnValue, FilterView, JoinType, JoinView,
+    ReadableTable, Schema, SortKey, SortedView, StorageHint, Table, TickableTable,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -51,6 +52,30 @@ fn orders(n: usize, hint: StorageHint) -> Rc<RefCell<Table>> {
     Rc::new(RefCell::new(table))
 }
 
+fn customer(cid: i32, name: String) -> Row {
+    HashMap::from([
+        ("cid".into(), ColumnValue::Int32(cid)),
+        ("name".into(), ColumnValue::String(name)),
+    ])
+}
+
+/// M customers: cid = i, name = "c{i}".
+fn customers(m: usize, hint: StorageHint) -> Rc<RefCell<Table>> {
+    let mut table = Table::with_hint(
+        "customers".into(),
+        Schema::new(vec![
+            ("cid".into(), ColumnType::Int32, false),
+            ("name".into(), ColumnType::String, false),
+        ]),
+        hint,
+    );
+    for i in 0..m {
+        table.append_row(customer(i as i32, format!("c{i}"))).unwrap();
+    }
+    table.clear_changeset();
+    Rc::new(RefCell::new(table))
+}
+
 fn passes(row: &Row) -> bool {
     row["amount"].as_f64().is_some_and(|v| v >= 5.0)
 }
@@ -72,11 +97,14 @@ struct Sample {
 #[derive(Clone, Copy)]
 enum Side {
     Orders,
+    Customers,
 }
 
 struct Pipeline {
     orders: Rc<RefCell<Table>>,
     orders_tick: TickableTable,
+    customers: Option<(Rc<RefCell<Table>>, TickableTable)>,
+    join: Option<Rc<RefCell<JoinView>>>,
     /// Registered views, kept alive here (ticks hold weak references), with
     /// their lengths right after construction.
     views: Vec<(&'static str, SharedView, usize)>,
@@ -85,7 +113,7 @@ struct Pipeline {
 impl Pipeline {
     fn new(orders: Rc<RefCell<Table>>) -> Self {
         let orders_tick = TickableTable::new(orders.clone());
-        Pipeline { orders, orders_tick, views: Vec::new() }
+        Pipeline { orders, orders_tick, customers: None, join: None, views: Vec::new() }
     }
 
     fn keep(&mut self, name: &'static str, view: SharedView) {
@@ -96,6 +124,7 @@ impl Pipeline {
     fn tick(&self, side: Side) {
         match side {
             Side::Orders => self.orders_tick.tick(),
+            Side::Customers => self.customers.as_ref().unwrap().1.tick(),
         };
     }
 
@@ -142,6 +171,46 @@ fn build(view: &'static str, n: usize, hint: StorageHint) -> Pipeline {
             ));
             p.orders_tick.register_aggregate(&totals);
             p.keep("aggregate", totals);
+        }
+        "join" | "join_chain" => {
+            let customers = customers(n / 10, hint);
+            let customers_tick = TickableTable::new(customers.clone());
+            let join = Rc::new(RefCell::new(
+                JoinView::new(
+                    "j".into(),
+                    p.orders.clone(),
+                    customers.clone(),
+                    "cust".into(),
+                    "cid".into(),
+                    JoinType::Inner,
+                )
+                .unwrap(),
+            ));
+            p.orders_tick.register_join_as_left(&join);
+            customers_tick.register_join_as_right(&join);
+            p.keep("join", join.clone());
+            if view == "join_chain" {
+                // Children of a join register on both roots, as Python's
+                // chaining does, so a tick on either side updates them.
+                let filter = Rc::new(RefCell::new(FilterView::new("jf".into(), join.clone(), passes)));
+                let totals = Rc::new(RefCell::new(
+                    AggregateView::new(
+                        "jg".into(),
+                        filter.clone(),
+                        vec!["right_name".into()],
+                        vec![("total".into(), "amount".into(), AggregateFunction::Sum)],
+                    )
+                    .unwrap(),
+                ));
+                for tick in [&p.orders_tick, &customers_tick] {
+                    tick.register_filter(&filter);
+                    tick.register_aggregate(&totals);
+                }
+                p.keep("join_filter", filter);
+                p.keep("join_totals", totals);
+            }
+            p.customers = Some((customers, customers_tick));
+            p.join = Some(join);
         }
         _ => unreachable!("unknown view {view}"),
     }
@@ -285,6 +354,120 @@ fn sort_key_move(ctx: &Ctx, p: &Pipeline) {
     );
 }
 
+/// right_value_edit and right_insert/delete on `customers`.
+fn right_workloads(ctx: &Ctx, p: &Pipeline) {
+    let customers = &p.customers.as_ref().unwrap().0;
+    let m = ctx.rows / 10;
+    let mid = m / 2;
+    let name = |value: String| {
+        move || customers.borrow_mut().set_value(mid, "name", ColumnValue::String(value.clone())).unwrap()
+    };
+    run_pair(
+        ctx,
+        p,
+        Step { workload: Some("right_value_edit"), side: Side::Customers, mutate: Box::new(name("alt".into())) },
+        Step { workload: None, side: Side::Customers, mutate: Box::new(name(format!("c{mid}"))) },
+    );
+    run_pair(
+        ctx,
+        p,
+        Step {
+            workload: Some("right_insert"),
+            side: Side::Customers,
+            mutate: Box::new(move || customers.borrow_mut().append_row(customer(m as i32, "new".into())).unwrap()),
+        },
+        Step {
+            workload: Some("right_delete"),
+            side: Side::Customers,
+            mutate: Box::new(move || {
+                customers.borrow_mut().delete_row(m).unwrap();
+            }),
+        },
+    );
+}
+
+/// The join's history cursor; only valid while both parents are synced.
+fn join_cursor(join: &RefCell<JoinView>) -> usize {
+    join.borrow().changeset().expect("synced join exposes history").total_len()
+}
+
+fn kept_history(join: &RefCell<JoinView>, cursor: usize) -> bool {
+    join.borrow().changeset().expect("synced join exposes history").changes_from(cursor).is_some()
+}
+
+/// A new customer and that customer's first order, ticked together
+/// (`both_then_tick`, which rebuilds the join) or one side at a time.
+fn two_sided(ctx: &Ctx, p: &Pipeline) {
+    let (n, m) = (ctx.rows, ctx.rows / 10);
+    let mid = n / 2;
+    let customers = &p.customers.as_ref().unwrap().0;
+    let join = p.join.as_ref().unwrap();
+    let insert_order = || {
+        let start = Instant::now();
+        p.orders.borrow_mut().insert_row(mid, order(n as i64, mid as i64, m as i32, 10.0)).unwrap();
+        micros(start)
+    };
+    let insert_customer = || {
+        let start = Instant::now();
+        customers.borrow_mut().append_row(customer(m as i32, "new".into())).unwrap();
+        micros(start)
+    };
+    let tick = |side| {
+        let start = Instant::now();
+        p.tick(side);
+        micros(start)
+    };
+    for variant in ["both_then_tick", "tick_each_side"] {
+        let mut samples = Vec::new();
+        for _ in 0..WARMUP + MEASURED {
+            let cursor = join_cursor(join);
+            let sample = if variant == "both_then_tick" {
+                let mutate_us = insert_order() + insert_customer();
+                let orders_us = tick(Side::Orders);
+                assert!(
+                    !kept_history(join, cursor),
+                    "{n} rows {} {} {variant}: expected a rebuild",
+                    storage_name(ctx.hint),
+                    ctx.view
+                );
+                let customers_us = tick(Side::Customers);
+                Sample { mutate_us, tick_us: orders_us + customers_us, tick_parts: Some((orders_us, customers_us)) }
+            } else {
+                let order_us = insert_order();
+                let orders_us = tick(Side::Orders);
+                assert!(
+                    kept_history(join, cursor),
+                    "{n} rows {} {} {variant}: orders tick rebuilt",
+                    storage_name(ctx.hint),
+                    ctx.view
+                );
+                let cursor = join_cursor(join);
+                let customer_us = insert_customer();
+                let customers_us = tick(Side::Customers);
+                assert!(
+                    kept_history(join, cursor),
+                    "{n} rows {} {} {variant}: customers tick rebuilt",
+                    storage_name(ctx.hint),
+                    ctx.view
+                );
+                Sample {
+                    mutate_us: order_us + customer_us,
+                    tick_us: orders_us + customers_us,
+                    tick_parts: Some((orders_us, customers_us)),
+                }
+            };
+            samples.push(sample);
+            // Untimed cleanup, one side at a time so it never rebuilds.
+            p.orders.borrow_mut().delete_row(mid).unwrap();
+            p.tick(Side::Orders);
+            customers.borrow_mut().delete_row(m).unwrap();
+            p.tick(Side::Customers);
+            p.check(ctx, variant);
+        }
+        report(n, ctx.hint, ctx.view, &format!("two_sided_{variant}"), &samples);
+    }
+}
+
 fn main() {
     assert!(
         !cfg!(debug_assertions),
@@ -302,13 +485,17 @@ fn main() {
     for &rows in &sizes {
         assert!(rows >= 1000 && rows % 10 == 0, "row counts must be >= 1000 and divisible by 10");
         for hint in [StorageHint::FastReads, StorageHint::FastUpdates] {
-            for view in ["none", "filter", "sort", "aggregate"] {
+            for view in ["none", "filter", "sort", "aggregate", "join", "join_chain"] {
                 eprintln!("{rows} {} {view}", storage_name(hint));
                 let ctx = Ctx { rows, hint, view };
                 let p = build(view, rows, hint);
                 left_workloads(&ctx, &p);
                 if view == "sort" {
                     sort_key_move(&ctx, &p);
+                }
+                if p.join.is_some() {
+                    right_workloads(&ctx, &p);
+                    two_sided(&ctx, &p);
                 }
             }
         }
