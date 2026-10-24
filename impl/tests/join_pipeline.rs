@@ -623,25 +623,28 @@ fn a_value_edit_then_delete_of_the_same_right_row() {
     );
 }
 
-/// Rows (id, k) with a Float64 join key `k`.
-fn float_keyed(name: &str, rows: &[(i32, f64)]) -> Rc<RefCell<Table>> {
+/// Rows (id, k) with a join key `k` of the given type.
+fn keyed(name: &str, key_type: ColumnType, rows: &[(i32, ColumnValue)]) -> Rc<RefCell<Table>> {
     let mut table = Table::new(
         name.into(),
         Schema::new(vec![
             ("id".into(), ColumnType::Int32, false),
-            ("k".into(), ColumnType::Float64, false),
+            ("k".into(), key_type, false),
         ]),
     );
-    for &(id, k) in rows {
+    for (id, k) in rows {
         table
-            .append_row(HashMap::from([
-                ("id".into(), Int32(id)),
-                ("k".into(), ColumnValue::Float64(k)),
-            ]))
+            .append_row(HashMap::from([("id".into(), Int32(*id)), ("k".into(), k.clone())]))
             .unwrap();
     }
     table.clear_changeset();
     Rc::new(RefCell::new(table))
+}
+
+/// Rows (id, k) with a Float64 join key `k`.
+fn float_keyed(name: &str, rows: &[(i32, f64)]) -> Rc<RefCell<Table>> {
+    let rows: Vec<_> = rows.iter().map(|&(id, k)| (id, ColumnValue::Float64(k))).collect();
+    keyed(name, ColumnType::Float64, &rows)
 }
 
 fn float_join(left: &Rc<RefCell<Table>>, right: &Rc<RefCell<Table>>, how: JoinType) -> JoinView {
@@ -705,4 +708,33 @@ fn signed_zero_key_update_in_place() {
         changes[0],
         TableChange::CellUpdated { old_value: ColumnValue::Float64(v), .. } if v.is_sign_negative()
     ));
+}
+
+#[test]
+fn signed_zero_left_insert_matches_existing_rows() {
+    let zeros = [
+        (ColumnType::Float64, ColumnValue::Float64(-0.0), ColumnValue::Float64(0.0)),
+        (ColumnType::Float32, ColumnValue::Float32(-0.0), ColumnValue::Float32(0.0)),
+    ];
+    for (key_type, negative, positive) in zeros {
+        for how in [JoinType::Inner, JoinType::Full] {
+            let l = keyed("l", key_type, &[]);
+            let r = keyed("r", key_type, &[(10, positive.clone())]);
+            let mut joined = JoinView::new("j".into(), l.clone(), r, "k".into(), "k".into(), how).unwrap();
+            let base = baseline(&joined);
+            l.borrow_mut()
+                .append_row(HashMap::from([("id".into(), Int32(1)), ("k".into(), negative.clone())]))
+                .unwrap();
+            replayed(&mut joined, base);
+            assert_eq!(joined.len(), 1, "{key_type:?} {how:?}: -0.0 joins the existing 0.0 row");
+            let row = joined.get_row(0).unwrap();
+            assert_eq!((&row["id"], &row["right_id"]), (&Int32(1), &Int32(10)));
+            let left_key_negative = match row["k"] {
+                ColumnValue::Float64(v) => v.is_sign_negative(),
+                ColumnValue::Float32(v) => v.is_sign_negative(),
+                ref other => panic!("unexpected key {other:?}"),
+            };
+            assert!(left_key_negative, "{key_type:?} {how:?}: output keeps the stored -0.0");
+        }
+    }
 }
