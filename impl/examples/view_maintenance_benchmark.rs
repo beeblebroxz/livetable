@@ -256,8 +256,15 @@ fn report(rows: usize, hint: StorageHint, view: &str, workload: &str, samples: &
     println!("{line}");
 }
 
-/// Mutate, then tick, timing each separately.
+/// Mutate, then tick, timing each separately. Outside the timing, check that
+/// every view kept its history: a silent rebuild keeps lengths right, so the
+/// length check alone would miss it.
 fn timed(p: &Pipeline, side: Side, mutate: &dyn Fn()) -> Sample {
+    let cursors: Vec<usize> = p
+        .views
+        .iter()
+        .map(|(_, view, _)| view.borrow().changeset().expect("synced view exposes history").total_len())
+        .collect();
     let start = Instant::now();
     mutate();
     let mutate_us = micros(start);
@@ -265,6 +272,10 @@ fn timed(p: &Pipeline, side: Side, mutate: &dyn Fn()) -> Sample {
     p.tick(side);
     let tick_us = micros(start);
     black_box(p.views.first().map(|(_, view, _)| view.borrow().len()));
+    for ((name, view, _), cursor) in p.views.iter().zip(cursors) {
+        let kept = view.borrow().changeset().expect("synced view exposes history").changes_from(cursor).is_some();
+        assert!(kept, "{name} rebuilt instead of syncing incrementally");
+    }
     Sample { mutate_us, tick_us, tick_parts: None }
 }
 

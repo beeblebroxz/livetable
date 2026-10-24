@@ -20,8 +20,10 @@ FastUpdates tick costs match FastReads to within about 10% everywhere.
    | Pipeline | Ticked together (rebuild) | One side at a time | Ratio |
    |---|---:|---:|---:|
    | join alone, 10k | 683 µs | 625 µs | 1.1× |
+   | join alone, 100k | 7.2 ms | 6.4 ms | 1.1× |
    | join alone, 1M | 82.0 ms | 75.9 ms | 1.1× |
    | join + filter + SUM over it, 10k | 9.1 ms | 0.95 ms | 9.6× |
+   | join + filter + SUM over it, 100k | 95.2 ms | 9.6 ms | 9.9× |
    | join + filter + SUM over it, 1M | 1,027 ms | 122 ms | 8.4× |
 
    - **The join's own rebuild costs little extra.** The one-sided path is
@@ -31,7 +33,8 @@ FastUpdates tick costs match FastReads to within about 10% everywhere.
      the join's history, so the filter and aggregate over it rebuild too.
      That adds about 0.9 s at 1M.
 2. **Per-event cost in filter, sort and aggregate grows about 10× per 10×
-   rows** for every structural event except a tail append:
+   rows** for every structural event, except a tail append in filter and
+   sort:
 
    | View | Middle insert | Middle delete | Tail delete | Tail append |
    |---|---:|---:|---:|---:|
@@ -39,16 +42,20 @@ FastUpdates tick costs match FastReads to within about 10% everywhere.
    | sort | 930 µs | 942 µs | 352 µs | 0.75 µs |
    | aggregate (SUM by 8 regions) | 90.3 ms | 88.6 ms | 85.4 ms | 2.6 ms |
 
-   - **Aggregate is 100× worse than sort.** Every structural event rebuilds
-     its row-to-group map and every group's row list, so one insert or
-     delete costs about 90 ms, even with only 8 groups.
+   - **Aggregate is about 95× worse than sort.** A middle insert and any
+     delete rebuild its row-to-group map and every group's row list, so each
+     costs about 90 ms, even with only 8 groups.
+   - **Aggregate tail appends are not fast either:** 22.6 µs, then 165 µs,
+     then 2.6 ms. The append path scans every row's entry for the largest
+     index (`row_to_group.keys().max()`).
    - **Value edits stay flat.** They cost 0.1–0.8 µs at every size.
-   - **Only an append to the end is fast.** Filter and sort skip the shift
-     for a tail append, but not for a tail delete.
-   - **FastUpdates' advantage barely survives the views.** At 1M, a middle
-     insert costs the root itself 14.5 µs on FastUpdates against 508 µs on
+   - **Only an append to the end is fast, and only in filter and sort.**
+     They skip the shift for a tail append, but not for a tail delete.
+   - **The views shrink FastUpdates' advantage.** At 1M, a middle insert
+     costs the root itself 14.5 µs on FastUpdates against 508 µs on
      FastReads, 35× less. The views' ticks are the same on both, so the
-     totals (mutation plus tick) are much closer:
+     totals (mutation plus tick) are much closer. Filter keeps a 3.2×
+     advantage, sort keeps 1.6×, and aggregate keeps none:
 
      | View | FastUpdates total | FastReads total | Advantage |
      |---|---:|---:|---:|
@@ -61,47 +68,81 @@ FastUpdates tick costs match FastReads to within about 10% everywhere.
    |---|---:|---:|
    | Customer insert (no orders) | 64.1 ms | a lookup over 1M orders |
    | Customer name edit (fans out to about 10 rows) | 31.3 ms | a position map over the 1M-row join output |
-   | Order insert, middle | 11.5 ms | a lookup over 100k customers |
+   | Order insert, middle | 11.5 ms | a lookup over 100k customers (about 9 ms), plus shifting the join index (about 2.4 ms) |
    | Order insert, tail | 9.1 ms | a lookup over 100k customers |
-   | Order delete | 1.0 ms | no lookup |
-   | Customer delete | 1.8 ms | no lookup |
+   | Order delete, middle | 1.0 ms | shifting the join index; no lookup |
+   | Order delete, tail | 0.59 ms | shifting the join index; no lookup |
+   | Customer delete | 1.8 ms | shifting the join index; no lookup |
 
-   Each figure grows about 9–13× per 10× rows.
+   - **Growth:** each figure grows about 9–13× per 10× rows.
+   - **Lookups are only part of it.** Every structural sync also makes at
+     least one pass over the join index to shift positions. The deletes show
+     that residual cost: 0.6–1.8 ms at 1M.
 
 ## Recommendation
 
-The candidates, ranked by how much they cost a typical live pipeline:
+**Workload assumption.** The ranking below assumes a mixed workload: rows
+inserted and deleted anywhere in the table, on pipelines like the ones
+measured here. That assumption is a judgment, not something this benchmark
+measured, and the order changes for other workloads (see the end of this
+section).
 
-1. **Aggregate re-indexing.** About 90 ms per insert or delete at 1M, and
-   7 ms at 100k.
-   - It hits every aggregate over any table that gains or loses rows. That
-     is the commonest derived view, and it includes aggregates downstream of
-     filters and joins: the join + filter + SUM pipeline's 56 ms middle
-     insert is mostly this.
+1. **Aggregate re-indexing.** About 90 ms per middle insert or any delete at
+   1M (7 ms at 100k), and 2.6 ms per tail append.
+   - It hits every aggregate over a table that changes structure, including
+     aggregates downstream of filters and joins. The join + filter + SUM
+     pipeline's 56 ms middle insert is mostly this; 11.5 ms of it is the
+     join.
    - The fix is contained in `impl/src/view/aggregate.rs`, which the
-     aggregate contract tests and two fuzz drivers cover. Keeping each row's
-     group in a position-indexed vector, shifted the way filters shift their
-     index, should bring an event down to the sub-millisecond range of
-     filter and sort. That is a prediction to measure, not a result.
-2. **Persistent join key indexes.** 9–64 ms per one-sided structural event
-   at 1M, and 31 ms per customer value edit.
-   - Keeping each side's key index across syncs, instead of rebuilding a
-     lookup each time, would make these costs proportional to the matches.
-   - It costs memory for two hash indexes, and it touches the most intricate
-     view code.
-3. **Two-sided rebuild.** About 0.9 s extra at 1M, but only when both joined
-   tables change in the same tick and views sit over the join.
-   - Fixing it alone would save the cascade, but the one-sided path would
-     still cost 122 ms, mostly item 2's lookups.
-   - So do it after item 2, or together with it.
+     aggregate contract tests and two fuzz drivers cover. It would replace
+     both the row-to-group map and each group's `row_indices` set (used by
+     MIN/MAX rescans and the empty-group check) with position-indexed
+     structures shifted the way filters shift their index. It would also
+     drop the tail-append key scan.
+   - The expected result is sub-millisecond events at 1M, like filter and
+     sort. That is a prediction to measure, not a result.
+2. **Join key lookups.** 9–64 ms per one-sided insert at 1M, and 31 ms per
+   customer value edit.
+   - A key index kept across syncs, instead of a lookup built on every
+     insert, would remove the lookup part: about 9 ms of an order insert and
+     64 ms of a customer insert.
+   - It would not remove the 0.6–1.8 ms of shifting the join index that
+     every structural sync pays.
+   - The index must not itself shift positions on every insert or delete,
+     or it repeats item 1's problem. It needs stable row identities, or an
+     equally cheap shifting scheme.
+   - It also costs memory for two indexes, and it touches the most
+     intricate view code. The benefit is a prediction, conditional on that
+     design.
+3. **Two-sided rebuild.** About 0.9 s extra at 1M, 88% of that pipeline's
+   cost each time it happens, when views sit over the join.
+   - **When it happens:** both parents have pending structural changes
+     (an insert, a delete or a join-key update) at the moment the join
+     syncs. For example, both tables are mutated before either is ticked. A
+     value edit on one side does not trigger it.
+   - **How often is unmeasured.** The server's pipeline specs build no
+     joins, so today it arises only through the Rust and Python APIs.
+   - **The one-sided path still costs 122 ms.** About 74 ms of that is the
+     join's lookups (item 2), and about 46 ms is the aggregate's
+     re-indexing (item 1). So fixing this alone helps most when items 1 and
+     2 are fixed too.
 4. **Filter and sort index shifting.** 0.2–0.9 ms per event at 1M.
    - Real and linear, but the cheapest in absolute terms here. It mainly
      erodes FastUpdates' advantage rather than causing visible stalls.
    - Fixing it is a redesign of positional indexes. Defer it until the costs
      above it are gone.
 
-Which to take on, if any, is the user's decision. Item 1 has the best ratio of
-benefit to risk on these numbers.
+**Other workloads.**
+- **Append-only streams (tail appends only):** join lookups (9.1 ms per
+  order append) outrank the aggregate (2.6 ms), and filter and sort cost
+  under 1 µs. The order becomes 2, 1, then 3 if both joined tables change
+  between ticks.
+- **Both joined tables often change between ticks:** item 3 moves to the
+  top, since fixing it alone removes about 88% of that pipeline's cost each
+  time it happens.
+
+Which to take on, if any, is the user's decision. For the mixed workload,
+item 1 has the best ratio of benefit to risk on these numbers.
 
 ## Method
 
@@ -123,10 +164,17 @@ benefit to risk on these numbers.
 - **Sampling.** 5 warmups and 31 measured samples per workload. The mutation
   and `tick()` are timed separately, as medians, with a nearest-rank p95 for
   the tick. Construction and the harness's checks are excluded from timing.
-- **Built-in checks.** After every sample pair the harness asserts that view
-  lengths have not drifted, and that `both_then_tick` rebuilt the join while
-  `tick_each_side` kept its history. Deliberately broken workloads trip both
-  checks.
+- **Built-in checks.** The harness asserts three things:
+  - after every sample pair, view lengths have not drifted;
+  - after every timed tick, each view kept its history rather than silently
+    rebuilding;
+  - `both_then_tick` rebuilt the join, while `tick_each_side` kept its
+    history.
+
+  Deliberately broken workloads trip each check. The recorded run predates
+  the per-tick history check. A reviewer's instrumented copy found no
+  rebuilds across 12,960 view-ticks at 1k–100k, and a validation rerun at 1M
+  with the check (output discarded) found none either.
 - **Timer.** The macOS timer's resolution is about 42 ns, so values under
   0.1 µs are a tick or two of noise.
 
