@@ -40,10 +40,10 @@ type ComputeFunction = dyn Fn(&HashMap<String, ColumnValue>) -> ColumnValue;
 ///
 /// Float variants store IEEE 754 bit patterns so `Eq`/`Hash` derive cleanly.
 /// LiveTable excludes NaN-bearing rows from joins: builders return `None` for
-/// those keys. Signed zeros remain distinct because their bits differ.
+/// those keys. Builders fold -0.0 into +0.0, since the two compare equal.
 ///
 /// Also reused by `aggregate_support::GroupKey`, which applies a different
-/// float policy (NaN/-0.0 canonicalized instead of excluded — see there).
+/// NaN policy (canonicalized instead of excluded — see there).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum JoinKeyPart {
     Int32(i32),
@@ -58,6 +58,27 @@ enum JoinKeyPart {
 
 type JoinKey = Vec<JoinKeyPart>;
 
+/// Bits of a float key: one NaN pattern for every NaN, and +0.0 for -0.0.
+fn canonical_f32_bits(v: f32) -> u32 {
+    if v.is_nan() {
+        f32::NAN.to_bits()
+    } else if v == 0.0 {
+        0.0_f32.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
+fn canonical_f64_bits(v: f64) -> u64 {
+    if v.is_nan() {
+        f64::NAN.to_bits()
+    } else if v == 0.0 {
+        0.0_f64.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
 /// Convert a single ColumnValue into a JoinKeyPart. Returns None if the value
 /// cannot participate in equality-based joins (NULL or NaN floats).
 fn column_value_to_join_key_part(value: &ColumnValue) -> Option<JoinKeyPart> {
@@ -66,9 +87,9 @@ fn column_value_to_join_key_part(value: &ColumnValue) -> Option<JoinKeyPart> {
         ColumnValue::Int32(v) => Some(JoinKeyPart::Int32(*v)),
         ColumnValue::Int64(v) => Some(JoinKeyPart::Int64(*v)),
         ColumnValue::Float32(v) if v.is_nan() => None,
-        ColumnValue::Float32(v) => Some(JoinKeyPart::Float32Bits(v.to_bits())),
+        ColumnValue::Float32(v) => Some(JoinKeyPart::Float32Bits(canonical_f32_bits(*v))),
         ColumnValue::Float64(v) if v.is_nan() => None,
-        ColumnValue::Float64(v) => Some(JoinKeyPart::Float64Bits(v.to_bits())),
+        ColumnValue::Float64(v) => Some(JoinKeyPart::Float64Bits(canonical_f64_bits(*v))),
         ColumnValue::String(s) => Some(JoinKeyPart::String(s.clone())),
         ColumnValue::Bool(b) => Some(JoinKeyPart::Bool(*b)),
         ColumnValue::Date(d) => Some(JoinKeyPart::Date(*d)),
@@ -84,9 +105,9 @@ fn column_value_into_join_key_part(value: ColumnValue) -> Option<JoinKeyPart> {
         ColumnValue::Int32(v) => Some(JoinKeyPart::Int32(v)),
         ColumnValue::Int64(v) => Some(JoinKeyPart::Int64(v)),
         ColumnValue::Float32(v) if v.is_nan() => None,
-        ColumnValue::Float32(v) => Some(JoinKeyPart::Float32Bits(v.to_bits())),
+        ColumnValue::Float32(v) => Some(JoinKeyPart::Float32Bits(canonical_f32_bits(v))),
         ColumnValue::Float64(v) if v.is_nan() => None,
-        ColumnValue::Float64(v) => Some(JoinKeyPart::Float64Bits(v.to_bits())),
+        ColumnValue::Float64(v) => Some(JoinKeyPart::Float64Bits(canonical_f64_bits(v))),
         ColumnValue::String(s) => Some(JoinKeyPart::String(s)),
         ColumnValue::Bool(b) => Some(JoinKeyPart::Bool(b)),
         ColumnValue::Date(d) => Some(JoinKeyPart::Date(d)),

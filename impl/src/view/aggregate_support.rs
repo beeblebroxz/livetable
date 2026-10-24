@@ -4,7 +4,7 @@
 //! `view.rs::AggregateView` are exposed as `pub(super)`; the rest stays
 //! private to this submodule.
 
-use super::JoinKeyPart;
+use super::{canonical_f32_bits, canonical_f64_bits, JoinKeyPart};
 use crate::column::ColumnValue;
 use crate::readable::ReadableTable;
 use std::collections::{HashMap, HashSet};
@@ -210,32 +210,11 @@ impl GroupState {
 
 /// A key for grouping rows — one typed part per group-by column, `None` = NULL.
 ///
-/// Uses the same typed `JoinKeyPart` representation as joins, but with a
-/// different float policy: GROUP BY folds all NaNs into a single group
-/// (Postgres-style) and folds -0.0 into +0.0 (they compare equal), whereas
-/// joins exclude NaN keys entirely.
+/// Uses the same typed `JoinKeyPart` representation as joins. Both fold -0.0
+/// into +0.0; they differ only on NaN: GROUP BY folds all NaNs into a single
+/// group (Postgres-style), whereas joins exclude NaN keys entirely.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct GroupKey(Vec<Option<JoinKeyPart>>);
-
-fn canonical_f32_bits(v: f32) -> u32 {
-    if v.is_nan() {
-        f32::NAN.to_bits()
-    } else if v == 0.0 {
-        0.0_f32.to_bits()
-    } else {
-        v.to_bits()
-    }
-}
-
-fn canonical_f64_bits(v: f64) -> u64 {
-    if v.is_nan() {
-        f64::NAN.to_bits()
-    } else if v == 0.0 {
-        0.0_f64.to_bits()
-    } else {
-        v.to_bits()
-    }
-}
 
 /// Convert a group-by column value into a typed key part (None = NULL group).
 fn group_key_part(value: ColumnValue) -> Option<JoinKeyPart> {

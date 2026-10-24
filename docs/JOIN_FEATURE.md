@@ -174,8 +174,9 @@ For unmatched rows:
   as the same `ColumnValue` variant.
 - NULL keys never match.
 - Float NaN keys never match.
-- Float keys use their IEEE bit representation: `-0.0` and `0.0` are distinct
-  join keys, unlike their tie/grouping behavior in sorts and aggregates.
+- Float keys compare by value: `-0.0` matches `0.0`, as in sorts, aggregates,
+  and SQL. Output rows keep each side's stored value. (Before 2026-10-23 the
+  two zeros were distinct join keys.)
 - Composite keys are typed vectors, so embedded null bytes in strings cannot
   collide with key separators.
 

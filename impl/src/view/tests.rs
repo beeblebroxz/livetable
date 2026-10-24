@@ -3852,6 +3852,96 @@ fn test_join_float64_keys() {
     assert_eq!(row.get("right_label").unwrap().as_string(), Some("R_one"));
 }
 
+/// -0.0 and 0.0 compare equal, so they join (as in sorts, GROUP BY and SQL).
+/// Output rows keep each side's stored value; NaN still never matches.
+#[test]
+fn test_join_signed_zero_keys_match() {
+    fn keyed(name: &str, key_type: ColumnType, rows: &[(ColumnValue, &str)]) -> Rc<RefCell<Table>> {
+        let schema = Schema::new(vec![
+            ("k".to_string(), key_type, false),
+            ("label".to_string(), ColumnType::String, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new(name.to_string(), schema)));
+        for (k, label) in rows {
+            table
+                .borrow_mut()
+                .append_row(HashMap::from([
+                    ("k".to_string(), k.clone()),
+                    ("label".to_string(), ColumnValue::String(label.to_string())),
+                ]))
+                .unwrap();
+        }
+        table
+    }
+    let join = |left: &Rc<RefCell<Table>>, right: &Rc<RefCell<Table>>, how: JoinType| {
+        JoinView::new("j".to_string(), left.clone(), right.clone(), "k".to_string(), "k".to_string(), how)
+            .unwrap()
+    };
+    let f64_left = keyed(
+        "L",
+        ColumnType::Float64,
+        &[
+            (ColumnValue::Float64(-0.0), "L_negzero"),
+            (ColumnValue::Float64(1.5), "L_one"),
+            (ColumnValue::Float64(f64::NAN), "L_nan"),
+        ],
+    );
+    let f64_right = keyed(
+        "R",
+        ColumnType::Float64,
+        &[
+            (ColumnValue::Float64(0.0), "R_zero"),
+            (ColumnValue::Float64(f64::NAN), "R_nan"),
+        ],
+    );
+
+    let inner = join(&f64_left, &f64_right, JoinType::Inner);
+    assert_eq!(inner.len(), 1, "-0.0 must match 0.0");
+    let row = inner.get_row(0).unwrap();
+    assert_eq!(row["label"].as_string(), Some("L_negzero"));
+    assert_eq!(row["right_label"].as_string(), Some("R_zero"));
+    assert!(matches!(row["k"], ColumnValue::Float64(v) if v.is_sign_negative()));
+    assert!(matches!(row["right_k"], ColumnValue::Float64(v) if !v.is_sign_negative()));
+
+    // The zero pair matches; 1.5 and both NaNs stay unmatched.
+    let full = join(&f64_left, &f64_right, JoinType::Full);
+    assert_eq!(full.len(), 4);
+
+    let f32_left = keyed("L32", ColumnType::Float32, &[(ColumnValue::Float32(-0.0), "L")]);
+    let f32_right = keyed("R32", ColumnType::Float32, &[(ColumnValue::Float32(0.0), "R")]);
+    assert_eq!(join(&f32_left, &f32_right, JoinType::Inner).len(), 1);
+
+    // A float part of a composite key folds too.
+    let tagged = |name: &str, rows: &[(f64, i32)]| {
+        let schema = Schema::new(vec![
+            ("k".to_string(), ColumnType::Float64, false),
+            ("tag".to_string(), ColumnType::Int32, false),
+        ]);
+        let table = Rc::new(RefCell::new(Table::new(name.to_string(), schema)));
+        for &(k, tag) in rows {
+            table
+                .borrow_mut()
+                .append_row(HashMap::from([
+                    ("k".to_string(), ColumnValue::Float64(k)),
+                    ("tag".to_string(), ColumnValue::Int32(tag)),
+                ]))
+                .unwrap();
+        }
+        table
+    };
+    let composite = JoinView::new_multi(
+        "jm".to_string(),
+        tagged("L", &[(-0.0, 7)]),
+        tagged("R", &[(0.0, 7), (0.0, 8)]),
+        vec!["k".to_string(), "tag".to_string()],
+        vec!["k".to_string(), "tag".to_string()],
+        JoinType::Inner,
+    )
+    .unwrap();
+    assert_eq!(composite.len(), 1);
+    assert_eq!(composite.get_row(0).unwrap()["right_tag"], ColumnValue::Int32(7));
+}
+
 // === Regression coverage for hot-path optimizations in JoinView left-insert ===
 
 /// Covers the LEFT "no-match incremental insert" branch where a new left

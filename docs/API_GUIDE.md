@@ -276,7 +276,7 @@ let composite = JoinView::new_multi(
 ```
 
 LiveTable implements `Left`, `Inner`, `Right`, and `Full` joins. NULL and NaN
-keys do not match. Right-side output columns are prefixed with `right_`.
+keys do not match; `-0.0` and `0.0` keys do. Right-side output columns are prefixed with `right_`.
 `JoinView::sync()` incrementally consumes changes from both parents;
 `refresh()` performs a complete rebuild. See [JOIN_FEATURE.md](JOIN_FEATURE.md)
 for details.

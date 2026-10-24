@@ -222,6 +222,26 @@ class TestSingleColumnJoinBackwardCompat:
 
         assert len(joined) == 1
 
+    def test_signed_zero_float_keys_match(self):
+        """-0.0 and 0.0 compare equal, so they join."""
+        left = livetable.Table("left", livetable.Schema([
+            ("k", livetable.ColumnType.FLOAT64, False),
+            ("val", livetable.ColumnType.STRING, False),
+        ]))
+        left.append_row({"k": -0.0, "val": "neg"})
+        right = livetable.Table("right", livetable.Schema([
+            ("k", livetable.ColumnType.FLOAT64, False),
+            ("data", livetable.ColumnType.STRING, False),
+        ]))
+        right.append_row({"k": 0.0, "data": "pos"})
+
+        joined = livetable.JoinView("j", left, right, "k", "k", livetable.JoinType.INNER)
+
+        assert len(joined) == 1
+        row = joined.get_row(0)
+        assert row["val"] == "neg"
+        assert row["right_data"] == "pos"
+
 
 # ============================================================================
 # Error Handling Tests

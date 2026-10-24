@@ -622,3 +622,87 @@ fn a_value_edit_then_delete_of_the_same_right_row() {
         ]
     );
 }
+
+/// Rows (id, k) with a Float64 join key `k`.
+fn float_keyed(name: &str, rows: &[(i32, f64)]) -> Rc<RefCell<Table>> {
+    let mut table = Table::new(
+        name.into(),
+        Schema::new(vec![
+            ("id".into(), ColumnType::Int32, false),
+            ("k".into(), ColumnType::Float64, false),
+        ]),
+    );
+    for &(id, k) in rows {
+        table
+            .append_row(HashMap::from([
+                ("id".into(), Int32(id)),
+                ("k".into(), ColumnValue::Float64(k)),
+            ]))
+            .unwrap();
+    }
+    table.clear_changeset();
+    Rc::new(RefCell::new(table))
+}
+
+fn float_join(left: &Rc<RefCell<Table>>, right: &Rc<RefCell<Table>>, how: JoinType) -> JoinView {
+    JoinView::new("j".into(), left.clone(), right.clone(), "k".into(), "k".into(), how).unwrap()
+}
+
+#[test]
+fn signed_zero_insert_fills_the_placeholder() {
+    let l = float_keyed("l", &[(1, -0.0)]);
+    let r = float_keyed("r", &[]);
+    let mut left = float_join(&l, &r, JoinType::Left);
+    let base = baseline(&left);
+    r.borrow_mut()
+        .append_row(HashMap::from([
+            ("id".into(), Int32(10)),
+            ("k".into(), ColumnValue::Float64(0.0)),
+        ]))
+        .unwrap();
+    let changes = replayed(&mut left, base);
+    let mut filled: Vec<&str> = changes
+        .iter()
+        .map(|change| match change {
+            TableChange::CellUpdated { row: 0, column, old_value: Null, .. } => column.as_str(),
+            other => panic!("expected a placeholder fill, got {other:?}"),
+        })
+        .collect();
+    filled.sort();
+    assert_eq!(filled, ["right_id", "right_k"]);
+    assert_eq!(left.len(), 1);
+}
+
+#[test]
+fn signed_zero_key_update_rematches() {
+    let l = float_keyed("l", &[(1, 0.0)]);
+    let r = float_keyed("r", &[(10, 1.0)]);
+    let mut inner = float_join(&l, &r, JoinType::Inner);
+    let base = baseline(&inner);
+    r.borrow_mut().set_value(0, "k", ColumnValue::Float64(-0.0)).unwrap();
+    let changes = replayed(&mut inner, base);
+    assert!(
+        matches!(changes.as_slice(), [TableChange::RowInserted { index: 0, .. }]),
+        "{changes:?}"
+    );
+    assert_eq!(inner.len(), 1);
+}
+
+#[test]
+fn signed_zero_key_update_in_place() {
+    let l = float_keyed("l", &[(1, 0.0)]);
+    let r = float_keyed("r", &[(10, -0.0)]);
+    let mut inner = float_join(&l, &r, JoinType::Inner);
+    let base = baseline(&inner);
+    r.borrow_mut().set_value(0, "k", ColumnValue::Float64(0.0)).unwrap();
+    let changes = replayed(&mut inner, base);
+    // ColumnValue equality treats the zeros as equal, so check the old sign too.
+    assert_eq!(
+        changes,
+        [update(0, "right_k", ColumnValue::Float64(-0.0), ColumnValue::Float64(0.0))]
+    );
+    assert!(matches!(
+        changes[0],
+        TableChange::CellUpdated { old_value: ColumnValue::Float64(v), .. } if v.is_sign_negative()
+    ));
+}
