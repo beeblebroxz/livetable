@@ -23,6 +23,9 @@
 //! also replay onto the pre-tick snapshot and reproduce the post-tick one
 //! exactly.
 //!
+//! Root tables alternate FastReads/FastUpdates storage by trial (two-root join
+//! drivers vary each side independently); oracles stay FastReads.
+//!
 //! It also covers multi-consumer min-cursor changeset compaction (filter + the
 //! two direct views all consume the root changeset on the same TickableTable).
 //!
@@ -40,7 +43,8 @@ use std::rc::Rc;
 
 use livetable::{
     AggregateFunction, AggregateView, ColumnType, ColumnValue, ComputedView, FilterView, JoinType,
-    JoinView, ReadableTable, Schema, SortKey, SortedView, Table, TableChange, TickableTable,
+    JoinView, ReadableTable, Schema, SortKey, SortedView, StorageHint, Table, TableChange,
+    TickableTable,
 };
 
 type Row = HashMap<String, ColumnValue>;
@@ -60,6 +64,16 @@ impl Lcg {
     }
     fn pct(&mut self) -> usize {
         self.below(100)
+    }
+}
+
+/// Storage for a trial's root tables: even trials FastReads, odd FastUpdates.
+/// Oracles stay FastReads, so FastUpdates trials also check layout independence.
+fn hint_for(trial: u64) -> StorageHint {
+    if trial % 2 == 0 {
+        StorageHint::FastReads
+    } else {
+        StorageHint::FastUpdates
     }
 }
 
@@ -521,7 +535,7 @@ fn assert_pipeline_matches(trial: u64, step: usize, base: &Rc<RefCell<Table>>, p
 fn differential_chained_forward_prop_fuzz() {
     for trial in 0..60u64 {
         let mut rng = Lcg(0x9E37_79B9_7F4A_7C15 ^ trial.wrapping_mul(0xD1B5_4A32_D192_ED03));
-        let base = Rc::new(RefCell::new(Table::new("base".to_string(), schema())));
+        let base = Rc::new(RefCell::new(Table::with_hint("base".to_string(), schema(), hint_for(trial))));
         let p = build_pipeline(&base);
         let mut next_id: i64 = 0;
 
@@ -541,7 +555,7 @@ fn differential_chained_forward_prop_fuzz() {
 fn differential_batched_forward_prop_fuzz() {
     for trial in 0..60u64 {
         let mut rng = Lcg(0x2545_F491_4F6C_DD1D ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let base = Rc::new(RefCell::new(Table::new("base".to_string(), schema())));
+        let base = Rc::new(RefCell::new(Table::with_hint("base".to_string(), schema(), hint_for(trial))));
         let p = build_pipeline(&base);
         let mut next_id: i64 = 0;
 
@@ -607,7 +621,7 @@ fn differential_int_group_by_fuzz() {
 
     for trial in 0..40u64 {
         let mut rng = Lcg(0xABCD_EF01_2345_6789 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let base = Rc::new(RefCell::new(Table::new("base".to_string(), int_schema())));
+        let base = Rc::new(RefCell::new(Table::with_hint("base".to_string(), int_schema(), hint_for(trial))));
         let mut next_id: i64 = 0;
 
         // Seed rows BEFORE building the view so construction rebuilds via the
@@ -708,8 +722,8 @@ fn differential_join_fuzz() {
     for (jt_name, jt) in join_types {
         for trial in 0..30u64 {
             let mut rng = Lcg(0x1357_9BDF_0246_8ACE ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let left = Rc::new(RefCell::new(Table::new("left".to_string(), left_schema())));
-            let right = Rc::new(RefCell::new(Table::new("right".to_string(), right_schema())));
+            let left = Rc::new(RefCell::new(Table::with_hint("left".to_string(), left_schema(), hint_for(trial))));
+            let right = Rc::new(RefCell::new(Table::with_hint("right".to_string(), right_schema(), hint_for(trial / 2))));
             let mut joined = JoinView::new(
                 "j".to_string(),
                 left.clone(),
@@ -822,7 +836,7 @@ fn differential_computed_view_fuzz() {
     // that the computed column matches a from-scratch ComputedView.
     for trial in 0..30u64 {
         let mut rng = Lcg(0xFACE_B00C_1234_5678 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let base = Rc::new(RefCell::new(Table::new("base".to_string(), schema())));
+        let base = Rc::new(RefCell::new(Table::with_hint("base".to_string(), schema(), hint_for(trial))));
 
         let computed_direct = Rc::new(RefCell::new(ComputedView::new(
             "cd".to_string(),
@@ -953,8 +967,8 @@ fn differential_join_batched_fuzz() {
         let (mut kept, mut steps) = (0usize, 0usize);
         for trial in 0..30u64 {
             let mut rng = Lcg(0x0F1E_2D3C_4B5A_6978 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let left = Rc::new(RefCell::new(Table::new("left".to_string(), left_schema())));
-            let right = Rc::new(RefCell::new(Table::new("right".to_string(), right_schema())));
+            let left = Rc::new(RefCell::new(Table::with_hint("left".to_string(), left_schema(), hint_for(trial))));
+            let right = Rc::new(RefCell::new(Table::with_hint("right".to_string(), right_schema(), hint_for(trial / 2))));
             let mut joined = JoinView::new(
                 "j".to_string(), left.clone(), right.clone(),
                 "k".to_string(), "k".to_string(), jt,
