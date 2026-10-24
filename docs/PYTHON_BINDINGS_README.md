@@ -881,6 +881,7 @@ Registries hold weak references, so keep the chained views you use alive.
 **Notes:**
 - Right table columns are prefixed with `"right_"` to avoid conflicts
 - NULL values in join keys don't match (SQL semantics)
+- Float keys: NaN never matches; `-0.0` matches `0.0`
 - Key counts must match between left and right
 
 ### JoinType

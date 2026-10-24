@@ -178,7 +178,7 @@ Located in Rust source files with `#[cfg(test)]` modules:
 
 Rust integration tests under `../impl/tests/`:
 
-- **forward_prop_fuzz.rs** - Differential randomized view propagation
+- **forward_prop_fuzz.rs** - Differential randomized view propagation on both storage hints, including joins over filter and sort views
 - **filter_pipeline.rs** - Filter output coordinates, bounded work, history, and compaction
 - **sorted_pipeline.rs** - Sorted-coordinate replay, move batches, and bounded source reads
 - **aggregate_pipeline.rs** - Aggregate net-diff history, group positions, invalidation, and replaying children

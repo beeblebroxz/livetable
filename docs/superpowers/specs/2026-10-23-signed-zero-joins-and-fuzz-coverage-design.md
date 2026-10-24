@@ -1,6 +1,25 @@
 # Signed-zero join keys and fuzz coverage
 
-**Status:** Draft 2026-10-23
+**Status:** Implemented 2026-10-23
+Plan: `docs/superpowers/plans/2026-10-23-signed-zero-joins-and-fuzz-coverage.md`.
+Current references: the signed-zero tests (`test_join_signed_zero_keys_match`
+in `impl/src/view/tests.rs`, `signed_zero_*` in `impl/tests/join_pipeline.rs`)
+and `impl/tests/forward_prop_fuzz.rs`.
+
+Implementation notes:
+
+- The fuzz found no FastUpdates or view-parent-join bugs.
+- Mutation check: dropping the join's empty-batch version record now fails
+  the chained, batched and both join drivers, each in a new view-parent join
+  (`filter_join`, `view_join`, `view_join_batched`). Before, only a contract
+  test caught it.
+- The batched view-parent join kept history in 2071 of 3600 steps (57%) for
+  every join type, against 1702 (47%) for the root ⋈ root join. Its floor is
+  25%.
+- Fuzz wall time (debug `cargo test`, Apple M2): 128.05 s before, 128.19 s
+  with storage alternation, 172.40 s with both view-join additions. That is
+  35% more, over the ~25% target. The main pipeline's three extra views and
+  their oracles cost most of it; kept as this spec directs.
 
 ## Why
 
