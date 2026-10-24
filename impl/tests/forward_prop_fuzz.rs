@@ -18,6 +18,9 @@
 //! - Filter, sort, and FULL join over AggregateViews (aggregate output history)
 //! - Filter, sort, and aggregate over a LEFT join to a static dimension table
 //!   (join output history)
+//! - Joins with view parents: the filter LEFT-joined to the dimension table
+//!   (with a sorted child), and the dimension table FULL-joined to the direct
+//!   sort, so excluded filter edits reach a join as empty batches
 //!
 //! Sort, aggregate, aggregate-child, join, and join-child output history must
 //! also replay onto the pre-tick snapshot and reproduce the post-tick one
@@ -342,6 +345,13 @@ struct Pipeline {
     join_filter: Rc<RefCell<FilterView>>,
     join_sorted: Rc<RefCell<SortedView>>,
     join_groups: Rc<RefCell<AggregateView>>,
+    /// The filter LEFT-joined to region tiers: a join with a filter parent,
+    /// so excluded edits reach it as empty batches.
+    filter_join: Rc<RefCell<JoinView>>,
+    filter_join_sorted: Rc<RefCell<SortedView>>,
+    /// Region tiers FULL-joined to the direct sort: a join whose RIGHT parent
+    /// is a sort, including the delete+insert pair a sort emits for a move.
+    sorted_join: Rc<RefCell<JoinView>>,
     tick: TickableTable,
 }
 
@@ -358,14 +368,17 @@ impl Pipeline {
         ]
     }
 
-    /// The dimension join and its children. The join rebuilds when a batch
-    /// updates a region before inserting or deleting an order.
+    /// The joins and their children. A join rebuilds when a batch updates a
+    /// region before inserting or deleting an order.
     fn join_replayed(&self) -> Vec<(&'static str, Rc<RefCell<dyn ReadableTable>>)> {
         vec![
             ("dim_join", self.dim_join.clone()),
             ("join_filter", self.join_filter.clone()),
             ("join_sorted", self.join_sorted.clone()),
             ("join_groups", self.join_groups.clone()),
+            ("filter_join", self.filter_join.clone()),
+            ("filter_join_sorted", self.filter_join_sorted.clone()),
+            ("sorted_join", self.sorted_join.clone()),
         ]
     }
 }
@@ -406,6 +419,14 @@ fn dim_join(base: Rc<RefCell<Table>>, dim: Rc<RefCell<Table>>, name: &str) -> Jo
     JoinView::new(name.to_string(), base, dim, "region".to_string(), "region".to_string(), JoinType::Left).unwrap()
 }
 
+fn filter_join(filter: Rc<RefCell<FilterView>>, dim: Rc<RefCell<Table>>, name: &str) -> JoinView {
+    JoinView::new(name.to_string(), filter, dim, "region".to_string(), "region".to_string(), JoinType::Left).unwrap()
+}
+
+fn sorted_join(dim: Rc<RefCell<Table>>, sorted: Rc<RefCell<SortedView>>, name: &str) -> JoinView {
+    JoinView::new(name.to_string(), dim, sorted, "region".to_string(), "region".to_string(), JoinType::Full).unwrap()
+}
+
 fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
     let filter = Rc::new(RefCell::new(FilterView::new("f".to_string(), base.clone(), passes)));
     let agg_filtered = Rc::new(RefCell::new(
@@ -438,6 +459,11 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
     let join_groups = Rc::new(RefCell::new(
         AggregateView::new("jg".to_string(), dim_join_view.clone(), vec!["right_tier".to_string()], aggs()).unwrap(),
     ));
+    let filter_join_view = Rc::new(RefCell::new(filter_join(filter.clone(), dim.clone(), "fj")));
+    let filter_join_sorted = Rc::new(RefCell::new(
+        SortedView::new("fjs".to_string(), filter_join_view.clone(), sort_keys()).unwrap(),
+    ));
+    let sorted_join_view = Rc::new(RefCell::new(sorted_join(dim.clone(), sorted_direct.clone(), "sj")));
 
     // Registration order = topological order (parents before children).
     let tick = TickableTable::new(base.clone());
@@ -454,6 +480,9 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
     tick.register_filter(&join_filter);
     tick.register_sorted(&join_sorted);
     tick.register_aggregate(&join_groups);
+    tick.register_join_as_left(&filter_join_view);
+    tick.register_sorted(&filter_join_sorted);
+    tick.register_join_as_right(&sorted_join_view);
 
     Pipeline {
         filter,
@@ -470,6 +499,9 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
         join_filter,
         join_sorted,
         join_groups,
+        filter_join: filter_join_view,
+        filter_join_sorted,
+        sorted_join: sorted_join_view,
         tick,
     }
 }
@@ -529,6 +561,27 @@ fn assert_pipeline_matches(trial: u64, step: usize, base: &Rc<RefCell<Table>>, p
     assert_ordered_eq("join_sorted", trial, step, &snapshot(&*p.join_sorted.borrow()), &snapshot(&ojs));
     let ojg = AggregateView::new("ojg".to_string(), odj.clone(), vec!["right_tier".to_string()], aggs()).unwrap();
     assert_agg_eq("join_groups", trial, step, "right_tier", &snapshot(&*p.join_groups.borrow()), &snapshot(&ojg));
+
+    let ofj = Rc::new(RefCell::new(filter_join(of.clone(), p.dim.clone(), "ofj")));
+    assert_eq!(
+        multiset(&snapshot(&*p.filter_join.borrow())),
+        multiset(&snapshot(&*ofj.borrow())),
+        "[filter_join] trial {trial} step {step}"
+    );
+    let ofjs = SortedView::new("ofjs".to_string(), ofj.clone(), sort_keys()).unwrap();
+    assert_ordered_eq(
+        "filter_join_sorted",
+        trial,
+        step,
+        &snapshot(&*p.filter_join_sorted.borrow()),
+        &snapshot(&ofjs),
+    );
+    let osj = sorted_join(p.dim.clone(), osd.clone(), "osj");
+    assert_eq!(
+        multiset(&snapshot(&*p.sorted_join.borrow())),
+        multiset(&snapshot(&osj)),
+        "[sorted_join] trial {trial} step {step}"
+    );
 }
 
 #[test]
