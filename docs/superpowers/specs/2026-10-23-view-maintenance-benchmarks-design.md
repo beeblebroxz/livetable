@@ -1,6 +1,11 @@
 # View maintenance benchmarks
 
-**Status:** Draft 2026-10-23
+**Status:** Implemented 2026-10-23
+Plan: `docs/superpowers/plans/2026-10-23-view-maintenance-benchmarks.md`.
+Report: `docs/VIEW_MAINTENANCE_BENCHMARK.md` (raw output in
+`benchmarks/view_maintenance_2026-10-23.jsonl`). The full run took 178 s, so no
+samples were cut. Two-sided variants are reported as workloads
+`two_sided_both_then_tick` and `two_sided_tick_each_side`.
 
 ## Why
 

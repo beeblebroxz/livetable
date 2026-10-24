@@ -92,6 +92,18 @@ construction, Python callbacks, serialization, WebSocket delivery, and rendering
 The linked reports above preserve their before/after commits and measured
 environments; rerunning on a different revision creates a new measurement.
 
+### View maintenance per tick
+
+The [view maintenance report](VIEW_MAINTENANCE_BENCHMARK.md) measures one
+`tick()` per view type (filter, sort, aggregate, join, and a join with views
+over it) after a single edit, insert or delete, at 10k/100k/1M rows on both
+storage hints. It also measures a join whose two parents change in the same
+tick. Mutation and tick are timed separately, and the raw output is committed.
+
+```bash
+cargo run --release --manifest-path impl/Cargo.toml --example view_maintenance_benchmark -- 10000 100000 1000000
+```
+
 ### Filter comparison
 
 `benchmarks/filter_vs_pandas.py` compares:
