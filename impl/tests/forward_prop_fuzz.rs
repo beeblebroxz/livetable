@@ -21,6 +21,8 @@
 //! - Joins with view parents: the filter LEFT-joined to the dimension table
 //!   (with a sorted child), and the dimension table FULL-joined to the direct
 //!   sort, so excluded filter edits reach a join as empty batches
+//! - A filter-parent ⋈ sort-parent join beside the root ⋈ root join in both
+//!   join drivers, for every join type
 //!
 //! Sort, aggregate, aggregate-child, join, and join-child output history must
 //! also replay onto the pre-tick snapshot and reproduce the post-tick one
@@ -73,7 +75,7 @@ impl Lcg {
 /// Storage for a trial's root tables: even trials FastReads, odd FastUpdates.
 /// Oracles stay FastReads, so FastUpdates trials also check layout independence.
 fn hint_for(trial: u64) -> StorageHint {
-    if trial % 2 == 0 {
+    if trial.is_multiple_of(2) {
         StorageHint::FastReads
     } else {
         StorageHint::FastUpdates
@@ -763,6 +765,33 @@ fn multiset(rows: &[Row]) -> Vec<String> {
     v
 }
 
+fn low_lval(row: &Row) -> bool {
+    matches!(row.get("lval"), Some(ColumnValue::Int32(v)) if *v < 500)
+}
+
+fn right_sort_keys() -> Vec<SortKey> {
+    vec![SortKey::ascending("rval"), SortKey::ascending("rid")]
+}
+
+/// A join whose parents are views: a filter over `left` and a sort over
+/// `right`. Returned with its parents so callers can sync them first.
+fn view_parent_join(
+    left: Rc<RefCell<Table>>,
+    right: Rc<RefCell<Table>>,
+    jt: JoinType,
+) -> (Rc<RefCell<FilterView>>, Rc<RefCell<SortedView>>, JoinView) {
+    let lf = Rc::new(RefCell::new(FilterView::new("lf".to_string(), left, low_lval)));
+    let rs = Rc::new(RefCell::new(SortedView::new("rs".to_string(), right, right_sort_keys()).unwrap()));
+    let joined = JoinView::new("vj".to_string(), lf.clone(), rs.clone(), "k".to_string(), "k".to_string(), jt).unwrap();
+    (lf, rs, joined)
+}
+
+fn sync_view_parent_join(lf: &Rc<RefCell<FilterView>>, rs: &Rc<RefCell<SortedView>>, joined: &mut JoinView) {
+    lf.borrow_mut().sync();
+    rs.borrow_mut().sync();
+    joined.sync();
+}
+
 #[test]
 fn differential_join_fuzz() {
     let join_types = [
@@ -786,11 +815,14 @@ fn differential_join_fuzz() {
                 jt,
             )
             .unwrap();
+            let (lf, rs, mut view_joined) = view_parent_join(left.clone(), right.clone(), jt);
             let mut next_lid: i64 = 0;
             let mut next_rid: i64 = 0;
 
             for step in 0..160usize {
                 let before = snapshot(&joined);
+                let view_before = snapshot(&view_joined);
+                let view_cursor = view_joined.changeset().expect("synced join exposes history").total_len();
                 let cursor = joined.changeset().expect("synced join exposes history").total_len();
                 let llen = left.borrow().len();
                 let rlen = right.borrow().len();
@@ -846,6 +878,9 @@ fn differential_join_fuzz() {
                 // One parent change per step: never a rebuild, so history
                 // must always replay.
                 assert_replay(&format!("join:{jt_name}"), trial, step, before, cursor, &joined);
+                // Only one view parent emits per step, so this never rebuilds either.
+                sync_view_parent_join(&lf, &rs, &mut view_joined);
+                assert_replay(&format!("view_join:{jt_name}"), trial, step, view_before, view_cursor, &view_joined);
 
                 // Oracle: a from-scratch join on the current parent states.
                 let ol = clone_table(&left, left_schema());
@@ -865,6 +900,12 @@ fn differential_join_fuzz() {
                 assert_eq!(
                     live, oracle,
                     "[join:{jt_name}] trial {trial} step {step}: incremental != rebuild\nlive={live:#?}\noracle={oracle:#?}"
+                );
+                let (_, _, oview) = view_parent_join(ol.clone(), or.clone(), jt);
+                assert_eq!(
+                    multiset(&snapshot(&view_joined)),
+                    multiset(&snapshot(&oview)),
+                    "[view_join:{jt_name}] trial {trial} step {step}: incremental != rebuild"
                 );
             }
         }
@@ -1018,6 +1059,7 @@ fn differential_join_batched_fuzz() {
     ];
     for (jt_name, jt) in join_types {
         let (mut kept, mut steps) = (0usize, 0usize);
+        let mut view_kept = 0usize;
         for trial in 0..30u64 {
             let mut rng = Lcg(0x0F1E_2D3C_4B5A_6978 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let left = Rc::new(RefCell::new(Table::with_hint("left".to_string(), left_schema(), hint_for(trial))));
@@ -1026,11 +1068,14 @@ fn differential_join_batched_fuzz() {
                 "j".to_string(), left.clone(), right.clone(),
                 "k".to_string(), "k".to_string(), jt,
             ).unwrap();
+            let (lf, rs, mut view_joined) = view_parent_join(left.clone(), right.clone(), jt);
             let mut next_lid: i64 = 0;
             let mut next_rid: i64 = 0;
 
             for step in 0..120usize {
                 let before = snapshot(&joined);
+                let view_before = snapshot(&view_joined);
+                let view_cursor = view_joined.changeset().expect("synced join exposes history").total_len();
                 let cursor = joined.changeset().expect("synced join exposes history").total_len();
                 // Multi-change batch (1..=5 mutations) before one sync().
                 let batch = 1 + rng.below(5);
@@ -1041,6 +1086,18 @@ fn differential_join_batched_fuzz() {
                 steps += 1;
                 if replay_unless_invalidated(&format!("join_batched:{jt_name}"), trial, step, before, cursor, &joined) {
                     kept += 1;
+                }
+                // Both view parents can change structure in one batch, which rebuilds.
+                sync_view_parent_join(&lf, &rs, &mut view_joined);
+                if replay_unless_invalidated(
+                    &format!("view_join_batched:{jt_name}"),
+                    trial,
+                    step,
+                    view_before,
+                    view_cursor,
+                    &view_joined,
+                ) {
+                    view_kept += 1;
                 }
 
                 let ol = clone_table(&left, left_schema());
@@ -1056,6 +1113,12 @@ fn differential_join_batched_fuzz() {
                     live, oracle,
                     "[join_batched:{jt_name}] trial {trial} step {step}: incremental != rebuild\nlive={live:#?}\noracle={oracle:#?}"
                 );
+                let (_, _, oview) = view_parent_join(ol.clone(), or.clone(), jt);
+                assert_eq!(
+                    multiset(&snapshot(&view_joined)),
+                    multiset(&snapshot(&oview)),
+                    "[view_join_batched:{jt_name}] trial {trial} step {step}: incremental != rebuild"
+                );
             }
         }
         // An implementation that always invalidated would pass the replay
@@ -1063,6 +1126,11 @@ fn differential_join_batched_fuzz() {
         assert!(
             kept * 4 >= steps,
             "[join_batched:{jt_name}] history kept in only {kept}/{steps} batches"
+        );
+        // Observed 2071/3600 (57%) on 2026-10-23; the floor is about half that.
+        assert!(
+            view_kept * 4 >= steps,
+            "[view_join_batched:{jt_name}] history kept in only {view_kept}/{steps} batches"
         );
     }
 }
