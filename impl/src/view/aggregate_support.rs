@@ -9,6 +9,7 @@ use crate::column::ColumnValue;
 use crate::readable::ReadableTable;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 /// Supported aggregation functions
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -169,8 +170,10 @@ impl ColumnAggState {
 pub(super) struct GroupState {
     /// Per-source-column aggregate statistics
     column_stats: HashMap<String, ColumnAggState>,
-    /// Parent row indices belonging to this group (for MIN/MAX recalc on delete)
-    pub(super) row_indices: HashSet<usize>,
+    /// Number of parent rows in this group; the group is removed at zero.
+    pub(super) row_count: usize,
+    /// This group's key, shared by the view's position-indexed row map.
+    pub(super) key: Rc<GroupKey>,
     /// Source columns that need sorted_values for percentile calculations
     pub(super) percentile_columns: HashSet<String>,
     /// Source columns that need a value multiset for MIN/MAX
@@ -184,10 +187,12 @@ impl GroupState {
         position: usize,
         percentile_columns: HashSet<String>,
         extreme_columns: HashSet<String>,
+        key: Rc<GroupKey>,
     ) -> Self {
         GroupState {
             column_stats: HashMap::new(),
-            row_indices: HashSet::new(),
+            row_count: 0,
+            key,
             percentile_columns,
             extreme_columns,
             position,

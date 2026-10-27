@@ -20,7 +20,7 @@ fn order(region: &str, amount: i32) -> Row {
     ])
 }
 
-fn orders(rows: &[(&str, i32)]) -> Rc<RefCell<Table>> {
+fn orders_table(rows: &[(&str, i32)]) -> Table {
     let mut table = Table::new(
         "orders".into(),
         Schema::new(vec![
@@ -33,7 +33,11 @@ fn orders(rows: &[(&str, i32)]) -> Rc<RefCell<Table>> {
         table.append_row(order(region, *amount)).unwrap();
     }
     table.clear_changeset();
-    Rc::new(RefCell::new(table))
+    table
+}
+
+fn orders(rows: &[(&str, i32)]) -> Rc<RefCell<Table>> {
+    Rc::new(RefCell::new(orders_table(rows)))
 }
 
 fn by_region(parent: Rc<RefCell<dyn ReadableTable>>) -> AggregateView {
@@ -440,12 +444,8 @@ fn filter_and_sort_over_an_aggregate_replay_instead_of_rebuilding() {
 
 #[test]
 fn removing_an_extreme_reads_no_parent_rows() {
-    let table = Rc::try_unwrap(orders(&[("West", 10), ("West", 30), ("West", 25)]))
-        .ok()
-        .expect("sole owner")
-        .into_inner();
     let counted = Rc::new(RefCell::new(Counted {
-        inner: table,
+        inner: orders_table(&[("West", 10), ("West", 30), ("West", 25)]),
         reads: Cell::new(0),
     }));
     let mut view = by_region(counted.clone());
@@ -532,4 +532,57 @@ fn signed_zero_extremes_are_deterministic() {
         assert_eq!(bits(&view, "lo"), (-0.0f64).to_bits(), "{zeros:?} rebuilt MIN");
         assert_eq!(bits(&view, "hi"), 0.0f64.to_bits(), "{zeros:?} rebuilt MAX");
     }
+}
+
+/// A parent over a real table's rows whose changeset the test writes by hand.
+struct Scripted {
+    inner: Table,
+    changes: Changeset,
+    version: u64,
+}
+
+impl ReadableTable for Scripted {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+    fn column_names(&self) -> Vec<String> {
+        self.inner.column_names()
+    }
+    fn get_row(&self, index: usize) -> Result<Row, String> {
+        self.inner.get_row(index)
+    }
+    fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
+        self.inner.get_value(row, column)
+    }
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn changeset(&self) -> Option<&Changeset> {
+        Some(&self.changes)
+    }
+}
+
+#[test]
+fn out_of_range_events_rebuild_instead_of_panicking() {
+    let parent = Rc::new(RefCell::new(Scripted {
+        inner: orders_table(&[("West", 10), ("East", 20)]),
+        changes: Changeset::new(),
+        version: 0,
+    }));
+    let mut view = by_region(parent.clone());
+    let cursor = view.changeset().expect("history").total_len();
+    {
+        let mut parent = parent.borrow_mut();
+        parent.changes.push(TableChange::RowDeleted {
+            index: 7,
+            data: order("West", 10),
+        });
+        parent.version += 1;
+    }
+    view.sync();
+    assert!(
+        view.changeset().expect("synced").changes_from(cursor).is_none(),
+        "an out-of-range event must rebuild"
+    );
+    assert_eq!(snapshot(&view), snapshot(&by_region(parent.clone())));
 }

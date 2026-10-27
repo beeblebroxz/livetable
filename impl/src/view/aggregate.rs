@@ -35,10 +35,9 @@ pub struct AggregateView {
     groups: HashMap<GroupKey, GroupState>,
     /// Ordered list of group keys for consistent iteration
     group_order: Vec<GroupKey>,
-    /// Map from parent row index to its group key
-    row_to_group: HashMap<usize, GroupKey>,
-    /// Whether row_to_group is populated (deferred for fast initial build)
-    row_to_group_built: bool,
+    /// Each parent row's group, by parent position (`None`: in no group). A
+    /// structural event shifts it with one memmove instead of a rehash.
+    row_groups: Vec<Option<Rc<GroupKey>>>,
     /// Last synced generation from the parent's changeset.
     last_synced_generation: u64,
     /// Consumed cursor in the parent's stream, or usize::MAX without a coherent
@@ -73,58 +72,6 @@ fn same_value(old: &ColumnValue, new: &ColumnValue) -> bool {
     match (old, new) {
         (ColumnValue::Float64(old), ColumnValue::Float64(new)) => old.to_bits() == new.to_bits(),
         _ => old == new,
-    }
-}
-
-/// Temporary identities for a batch with multiple insertions/deletions. Old
-/// rows keep their pre-batch index as identity; inserted rows get fresh IDs.
-/// Replay aggregates against these identities, then remap the index hashes
-/// once. No source rows or aggregate values are copied.
-struct BatchRowMapping {
-    event_rows: Vec<usize>,
-    final_positions: Vec<usize>,
-}
-
-impl BatchRowMapping {
-    fn new(final_len: usize, changes: &[TableChange]) -> Option<Self> {
-        let mut initial_len = final_len;
-        for change in changes.iter().rev() {
-            match change {
-                TableChange::RowInserted { .. } => initial_len = initial_len.checked_sub(1)?,
-                TableChange::RowDeleted { .. } => initial_len = initial_len.checked_add(1)?,
-                _ => {}
-            }
-        }
-        let mut identities: Vec<usize> = (0..initial_len).collect();
-        let mut next_id = initial_len;
-        let mut event_rows = Vec::with_capacity(changes.len());
-        for change in changes {
-            let row = match change {
-                TableChange::RowInserted { index, .. } => {
-                    if *index > identities.len() {
-                        return None;
-                    }
-                    let id = next_id;
-                    next_id += 1;
-                    identities.insert(*index, id);
-                    id
-                }
-                TableChange::RowDeleted { index, .. } => {
-                    identities.get(*index)?;
-                    identities.remove(*index)
-                }
-                TableChange::CellUpdated { row, .. } => *identities.get(*row)?,
-            };
-            event_rows.push(row);
-        }
-        let mut final_positions = vec![usize::MAX; next_id];
-        for (position, identity) in identities.into_iter().enumerate() {
-            final_positions[identity] = position;
-        }
-        Some(Self {
-            event_rows,
-            final_positions,
-        })
     }
 }
 
@@ -173,8 +120,7 @@ impl AggregateView {
             aggregations,
             groups: HashMap::new(),
             group_order: Vec::new(),
-            row_to_group: HashMap::new(),
-            row_to_group_built: false,
+            row_groups: Vec::new(),
             last_synced_generation: generation,
             last_processed_change_count: change_count,
             sync_count: 0,
@@ -188,8 +134,7 @@ impl AggregateView {
     fn rebuild_index(&mut self) {
         self.groups.clear();
         self.group_order.clear();
-        self.row_to_group.clear();
-        self.row_to_group_built = false;
+        self.row_groups.clear();
 
         let pct_cols = self.percentile_source_columns();
         let extreme_cols = self.extreme_source_columns();
@@ -210,6 +155,7 @@ impl AggregateView {
             .collect();
 
         let num_rows = parent.len();
+        self.row_groups.reserve(num_rows);
         let (generation, change_count) = match parent.changeset() {
             Some(cs) => (cs.generation(), cs.total_len()),
             None => (self.last_synced_generation, usize::MAX),
@@ -251,16 +197,22 @@ impl AggregateView {
                 let group_val = match parent.get_value_by_index(row_idx, group_col_idx) {
                     Ok(ColumnValue::Int32(v)) => Some(v),
                     Ok(ColumnValue::Null) => None,
-                    _ => continue,
+                    _ => {
+                        // In no group, but still holds its position.
+                        self.row_groups.push(None);
+                        continue;
+                    }
                 };
 
                 // Get or create group state directly with int key
                 let is_new_group = !int_groups.contains_key(&group_val);
                 let position = int_group_order.len();
-                let state = int_groups
-                    .entry(group_val)
-                    .or_insert_with(|| GroupState::new(position, pct_cols.clone(), extreme_cols.clone()));
-                state.row_indices.insert(row_idx);
+                let state = int_groups.entry(group_val).or_insert_with(|| {
+                    let key = Rc::new(GroupKey::from_single_int(group_val));
+                    GroupState::new(position, pct_cols.clone(), extreme_cols.clone(), key)
+                });
+                state.row_count += 1;
+                self.row_groups.push(Some(state.key.clone()));
 
                 // Add aggregation value(s)
                 if has_single_source {
@@ -285,21 +237,17 @@ impl AggregateView {
             }
 
             // Convert integer groups to GroupKey-based maps (only allocate once per group)
-            // NOTE: We skip populating row_to_group for initial build.
-            // It will be populated lazily if incremental sync is needed.
             for &int_val in &int_group_order {
-                let key = GroupKey::from_single_int(int_val);
                 if let Some(state) = int_groups.remove(&int_val) {
+                    let key = (*state.key).clone();
                     self.groups.insert(key.clone(), state);
                     self.group_order.push(key);
                 }
             }
-            self.row_to_group_built = false; // Deferred for fast path
         } else {
             // General case - multi-column or non-int group by
             for row_idx in 0..num_rows {
                 let key = GroupKey::from_indices(&*parent, row_idx, &group_col_indices);
-                self.row_to_group.insert(row_idx, key.clone());
 
                 let col_values: Vec<(String, f64)> = source_col_info
                     .iter()
@@ -314,11 +262,11 @@ impl AggregateView {
 
                 let is_new_group = !self.groups.contains_key(&key);
                 let position = self.group_order.len();
-                let state = self
-                    .groups
-                    .entry(key.clone())
-                    .or_insert_with(|| GroupState::new(position, pct_cols.clone(), extreme_cols.clone()));
-                state.row_indices.insert(row_idx);
+                let state = self.groups.entry(key.clone()).or_insert_with(|| {
+                    GroupState::new(position, pct_cols.clone(), extreme_cols.clone(), Rc::new(key.clone()))
+                });
+                state.row_count += 1;
+                self.row_groups.push(Some(state.key.clone()));
 
                 for (source_col, num) in col_values {
                     state.add_column_value(&source_col, num);
@@ -328,7 +276,6 @@ impl AggregateView {
                     self.group_order.push(key);
                 }
             }
-            self.row_to_group_built = true; // General case builds it eagerly
         }
         drop(parent);
 
@@ -337,21 +284,6 @@ impl AggregateView {
         self.last_parent_version = parent_version;
         self.output_changes.invalidate();
         self.sync_count += 1;
-    }
-
-    /// Build row_to_group mapping if not already built (lazy initialization)
-    fn ensure_row_to_group_built(&mut self) {
-        if self.row_to_group_built {
-            return;
-        }
-
-        // Populate row_to_group from groups' row_indices
-        for (key, state) in &self.groups {
-            for &row_idx in &state.row_indices {
-                self.row_to_group.insert(row_idx, key.clone());
-            }
-        }
-        self.row_to_group_built = true;
     }
 
     /// Get unique source columns from aggregations
@@ -389,17 +321,11 @@ impl AggregateView {
             .collect()
     }
 
-    fn add_row_to_aggregates(
-        &mut self,
-        row_idx: usize,
-        row: &HashMap<String, ColumnValue>,
-        touched: &mut HashMap<GroupKey, Touch>,
-    ) {
+    /// Add a row's values to its group, creating the group if needed. Returns
+    /// the group's shared key; the caller records it at the row's position.
+    fn add_to_group(&mut self, row: &Row, touched: &mut HashMap<GroupKey, Touch>) -> Rc<GroupKey> {
         let key = GroupKey::from_row(row, &self.group_by_columns);
         self.touch_existing(&key, touched);
-
-        // Track which group this row belongs to
-        self.row_to_group.insert(row_idx, key.clone());
 
         // Collect source columns and their values first
         let source_cols = self.unique_source_columns();
@@ -420,35 +346,33 @@ impl AggregateView {
         let state = self
             .groups
             .entry(key.clone())
-            .or_insert_with(|| GroupState::new(position, pct_cols, extreme_cols));
-
-        // Add row index to group
-        state.row_indices.insert(row_idx);
+            .or_insert_with(|| GroupState::new(position, pct_cols, extreme_cols, Rc::new(key.clone())));
+        state.row_count += 1;
 
         // Add values for each unique source column (not per-aggregation!)
         for (source_col, num) in col_values {
             state.add_column_value(&source_col, num);
         }
+        let shared = state.key.clone();
 
         // Track group order
         if is_new_group {
             touched.insert(key.clone(), Touch::New);
             self.group_order.push(key);
         }
+        shared
     }
 
-    fn remove_row_from_aggregates(
+    /// Remove a row's values from its group, removing the group once empty.
+    /// The caller updates the row's position.
+    fn remove_from_group(
         &mut self,
-        row_idx: usize,
-        row: &HashMap<String, ColumnValue>,
+        row: &Row,
         touched: &mut HashMap<GroupKey, Touch>,
         removed_slots: &mut Vec<usize>,
-    ) -> bool {
+    ) {
         let key = GroupKey::from_row(row, &self.group_by_columns);
         self.touch_existing(&key, touched);
-
-        // Remove from row_to_group
-        self.row_to_group.remove(&row_idx);
 
         // Collect source columns and their values first
         let source_cols = self.unique_source_columns();
@@ -462,7 +386,8 @@ impl AggregateView {
             .collect();
 
         if let Some(state) = self.groups.get_mut(&key) {
-            state.row_indices.remove(&row_idx);
+            debug_assert!(state.row_count > 0, "removing a row from an empty group");
+            state.row_count -= 1;
 
             // Remove values for each unique source column
             for (source_col, num) in col_values {
@@ -470,14 +395,24 @@ impl AggregateView {
             }
 
             // If group is now empty, remove it
-            if state.row_indices.is_empty() {
+            if state.row_count == 0 {
                 self.remove_group(&key, touched, removed_slots);
             }
-
-            true
-        } else {
-            false
         }
+    }
+
+    /// Whether every event's index is in range for the rows before it:
+    /// inserts at or before the end, deletes and updates before it.
+    fn indices_in_range(mut len: usize, changes: &[TableChange]) -> bool {
+        for change in changes {
+            match change {
+                TableChange::RowInserted { index, .. } if *index <= len => len += 1,
+                TableChange::RowDeleted { index, .. } if *index < len => len -= 1,
+                TableChange::CellUpdated { row, .. } if *row < len => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Record an existing group's output row the first time a batch touches
@@ -714,9 +649,6 @@ impl AggregateView {
         let parent_version = parent.version();
         drop(parent);
 
-        // Ensure row_to_group is built before processing changes
-        self.ensure_row_to_group_built();
-
         let modified = self.apply_changes(&new_changes);
         self.last_processed_change_count = new_count;
         self.last_synced_generation = new_generation;
@@ -751,86 +683,57 @@ impl IncrementalView for AggregateView {
                 }
             }
         }
-        // A sort move emits delete + insert. Rehashing all row indices after
-        // each event makes even a small batch slower than a rebuild. Simulate
-        // bounded batches with cheap vector shifts and rehash just once.
-        // The doubled bound also covers 256 sort updates emitting 512 events.
-        // Beyond it, per-event reindexing costs O(rows) each: rebuild instead.
+        // Each structural event shifts `row_groups` once, a memmove. The bound
+        // (doubled to cover 256 sort updates emitting 512 events) caps a batch
+        // at about one rebuild's worth of memmoves.
         let multiple_shifts = changes
             .iter()
             .filter(|c| c.shifts_indices())
             .take(2)
             .count()
             == 2;
-        let batch_rows = if !multiple_shifts {
-            None
-        } else if changes.len() > MAX_FILTER_REPLAY_CHANGES * 2 {
+        if (multiple_shifts && changes.len() > MAX_FILTER_REPLAY_CHANGES * 2)
+            || !Self::indices_in_range(self.row_groups.len(), changes)
+        {
             self.rebuild_index();
             return true;
-        } else {
-            let prepared = BatchRowMapping::new(self.parent.borrow().len(), changes);
-            match prepared {
-                Some(mapping) => Some(mapping),
-                None => {
-                    self.rebuild_index();
-                    return true;
-                }
-            }
-        };
+        }
         let mut modified = false;
         // Past every rebuild fallback: this batch replaces retained history.
         self.output_changes.clear();
         let mut touched: HashMap<GroupKey, Touch> = HashMap::new();
         let mut removed_slots: Vec<usize> = Vec::new();
 
+        // Event indices refer to the rows as earlier events left them, so each
+        // event updates `row_groups` in order.
         for (change_index, change) in changes.iter().enumerate() {
-            let row_id = batch_rows.as_ref().map_or_else(
-                || change.row_index(),
-                |mapping| mapping.event_rows[change_index],
-            );
             match change {
                 TableChange::RowInserted { index, data } => {
-                    // Adjust existing row indices
-                    if batch_rows.is_none() {
-                        self.adjust_indices_for_insert(*index);
-                    }
-                    // Add the new row to aggregates
-                    self.add_row_to_aggregates(row_id, data, &mut touched);
+                    let key = self.add_to_group(data, &mut touched);
+                    self.row_groups.insert(*index, Some(key));
                     modified = true;
                 }
 
                 TableChange::RowDeleted { index, data } => {
-                    self.remove_row_from_aggregates(
-                        row_id,
-                        data,
-                        &mut touched,
-                        &mut removed_slots,
-                    );
-                    // Adjust remaining row indices
-                    if batch_rows.is_none() {
-                        self.adjust_indices_for_delete(*index);
-                    }
+                    self.remove_from_group(data, &mut touched, &mut removed_slots);
+                    self.row_groups.remove(*index);
                     modified = true;
                 }
 
                 TableChange::CellUpdated {
-                    row: _,
+                    row,
                     column,
                     old_value,
                     new_value,
                 } => {
-                    // Check if group-by column changed
+                    // A group-key update moves the row in place: no shift.
                     if self.group_by_columns.contains(column) {
                         let new_row = &updated_rows[&change_index];
                         let mut old_row = new_row.clone();
                         old_row.insert(column.clone(), old_value.clone());
-                        self.remove_row_from_aggregates(
-                            row_id,
-                            &old_row,
-                            &mut touched,
-                            &mut removed_slots,
-                        );
-                        self.add_row_to_aggregates(row_id, new_row, &mut touched);
+                        self.remove_from_group(&old_row, &mut touched, &mut removed_slots);
+                        let key = self.add_to_group(new_row, &mut touched);
+                        self.row_groups[*row] = Some(key);
                         modified = true;
                     } else {
                         // Check if aggregated column changed
@@ -838,18 +741,19 @@ impl IncrementalView for AggregateView {
                             self.aggregations.iter().any(|(_, src, _)| src == column);
                         if affects_aggregation {
                             // Update the aggregate values
-                            if let Some(key) = self.row_to_group.get(&row_id).cloned() {
-                                self.touch_existing(&key, &mut touched);
+                            if let Some(shared) = self.row_groups[*row].clone() {
+                                let key: &GroupKey = &shared;
+                                self.touch_existing(key, &mut touched);
 
                                 // Remove old value
-                                if let Some(state) = self.groups.get_mut(&key) {
+                                if let Some(state) = self.groups.get_mut(key) {
                                     if let Some(old_num) = Self::extract_numeric(old_value) {
                                         state.remove_column_value(column, old_num);
                                     }
                                 }
 
                                 // Add new value
-                                if let Some(state) = self.groups.get_mut(&key) {
+                                if let Some(state) = self.groups.get_mut(key) {
                                     if let Some(new_num) = Self::extract_numeric(new_value) {
                                         state.add_column_value(column, new_num);
                                     }
@@ -858,35 +762,6 @@ impl IncrementalView for AggregateView {
                             }
                         }
                     }
-                }
-            }
-        }
-
-        if let Some(mapping) = batch_rows {
-            let positions = &mapping.final_positions;
-            // Temporary inserted-and-deleted rows often leave the permutation
-            // unchanged. In that case even the final rehash is unnecessary.
-            if positions
-                .iter()
-                .enumerate()
-                .any(|(id, &pos)| pos != usize::MAX && pos != id)
-            {
-                self.row_to_group = std::mem::take(&mut self.row_to_group)
-                    .into_iter()
-                    .map(|(id, key)| {
-                        debug_assert_ne!(
-                            positions[id],
-                            usize::MAX,
-                            "deleted identity still in aggregate"
-                        );
-                        (positions[id], key)
-                    })
-                    .collect();
-                for state in self.groups.values_mut() {
-                    state.row_indices = std::mem::take(&mut state.row_indices)
-                        .into_iter()
-                        .map(|id| positions[id])
-                        .collect();
                 }
             }
         }
@@ -903,63 +778,6 @@ impl IncrementalView for AggregateView {
 
     fn rebuild(&mut self) {
         self.rebuild_index();
-    }
-}
-
-impl AggregateView {
-    /// Adjust row indices when a row is inserted
-    fn adjust_indices_for_insert(&mut self, inserted_index: usize) {
-        // Fast path: appending at the end doesn't shift any existing indices
-        let max_existing = self.row_to_group.keys().max().copied();
-        if max_existing.is_none_or(|max| inserted_index > max) {
-            return;
-        }
-
-        // Update row_to_group keys
-        let mut new_row_to_group = HashMap::new();
-        for (idx, key) in self.row_to_group.drain() {
-            let new_idx = if idx >= inserted_index { idx + 1 } else { idx };
-            new_row_to_group.insert(new_idx, key);
-        }
-        self.row_to_group = new_row_to_group;
-
-        // Update row_indices in each group
-        for state in self.groups.values_mut() {
-            let old_indices: Vec<usize> = state.row_indices.iter().copied().collect();
-            state.row_indices.clear();
-            for idx in old_indices {
-                let new_idx = if idx >= inserted_index { idx + 1 } else { idx };
-                state.row_indices.insert(new_idx);
-            }
-        }
-    }
-
-    /// Adjust row indices when a row is deleted
-    fn adjust_indices_for_delete(&mut self, deleted_index: usize) {
-        // Update row_to_group keys
-        let mut new_row_to_group = HashMap::new();
-        for (idx, key) in self.row_to_group.drain() {
-            if idx > deleted_index {
-                new_row_to_group.insert(idx - 1, key);
-            } else if idx < deleted_index {
-                new_row_to_group.insert(idx, key);
-            }
-            // idx == deleted_index is already removed
-        }
-        self.row_to_group = new_row_to_group;
-
-        // Update row_indices in each group
-        for state in self.groups.values_mut() {
-            let old_indices: Vec<usize> = state.row_indices.iter().copied().collect();
-            state.row_indices.clear();
-            for idx in old_indices {
-                if idx > deleted_index {
-                    state.row_indices.insert(idx - 1);
-                } else if idx < deleted_index {
-                    state.row_indices.insert(idx);
-                }
-            }
-        }
     }
 }
 

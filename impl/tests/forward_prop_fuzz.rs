@@ -635,9 +635,9 @@ fn differential_batched_forward_prop_fuzz() {
 
 /// GROUP BY a single Int32 column exercises a distinct fast path in
 /// `rebuild_index` (`is_single_int_group`) that the string-keyed fuzz never
-/// touches — including its deferred `row_to_group` population. Views are built
+/// touches, including the position-indexed row map it builds. Views are built
 /// AFTER seeding rows so the first incremental sync runs against a fast-path
-/// rebuild that already holds data.
+/// rebuild that already holds data, and half the inserts land mid-table.
 #[test]
 fn differential_int_group_by_fuzz() {
     fn int_schema() -> Schema {
@@ -670,7 +670,13 @@ fn differential_int_group_by_fuzz() {
         row.insert("bucket".to_string(), ColumnValue::Int32(rng.below(4) as i32));
         let a = amount(rng);
         row.insert("amount".to_string(), a);
-        base.borrow_mut().append_row(row).unwrap();
+        // Half the inserts land mid-table, so the Int32 fast path sees shifts.
+        let len = base.borrow().len();
+        if rng.below(2) == 0 {
+            base.borrow_mut().append_row(row).unwrap();
+        } else {
+            base.borrow_mut().insert_row(rng.below(len + 1), row).unwrap();
+        }
     };
 
     for trial in 0..40u64 {
