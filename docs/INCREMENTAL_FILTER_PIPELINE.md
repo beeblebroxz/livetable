@@ -40,18 +40,22 @@ filter emits nothing and the aggregate's sync does no work.
 
 Aggregate group-key updates use the same historical-row reconstruction, so
 small mixed batches can migrate rows between groups safely. Large group-key
-batches retain a rebuild fallback. Unrequested MIN/MAX statistics do not
-trigger rescans for SUM/COUNT/AVG-only views.
+batches retain a rebuild fallback. Since 2026-10-26, MIN/MAX keep a per-group
+value multiset, so removing an extreme never rescans the source, and
+SUM/COUNT/AVG-only views track no extremes at all.
 The integer grouping fast path retains NULL keys, matching incremental
 maintenance and the general grouping path.
 
 ## Limits
 
 This does not make every operation constant time. Membership changes and
-middle insertions/deletions can shift O(N) index bookkeeping. Requested
-MIN/MAX can rescan the affected group, and percentile maintenance uses sorted
-vectors. The integer-group fast path lazily builds its row-to-group map on
-the first incremental update; benchmark warmup includes that cost.
+middle insertions/deletions can shift O(N) index bookkeeping. MIN/MAX updates
+cost O(log g) for a group of g values, and percentile maintenance uses sorted
+vectors. At this milestone the integer-group fast path built its row-to-group
+map lazily on the first incremental update, and benchmark warmup included that
+cost. Since 2026-10-26 aggregates build a position-indexed row map during
+construction and shift it with one memmove per insert or delete; see the
+[view maintenance benchmark](VIEW_MAINTENANCE_BENCHMARK.md#after-the-aggregate-fix-2026-10-26).
 
 The subsequent [sorted pipeline milestone](INCREMENTAL_SORTED_PIPELINE.md)
 adds bounded sorted-coordinate output replay and aggregate index remapping.

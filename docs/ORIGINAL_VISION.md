@@ -180,8 +180,8 @@ The original proposal, rather than feeding directly into a "group by" table:
 The current `AggregateView` instead exposes its own materialized group state
 through `ReadableTable`; it does not populate a separate root table. It does
 publish a group-coordinate output changeset (a net diff per batch), so views
-and wire deliveries downstream of a group update incrementally. SUM/COUNT/AVG maintain incremental state; requested extrema
-may rescan a group, while percentiles maintain sorted values.
+and wire deliveries downstream of a group update incrementally. SUM/COUNT/AVG maintain incremental state, MIN/MAX keep a
+per-group value multiset, and percentiles maintain sorted values.
 
 ### Parallel Group By
 

@@ -82,7 +82,9 @@ impl ColumnAggState {
             *extremes.entry(OrderedF64(value)).or_insert(0) += 1;
         }
         if let Some(ref mut sorted) = self.sorted_values {
-            let pos = sorted.partition_point(|&v| v < value);
+            // Total order, so -0.0 and 0.0 sort apart and removal finds the
+            // exact value an incremental sync added.
+            let pos = sorted.partition_point(|v| v.total_cmp(&value).is_lt());
             sorted.insert(pos, value);
         }
     }
@@ -94,8 +96,8 @@ impl ColumnAggState {
         self.count = self.count.saturating_sub(1);
 
         if let Some(ref mut sorted) = self.sorted_values {
-            let pos = sorted.partition_point(|&v| v < value);
-            let present = pos < sorted.len() && sorted[pos] == value;
+            let pos = sorted.partition_point(|v| v.total_cmp(&value).is_lt());
+            let present = pos < sorted.len() && sorted[pos].to_bits() == value.to_bits();
             debug_assert!(present, "removed value {value} missing from sorted_values");
             if present {
                 sorted.remove(pos);
@@ -153,8 +155,12 @@ impl ColumnAggState {
                     ColumnValue::Null
                 }
             }
-            AggregateFunction::Min => Self::extreme(self.extremes.as_ref().and_then(|e| e.keys().next())),
-            AggregateFunction::Max => Self::extreme(self.extremes.as_ref().and_then(|e| e.keys().next_back())),
+            AggregateFunction::Min => {
+                Self::extreme(self.extremes.as_ref().and_then(|e| e.keys().next()))
+            }
+            AggregateFunction::Max => {
+                Self::extreme(self.extremes.as_ref().and_then(|e| e.keys().next_back()))
+            }
             AggregateFunction::Percentile(p) => self
                 .percentile(p)
                 .map_or(ColumnValue::Null, ColumnValue::Float64),
@@ -233,7 +239,6 @@ impl GroupState {
             }
         }
     }
-
 }
 
 /// A key for grouping rows — one typed part per group-by column, `None` = NULL.

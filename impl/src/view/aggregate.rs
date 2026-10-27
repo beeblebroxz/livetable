@@ -263,7 +263,12 @@ impl AggregateView {
                 let is_new_group = !self.groups.contains_key(&key);
                 let position = self.group_order.len();
                 let state = self.groups.entry(key.clone()).or_insert_with(|| {
-                    GroupState::new(position, pct_cols.clone(), extreme_cols.clone(), Rc::new(key.clone()))
+                    GroupState::new(
+                        position,
+                        pct_cols.clone(),
+                        extreme_cols.clone(),
+                        Rc::new(key.clone()),
+                    )
                 });
                 state.row_count += 1;
                 self.row_groups.push(Some(state.key.clone()));
@@ -343,10 +348,9 @@ impl AggregateView {
         let pct_cols = self.percentile_source_columns();
         let extreme_cols = self.extreme_source_columns();
         let position = self.group_order.len();
-        let state = self
-            .groups
-            .entry(key.clone())
-            .or_insert_with(|| GroupState::new(position, pct_cols, extreme_cols, Rc::new(key.clone())));
+        let state = self.groups.entry(key.clone()).or_insert_with(|| {
+            GroupState::new(position, pct_cols, extreme_cols, Rc::new(key.clone()))
+        });
         state.row_count += 1;
 
         // Add values for each unique source column (not per-aggregation!)

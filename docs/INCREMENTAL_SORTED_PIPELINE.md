@@ -47,13 +47,13 @@ table.tick()  # syncs parents before children
 - Derived cursors never constrain root-table compaction. Parent-before-child
   sync is required. A refresh without a root mutation still requires an
   explicit child `sync()`; root `tick()` does not run without pending mutations.
-- Aggregates batch index maintenance for inputs with at least two structural
-  events and at most 512 total events. Old rows retain temporary pre-batch
-  identities and inserted rows get fresh identities. Aggregate values update
-  incrementally; index hashes are remapped once before any MIN/MAX rescan.
-  This avoids repeated hash-map rebuilding for each sorted delete/insert pair.
-  Unchanged final identity mappings skip even that final remap. Larger inputs
-  with at least two structural events rebuild, as do inputs with group-key
+- At this milestone, aggregates batched index maintenance for inputs with at
+  least two structural events and at most 512 total events: old rows kept
+  temporary pre-batch identities, and index hashes were remapped once before
+  any MIN/MAX rescan. Since 2026-10-26 aggregates instead apply each event to a
+  position-indexed row map (one memmove per insert or delete) and keep MIN/MAX
+  in a value multiset, so there is no remap and no rescan. Larger inputs with
+  at least two structural events still rebuild, as do inputs with group-key
   updates above 256 events.
 - Python `ranked.group_by(by, agg)` accepts the same columns and aggregation
   strings as `table.group_by()`. It registers the sort once before its child;
@@ -63,15 +63,15 @@ table.tick()  # syncs parents before children
 ## Costs and limits
 
 For N sorted rows and K keys, permanent sort state is O(NK + N), plus bounded
-output history. Cached string keys own their values. Aggregate batch remapping
-uses O(N + B) temporary index storage, not a table snapshot. Construction and
+output history. Cached string keys own their values. Aggregates keep one
+pointer per row in a position-indexed map (at this milestone, batch remapping
+used O(N + B) temporary index storage instead). Construction and
 initial cache allocation are not measured by the update benchmark below.
 
 This is not an O(1) row-movement implementation. Moving rows, middle insertions,
 and deletions still shift vectors and inverse indices; structural batches can
-do O(BN) vector work even though aggregate hash remapping happens just once.
-Requested MIN/MAX can rescan affected groups, and percentiles maintain sorted
-vectors. A sort's 256 input events can produce 512 output events, so a child
+do O(BN) vector work. MIN/MAX updates are O(log g) per value, with no rescans
+since 2026-10-26, and percentiles maintain sorted vectors. A sort's 256 input events can produce 512 output events, so a child
 filter/sort with the same 256-input bound can legitimately rebuild.
 
 At this milestone, views other than filters and sorts exposed no output

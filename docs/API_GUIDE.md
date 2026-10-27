@@ -307,8 +307,9 @@ later tick.
 Filters and sorts replay mixed batches of up to 256 input events. Larger batches,
 missing history, or an incoherent baseline trigger a full rebuild. Sort moves
 emit a delete/insert pair, so a 256-event input batch can produce 512 events;
-a downstream filter/sort may consequently rebuild. Aggregates batch structural
-index remapping for up to 512 events; requested MIN/MAX can still rescan a group.
+a downstream filter/sort may consequently rebuild. Aggregates apply up to 512
+structural events per batch, one memmove each, and keep MIN/MAX in a per-group
+value multiset, so removing an extreme never rescans the source.
 An aggregate's `changeset()` holds each batch's net diff in group coordinates:
 changed result cells, deleted emptied groups, and new groups appended at the end.
 Filters, sorts, and joins built on an aggregate replay that history. A join's

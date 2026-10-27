@@ -564,25 +564,171 @@ impl ReadableTable for Scripted {
 
 #[test]
 fn out_of_range_events_rebuild_instead_of_panicking() {
-    let parent = Rc::new(RefCell::new(Scripted {
-        inner: orders_table(&[("West", 10), ("East", 20)]),
-        changes: Changeset::new(),
-        version: 0,
-    }));
-    let mut view = by_region(parent.clone());
-    let cursor = view.changeset().expect("history").total_len();
-    {
-        let mut parent = parent.borrow_mut();
-        parent.changes.push(TableChange::RowDeleted {
-            index: 7,
+    fn deleted(index: usize) -> TableChange {
+        TableChange::RowDeleted {
+            index,
             data: order("West", 10),
-        });
-        parent.version += 1;
+        }
     }
-    view.sync();
-    assert!(
-        view.changeset().expect("synced").changes_from(cursor).is_none(),
-        "an out-of-range event must rebuild"
+    fn inserted(index: usize) -> TableChange {
+        TableChange::RowInserted {
+            index,
+            data: order("West", 5),
+        }
+    }
+    // The parent holds two rows, so len = 2.
+    let rebuilds: Vec<(&str, Vec<TableChange>)> = vec![
+        ("delete at len", vec![deleted(2)]),
+        ("insert past len", vec![inserted(3)]),
+        ("aggregated update at len", vec![update(2, "amount", ColumnValue::Int32(10), ColumnValue::Int32(11))]),
+        ("other update at len", vec![update(2, "note", ColumnValue::Int32(0), ColumnValue::Int32(1))]),
+        (
+            "key update at len",
+            vec![update(2, "region", ColumnValue::String("West".into()), ColumnValue::String("East".into()))],
+        ),
+        ("second delete past the shrunk len", vec![deleted(0), deleted(1)]),
+        (
+            "update past the shrunk len",
+            vec![deleted(0), update(1, "amount", ColumnValue::Int32(20), ColumnValue::Int32(21))],
+        ),
+    ];
+    let keeps: Vec<(&str, Vec<TableChange>)> = vec![
+        ("insert at len", vec![inserted(2)]),
+        ("two appends", vec![inserted(2), inserted(3)]),
+        ("delete the last row", vec![deleted(1)]),
+    ];
+    for (rebuild, (label, changes)) in rebuilds
+        .into_iter()
+        .map(|case| (true, case))
+        .chain(keeps.into_iter().map(|case| (false, case)))
+    {
+        let parent = Rc::new(RefCell::new(Scripted {
+            inner: orders_table(&[("West", 10), ("East", 20)]),
+            changes: Changeset::new(),
+            version: 0,
+        }));
+        let mut view = by_region(parent.clone());
+        let cursor = view.changeset().expect("history").total_len();
+        {
+            let mut parent = parent.borrow_mut();
+            for change in changes {
+                parent.changes.push(change);
+            }
+            parent.version += 1;
+        }
+        view.sync();
+        let kept = view.changeset().expect("synced").changes_from(cursor).is_some();
+        assert_eq!(kept, !rebuild, "{label}: kept history = {kept}");
+        if rebuild {
+            assert_eq!(snapshot(&view), snapshot(&by_region(parent.clone())), "{label}");
+        }
+    }
+}
+
+/// A one-column Float64 table grouped into a single region.
+fn float_amounts() -> Rc<RefCell<Table>> {
+    let mut table = Table::new(
+        "amounts".into(),
+        Schema::new(vec![
+            ("region".into(), ColumnType::String, false),
+            ("amount".into(), ColumnType::Float64, false),
+        ]),
     );
-    assert_eq!(snapshot(&view), snapshot(&by_region(parent.clone())));
+    table.clear_changeset();
+    Rc::new(RefCell::new(table))
+}
+
+fn append_amount(table: &Rc<RefCell<Table>>, amount: f64) {
+    table
+        .borrow_mut()
+        .append_row(HashMap::from([
+            ("region".into(), ColumnValue::String("West".into())),
+            ("amount".into(), Float64(amount)),
+        ]))
+        .unwrap();
+}
+
+#[test]
+fn signed_zero_median_matches_a_rebuild() {
+    let table = float_amounts();
+    let mut view = AggregateView::new(
+        "median".into(),
+        table.clone(),
+        vec!["region".into()],
+        vec![("mid".into(), "amount".into(), AggregateFunction::Median)],
+    )
+    .unwrap();
+    append_amount(&table, -0.0);
+    append_amount(&table, 0.0);
+    view.sync();
+    table.borrow_mut().delete_row(0).unwrap(); // the -0.0 row
+    view.sync();
+    let bits = |view: &AggregateView| match view.get_row(0).unwrap()["mid"] {
+        Float64(v) => v.to_bits(),
+        ref other => panic!("unexpected median {other:?}"),
+    };
+    let incremental = bits(&view);
+    view.refresh();
+    assert_eq!(incremental, bits(&view), "incremental median differs from a rebuild");
+    assert_eq!(incremental, 0.0f64.to_bits());
+}
+
+/// MIN and MAX over `amount`, grouped by region.
+fn extremes_by_region(parent: Rc<RefCell<dyn ReadableTable>>) -> AggregateView {
+    AggregateView::new(
+        "extremes".into(),
+        parent,
+        vec!["region".into()],
+        vec![
+            ("low".into(), "amount".into(), AggregateFunction::Min),
+            ("top".into(), "amount".into(), AggregateFunction::Max),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn removing_a_minimum_reads_no_parent_rows() {
+    let counted = Rc::new(RefCell::new(Counted {
+        inner: orders_table(&[("West", 10), ("West", 30), ("West", 25)]),
+        reads: Cell::new(0),
+    }));
+    let mut view = extremes_by_region(counted.clone());
+    counted.borrow().reads.set(0);
+
+    let changes = sync_replayed(&mut view, || {
+        counted.borrow_mut().inner.delete_row(0).unwrap(); // West's min, 10
+    });
+    assert!(changes.contains(&update(0, "low", Float64(10.0), Float64(25.0))));
+    assert_eq!(counted.borrow().reads.get(), 0, "deleting the min read source rows");
+
+    let changes = sync_replayed(&mut view, || {
+        counted
+            .borrow_mut()
+            .inner
+            .set_value(1, "amount", ColumnValue::Int32(40)) // the new min, 25
+            .unwrap();
+    });
+    assert!(changes.contains(&update(0, "low", Float64(25.0), Float64(30.0))));
+    assert_eq!(counted.borrow().reads.get(), 0, "editing the min read source rows");
+}
+
+#[test]
+fn tied_minimums_survive_one_deletion() {
+    let table = orders(&[("West", 10), ("West", 10), ("West", 30)]);
+    let mut view = extremes_by_region(table.clone());
+    let changes = sync_replayed(&mut view, || {
+        table.borrow_mut().delete_row(0).unwrap();
+    });
+    assert!(
+        !changes
+            .iter()
+            .any(|c| matches!(c, TableChange::CellUpdated { column, .. } if column == "low")),
+        "{changes:?}"
+    );
+    assert_eq!(view.get_row(0).unwrap()["low"], Float64(10.0));
+    let changes = sync_replayed(&mut view, || {
+        table.borrow_mut().delete_row(0).unwrap();
+    });
+    assert!(changes.contains(&update(0, "low", Float64(10.0), Float64(30.0))));
 }
