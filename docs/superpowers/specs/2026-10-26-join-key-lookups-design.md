@@ -1,6 +1,26 @@
 # Join key lookups without rebuilding the other side
 
-**Status:** Draft 2026-10-26
+**Status:** Implemented 2026-10-26
+Plan: `docs/superpowers/plans/2026-10-26-join-key-lookups.md`.
+Results: "After the join lookup fix" in `docs/VIEW_MAINTENANCE_BENCHMARK.md`.
+
+Implementation notes:
+
+- Every budget was met. At 1M rows:
+  - order append 90 µs;
+  - order middle insert 1.1 ms;
+  - customer insert 0.89 ms;
+  - customer value edit 0.6 ms;
+  - one-side-at-a-time two-sided updates 2 ms;
+  - deletes 0.82–1.14× of before;
+  - construction 0.96× and `refresh()` 1.04× of before.
+- A 256-customer value-only batch takes 0.71 ms (from 33.4 ms). The first
+  customer insert after a rebuild takes 29 ms (from 64 ms), because it
+  builds the order-side vector.
+- The candidate scan compares up to four target hashes directly per row and
+  uses an identity-hashed set beyond that.
+- `join.rs` was not rustfmt-clean before this change and was left as it
+  was.
 
 ## Why
 

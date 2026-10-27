@@ -205,8 +205,10 @@ aggregate's re-indexing had dominated. At 1M rows on FastReads:
   1.04× for ticks of 1 µs or more.
 
 **What is left.** Of the candidates in the Recommendation:
-- The join's key lookups are now the largest per-event cost: 9–68 ms per
-  one-sided insert, and 31 ms per customer value edit.
+- The join's key lookups were then the largest per-event cost: 9–68 ms per
+  one-sided insert, and 31 ms per customer value edit. They were fixed later
+  the same day; see
+  [After the join lookup fix](#after-the-join-lookup-fix-2026-10-26).
 - The two-sided rebuild costs about 0.9 s with views over the join.
 - Filter and sort index shifting costs 0.2–1 ms.
 - The order between them, and whether to pursue any, is the user's
@@ -287,6 +289,161 @@ aggregate's re-indexing had dominated. At 1M rows on FastReads:
 | two_sided_tick_each_side | 10k | 967 | 642 | 961 | 660 |
 | two_sided_tick_each_side | 100k | 10.0 ms | 6,402 | 9,888 | 6,524 |
 | two_sided_tick_each_side | 1M | 145.0 ms | 76.0 ms | 130.4 ms | 81.2 ms |
+
+
+## After the join lookup fix (2026-10-26)
+
+Design:
+[join key lookups spec](superpowers/specs/2026-10-26-join-key-lookups-design.md).
+
+**What changed.**
+- **Finding matches:** each side keeps a vector of its rows' join-key
+  hashes, built from the live parent the first time the other side needs to
+  match against it, and updated by that side's inserts, deletes and key
+  updates. A sync scans the other side's vector once for the keys it needs
+  and verifies each candidate's key. This replaces the per-sync lookups over
+  the whole other parent.
+- **Value-only customer edits:** a batch of them locates its output rows in
+  one targeted pass over the join's index, instead of hashing the whole
+  output.
+- **Customer appends** skip the shift pass.
+
+**Harness change.** Before both runs, the harness gained an untimed warm-up
+(one order and one customer added and removed after building each join
+pipeline), so first-use vector builds never land in a sample.
+
+### Budgets
+
+All at 1M rows. Where two values are given, they are FastReads / FastUpdates.
+
+| Measure | Budget | Before | After |
+|---|---|---:|---:|
+| Order append | under 0.5 ms | 10.1 / 10.1 ms | 90 / 90 µs |
+| Order middle insert | under 5 ms | 12.5 / 12.3 ms | 1.14 / 1.10 ms |
+| Customer insert | under 2 ms | 67.3 / 65.9 ms | 893 / 890 µs |
+| Customer value edit | under 2 ms | 33.1 / 32.6 ms | 611 / 590 µs |
+| Two-sided, one side at a time | under 10 ms | 79.2 / 79.1 ms | 2.03 / 1.93 ms |
+| Deletes (order middle and tail, customer) | at most 1.25× | | 0.82–1.14× of before |
+| 256-customer value-only batch | under 5 ms | 33.4 ms | 0.71 ms |
+| First customer insert after a rebuild | no slower than before | 64.3 ms | 29.1 ms |
+| Join construction | at most 1.10× | 86.1 ms | 82.9 ms (0.96×) |
+| `refresh()` | at most 1.10× | 78.0 ms | 81.3 ms (1.04×) |
+
+- **Where the numbers come from:** the last four rows come from a throwaway
+  program, not committed, using the harness's data (1M orders INNER JOIN
+  100k customers, FastReads).
+- **Deletes:** the range covers 10k to 1M on both hints. The largest ratio is
+  1.14×, an order middle delete at 10k (9.4 to 10.8 µs).
+- **Value edits** on orders cost 0.2–0.25 µs, at timer resolution, and are
+  unchanged.
+- **The first customer insert after a rebuild** builds the order-side hash
+  vector from the parent, about 29 ms at 1M. That is still about half of
+  what every customer insert used to cost.
+
+### Downstream and noise
+
+- **The join + filter + SUM pipeline (`join_chain`):** it improves the same
+  way, since the join was its largest remaining cost. At 1M on FastReads:
+  - customer insert 67.2 ms to 0.89 ms;
+  - customer value edit 32.9 ms to 0.66 ms;
+  - order append 10.2 ms to 92 µs;
+  - one-side-at-a-time two-sided updates 77.9 ms to 2.3 ms.
+- **The two-sided rebuild** (a non-goal) is unchanged within noise. At 1M,
+  the join alone measured 80.9 ms before and 92.2 ms after on FastReads,
+  while its own before run was 91.6 ms on FastUpdates, against 91.0 ms
+  after. It still dominates when both joined tables change before either is
+  ticked: about 1 s with views over the join.
+- **Other views:** outside the join views, the largest after/before ratio is
+  1.29×, on a filter middle insert at 10k (a tick of a few µs), in code this
+  change did not touch. Everything else is within a few percent.
+- **Environment:** the same machine, OS and toolchain as the aggregate fix's
+  runs.
+  - Before run: commit `de8d67cd3c8136cbe2c8b6c9de18ef02690ee761` (the
+    harness warm-up on the old join).
+  - After run: commit `d034c409fc9272d165fa0eaabd8948f978afe614`.
+  - Wall times: 141 s before, 100 s after.
+- **Raw output:**
+  [`view_maintenance_2026-10-26-join-before.jsonl`](../benchmarks/view_maintenance_2026-10-26-join-before.jsonl)
+  and
+  [`view_maintenance_2026-10-26-join-after.jsonl`](../benchmarks/view_maintenance_2026-10-26-join-after.jsonl).
+
+**What is left now.**
+- **The two-sided rebuild:** about 1 s at 1M with views over the join, when
+  both joined tables change before either is ticked.
+- **O(output) passes:** order middle inserts and deletes, and customer
+  deletes, still shift the join's own index (about 1–2 ms at 1M).
+- **Filter and sort index shifting:** 0.2–1 ms per event.
+- **What to pursue next, if anything, is the user's decision.**
+
+#### `join` tick median, before → after
+
+| Workload | Rows | FastReads before | after | FastUpdates before | after |
+|---|---:|---:|---:|---:|---:|
+| value_edit | 10k | 0.21 | 0.25 | 0.21 | 0.21 |
+| value_edit | 100k | 0.21 | 0.25 | 0.21 | 0.25 |
+| value_edit | 1M | 0.25 | 0.25 | 0.21 | 0.25 |
+| middle_insert | 10k | 113 | 11.6 | 113 | 10.8 |
+| middle_insert | 100k | 1,023 | 96.3 | 1,029 | 96.7 |
+| middle_insert | 1M | 12.5 ms | 1,135 | 12.3 ms | 1,098 |
+| middle_delete | 10k | 9.42 | 10.8 | 9.33 | 9.62 |
+| middle_delete | 100k | 80.3 | 87.3 | 80.2 | 87.1 |
+| middle_delete | 1M | 1,016 | 1,047 | 947 | 1,004 |
+| tail_append | 10k | 105 | 2.38 | 106 | 2.17 |
+| tail_append | 100k | 942 | 10.2 | 946 | 10.2 |
+| tail_append | 1M | 10.1 ms | 90.1 | 10.1 ms | 89.9 |
+| tail_delete | 10k | 5.54 | 5.75 | 5.54 | 5.38 |
+| tail_delete | 100k | 45.9 | 45.2 | 45.9 | 45.2 |
+| tail_delete | 1M | 610 | 526 | 602 | 494 |
+| right_value_edit | 10k | 226 | 7.75 | 225 | 7.21 |
+| right_value_edit | 100k | 2,743 | 58.2 | 2,776 | 58.2 |
+| right_value_edit | 1M | 33.1 ms | 611 | 32.6 ms | 590 |
+| right_insert | 10k | 542 | 9.96 | 554 | 9.33 |
+| right_insert | 100k | 5,591 | 88.6 | 5,646 | 88.7 |
+| right_insert | 1M | 67.3 ms | 893 | 65.9 ms | 890 |
+| right_delete | 10k | 15.2 | 16.0 | 15.2 | 15.1 |
+| right_delete | 100k | 149 | 147 | 150 | 148 |
+| right_delete | 1M | 1,863 | 1,756 | 1,851 | 1,582 |
+| two_sided_both_then_tick | 10k | 698 | 730 | 746 | 743 |
+| two_sided_both_then_tick | 100k | 6,915 | 7,815 | 7,965 | 7,867 |
+| two_sided_both_then_tick | 1M | 80.9 ms | 92.2 ms | 91.6 ms | 91.0 ms |
+| two_sided_tick_each_side | 10k | 658 | 20.5 | 667 | 20.1 |
+| two_sided_tick_each_side | 100k | 6,596 | 185 | 6,677 | 185 |
+| two_sided_tick_each_side | 1M | 79.2 ms | 2,030 | 79.1 ms | 1,925 |
+
+#### `join_chain` tick median, before → after
+
+| Workload | Rows | FastReads before | after | FastUpdates before | after |
+|---|---:|---:|---:|---:|---:|
+| value_edit | 10k | 1.67 | 1.62 | 1.71 | 1.62 |
+| value_edit | 100k | 1.75 | 1.67 | 1.71 | 1.67 |
+| value_edit | 1M | 1.71 | 1.67 | 1.75 | 1.67 |
+| middle_insert | 10k | 118 | 15.2 | 119 | 15.0 |
+| middle_insert | 100k | 1,050 | 122 | 1,067 | 122 |
+| middle_insert | 1M | 12.6 ms | 1,426 | 12.4 ms | 1,370 |
+| middle_delete | 10k | 15.0 | 15.7 | 15.0 | 15.4 |
+| middle_delete | 100k | 121 | 127 | 121 | 127 |
+| middle_delete | 1M | 1,423 | 1,465 | 1,375 | 1,418 |
+| tail_append | 10k | 107 | 3.96 | 108 | 3.92 |
+| tail_append | 100k | 967 | 12.0 | 959 | 12.0 |
+| tail_append | 1M | 10.2 ms | 91.9 | 10.0 ms | 92.1 |
+| tail_delete | 10k | 10.4 | 10.2 | 10.4 | 10.1 |
+| tail_delete | 100k | 78.0 | 76.6 | 77.9 | 76.6 |
+| tail_delete | 1M | 921 | 803 | 910 | 808 |
+| right_value_edit | 10k | 252 | 33.4 | 254 | 33.3 |
+| right_value_edit | 100k | 2,699 | 86.9 | 2,638 | 87.2 |
+| right_value_edit | 1M | 32.9 ms | 659 | 32.4 ms | 643 |
+| right_insert | 10k | 542 | 9.42 | 557 | 9.42 |
+| right_insert | 100k | 5,578 | 88.7 | 5,638 | 88.7 |
+| right_insert | 1M | 67.2 ms | 889 | 65.6 ms | 889 |
+| right_delete | 10k | 15.2 | 15.2 | 15.2 | 15.2 |
+| right_delete | 100k | 150 | 148 | 150 | 148 |
+| right_delete | 1M | 1,878 | 1,639 | 1,861 | 1,610 |
+| two_sided_both_then_tick | 10k | 9,633 | 9,077 | 9,794 | 9,131 |
+| two_sided_both_then_tick | 100k | 96.8 ms | 91.5 ms | 99.3 ms | 92.4 ms |
+| two_sided_both_then_tick | 1M | 1,035.9 ms | 972.5 ms | 1,046.2 ms | 978.6 ms |
+| two_sided_tick_each_side | 10k | 660 | 24.7 | 673 | 24.4 |
+| two_sided_tick_each_side | 100k | 6,622 | 211 | 6,722 | 211 |
+| two_sided_tick_each_side | 1M | 77.9 ms | 2,278 | 78.4 ms | 2,203 |
 
 
 ## Method
