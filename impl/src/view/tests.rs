@@ -4528,3 +4528,110 @@ fn test_tickable_propagates_through_view_chain() {
     assert_eq!(s.len(), 4);
     assert_eq!(s.get_value(0, "amount").unwrap().as_f64().unwrap(), 900.0);
 }
+
+/// Randomized differential check of incremental joins against fresh ones.
+/// `cfg(test)` keeps only two bits of each join-key hash, so these six keys
+/// constantly share hashes and every match must be verified.
+#[test]
+fn test_join_incremental_matches_rebuild_under_collisions() {
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n
+        }
+    }
+    fn table(name: &str) -> Rc<RefCell<Table>> {
+        let schema = Schema::new(vec![
+            ("id".to_string(), ColumnType::Int64, false),
+            ("k".to_string(), ColumnType::Int32, true),
+        ]);
+        Rc::new(RefCell::new(Table::new(name.to_string(), schema)))
+    }
+    fn key(rng: &mut Lcg) -> ColumnValue {
+        if rng.below(100) < 15 {
+            ColumnValue::Null
+        } else {
+            ColumnValue::Int32(rng.below(6) as i32)
+        }
+    }
+    fn canon(view: &dyn crate::readable::ReadableTable) -> Vec<String> {
+        let mut rows: Vec<String> = (0..view.len())
+            .map(|i| {
+                let mut cells: Vec<String> = view
+                    .get_row(i)
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v:?}"))
+                    .collect();
+                cells.sort();
+                cells.join("|")
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+    for how in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full] {
+        for trial in 0..30u64 {
+            let mut rng = Lcg(0x5EED_1234_ABCD_0001 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let (left, right) = (table("l"), table("r"));
+            let mut joined = JoinView::new(
+                "j".to_string(),
+                left.clone(),
+                right.clone(),
+                "k".to_string(),
+                "k".to_string(),
+                how,
+            )
+            .unwrap();
+            let mut next_id = 0i64;
+            for step in 0..60 {
+                // Odd trials batch several ops (both sides may change, which
+                // rebuilds and drops per-side state); even trials sync each op.
+                let ops = if trial % 2 == 1 { 1 + rng.below(3) } else { 1 };
+                for _ in 0..ops {
+                    let side = if rng.below(2) == 0 { &left } else { &right };
+                    let len = side.borrow().len();
+                    let op = if len == 0 { 0 } else if len >= 16 { 1 } else { rng.below(4) };
+                    let mut t = side.borrow_mut();
+                    match op {
+                        0 => {
+                            next_id += 1;
+                            let k = key(&mut rng);
+                            let row = HashMap::from([
+                                ("id".to_string(), ColumnValue::Int64(next_id)),
+                                ("k".to_string(), k),
+                            ]);
+                            t.insert_row(rng.below(len + 1), row).unwrap();
+                        }
+                        1 => {
+                            t.delete_row(rng.below(len)).unwrap();
+                        }
+                        2 => {
+                            let k = key(&mut rng);
+                            t.set_value(rng.below(len), "k", k).unwrap();
+                        }
+                        _ => {
+                            next_id += 1;
+                            t.set_value(rng.below(len), "id", ColumnValue::Int64(next_id)).unwrap();
+                        }
+                    }
+                }
+                joined.sync();
+                let fresh = JoinView::new(
+                    "f".to_string(),
+                    left.clone(),
+                    right.clone(),
+                    "k".to_string(),
+                    "k".to_string(),
+                    how,
+                )
+                .unwrap();
+                assert_eq!(canon(&joined), canon(&fresh), "{how:?} trial {trial} step {step}");
+            }
+        }
+    }
+}

@@ -6,6 +6,7 @@ use crate::filter_changes::{row_after_update, MAX_FILTER_REPLAY_CHANGES};
 use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -27,6 +28,43 @@ pub enum JoinType {
 type Row = HashMap<String, ColumnValue>;
 /// (left row, right row); `None` is the unmatched side.
 type Entry = (Option<usize>, Option<usize>);
+
+/// Key hash of a row whose join key is NULL or NaN: it never matches.
+const NO_KEY: u64 = u64::MAX;
+
+/// Hash of a join key for the per-side key-hash vectors. Unit tests keep only
+/// two bits, so distinct keys share hashes and every match must be verified.
+fn key_hash(key: Option<&JoinKey>) -> u64 {
+    let Some(key) = key else {
+        return NO_KEY;
+    };
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    let hash = if cfg!(test) { hasher.finish() & 0b11 } else { hasher.finish() };
+    if hash == NO_KEY {
+        NO_KEY - 1
+    } else {
+        hash
+    }
+}
+
+/// Hasher for keys that are already hashes.
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("IdentityHasher only hashes u64 keys")
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+type HashedMap<V> = HashMap<u64, V, BuildHasherDefault<IdentityHasher>>;
 
 /// A batch whose output would exceed this invalidates its history instead:
 /// consumers rebuild above their own replay bounds anyway.
@@ -153,6 +191,15 @@ pub struct JoinView {
     /// The latest incremental batch in JOIN coordinates (join_index
     /// positions). Rebuilds and oversized batches invalidate it.
     output_changes: Changeset,
+    /// Each parent row's `key_hash`, by position, once first needed. Read only
+    /// to find matches while that side has no structural changes in the sync
+    /// (the frame-mixing guard rebuilds when both do), so its live rows are
+    /// the view's. Maintained by that side's structural events; rebuilds drop it.
+    left_key_hashes: Option<Vec<u64>>,
+    right_key_hashes: Option<Vec<u64>>,
+    /// Parent row counts as of the last applied event.
+    left_rows: usize,
+    right_rows: usize,
 }
 
 impl JoinView {
@@ -276,6 +323,10 @@ impl JoinView {
             last_left_parent_version: left_version,
             last_right_parent_version: right_version,
             output_changes: Changeset::new(),
+            left_key_hashes: None,
+            right_key_hashes: None,
+            left_rows: 0,
+            right_rows: 0,
         };
 
         view.rebuild_index();
@@ -391,52 +442,81 @@ impl JoinView {
             right.changeset().map_or(usize::MAX, |cs| cs.total_len());
         self.last_left_parent_version = left.version();
         self.last_right_parent_version = right.version();
+        self.left_rows = left.len();
+        self.right_rows = right.len();
         drop(left);
         drop(right);
+        self.left_key_hashes = None;
+        self.right_key_hashes = None;
         self.output_changes.invalidate();
         self.sync_count += 1;
     }
 
-    /// Build a lookup map from right table for efficient join operations
-    fn build_right_lookup(&self) -> HashMap<JoinKey, Vec<usize>> {
-        let right = self.right_table.borrow();
-        let mut right_index: HashMap<JoinKey, Vec<usize>> = HashMap::new();
-
-        // Pre-compute column indices
-        let right_col_indices: Vec<usize> = self
-            .right_keys
-            .iter()
-            .filter_map(|k| right.column_index(k))
-            .collect();
-
-        for i in 0..right.len() {
-            if let Some(key) = Self::build_key_from_indices(&*right, i, &right_col_indices) {
-                right_index.entry(key).or_default().push(i);
+    /// Rows of one parent whose key equals each target key, ascending. One
+    /// scan of the parent's key-hash vector (built from the live parent on
+    /// first use) finds candidates; each is verified against its live key, as
+    /// hashes can collide. Only for a parent with no structural changes in
+    /// this sync, whose live rows are the view's.
+    fn matching_rows(
+        hashes: &mut Option<Vec<u64>>,
+        table: &RefCell<dyn ReadableTable>,
+        keys: &[String],
+        targets: Vec<JoinKey>,
+    ) -> HashMap<JoinKey, Vec<usize>> {
+        let mut found: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+        if targets.is_empty() {
+            return found;
+        }
+        let table = table.borrow();
+        let cols: Vec<usize> = keys.iter().filter_map(|k| table.column_index(k)).collect();
+        let hashes = hashes.get_or_insert_with(|| {
+            (0..table.len())
+                .map(|row| key_hash(Self::build_key_from_indices(&*table, row, &cols).as_ref()))
+                .collect()
+        });
+        let mut by_hash: HashedMap<Vec<JoinKey>> = HashedMap::default();
+        for key in targets {
+            let keys = by_hash.entry(key_hash(Some(&key))).or_default();
+            if !keys.contains(&key) {
+                keys.push(key);
             }
         }
-
-        right_index
+        // A handful of target hashes compare faster than a map lookup per row.
+        let few: Vec<u64> = if by_hash.len() <= 4 {
+            by_hash.keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        for (row, hash) in hashes.iter().enumerate() {
+            let hit = if few.is_empty() {
+                by_hash.contains_key(hash)
+            } else {
+                few.contains(hash)
+            };
+            if !hit {
+                continue;
+            }
+            if let Some(key) = Self::build_key_from_indices(&*table, row, &cols) {
+                if by_hash[hash].contains(&key) {
+                    found.entry(key).or_default().push(row);
+                }
+            }
+        }
+        found
     }
 
-    /// Mirror of `build_right_lookup` for the left table. Used to make
-    /// right-table inserts O(matches) instead of O(left.len()) per insert.
-    fn build_left_lookup(&self) -> HashMap<JoinKey, Vec<usize>> {
-        let left = self.left_table.borrow();
-        let mut left_index: HashMap<JoinKey, Vec<usize>> = HashMap::new();
-
-        let left_col_indices: Vec<usize> = self
-            .left_keys
-            .iter()
-            .filter_map(|k| left.column_index(k))
-            .collect();
-
-        for i in 0..left.len() {
-            if let Some(key) = Self::build_key_from_indices(&*left, i, &left_col_indices) {
-                left_index.entry(key).or_default().push(i);
+    /// Whether every event's index is in range for the rows before it:
+    /// inserts at or before the end, deletes and updates before it.
+    fn indices_in_range(mut rows: usize, changes: &[TableChange]) -> bool {
+        for change in changes {
+            match change {
+                TableChange::RowInserted { index, .. } if *index <= rows => rows += 1,
+                TableChange::RowDeleted { index, .. } if *index < rows => rows -= 1,
+                TableChange::CellUpdated { row, .. } if *row < rows => {}
+                _ => return false,
             }
         }
-
-        left_index
+        true
     }
 
     /// Binary search for the insertion position of a new (Some(left_idx), _) entry.
@@ -791,7 +871,30 @@ impl JoinView {
         changes: &[TableChange],
         out: &mut JoinOutput,
     ) -> Result<(), String> {
-        let mut right_lookup: Option<HashMap<JoinKey, Vec<usize>>> = None;
+        // Pre-pass: each key update's row after it, and every key this batch
+        // must match on the right, for one scan of the right's key hashes.
+        let mut after_rows: HashMap<usize, Row> = HashMap::new();
+        let mut targets: Vec<JoinKey> = Vec::new();
+        for (t, change) in changes.iter().enumerate() {
+            match change {
+                TableChange::RowInserted { data, .. } => {
+                    targets.extend(Self::build_composite_key(data, &self.left_keys));
+                }
+                TableChange::CellUpdated { column, .. } if self.left_keys.contains(column) => {
+                    let after =
+                        row_after_update(changes, t, |i| self.left_table.borrow().get_row(i))?;
+                    targets.extend(Self::build_composite_key(&after, &self.left_keys));
+                    after_rows.insert(t, after);
+                }
+                _ => {}
+            }
+        }
+        let right_matches = Self::matching_rows(
+            &mut self.right_key_hashes,
+            &self.right_table,
+            &self.right_keys,
+            targets,
+        );
         for (t, change) in changes.iter().enumerate() {
             match change {
                 TableChange::RowDeleted { index, data } => {
@@ -803,6 +906,10 @@ impl JoinView {
                             }
                         }
                     }
+                    if let Some(hashes) = &mut self.left_key_hashes {
+                        hashes.remove(*index);
+                    }
+                    self.left_rows -= 1;
                     self.orphan_unmatched(rights, out)?;
                 }
                 TableChange::RowInserted { index, data } => {
@@ -820,8 +927,12 @@ impl JoinView {
                         }
                     }
                     let key = Self::build_composite_key(data, &self.left_keys);
-                    let lookup = right_lookup.get_or_insert_with(|| self.build_right_lookup());
-                    self.insert_left_matches(*index, key.and_then(|k| lookup.get(&k)), data, out)?;
+                    if let Some(hashes) = &mut self.left_key_hashes {
+                        hashes.insert(*index, key_hash(key.as_ref()));
+                    }
+                    self.left_rows += 1;
+                    let matching = key.as_ref().and_then(|k| right_matches.get(k));
+                    self.insert_left_matches(*index, matching, data, out)?;
                 }
                 TableChange::CellUpdated {
                     row,
@@ -829,8 +940,7 @@ impl JoinView {
                     old_value,
                     new_value,
                 } if self.left_keys.contains(column) => {
-                    let after =
-                        row_after_update(changes, t, |i| self.left_table.borrow().get_row(i))?;
+                    let after = after_rows.remove(&t).expect("pre-pass row for key update");
                     let mut before = after.clone();
                     before.insert(column.clone(), old_value.clone());
                     let new_key = Self::build_composite_key(&after, &self.left_keys);
@@ -839,15 +949,13 @@ impl JoinView {
                         Self::update_cells(at, column.clone(), old_value, new_value, out)?;
                         continue;
                     }
+                    if let Some(hashes) = &mut self.left_key_hashes {
+                        hashes[*row] = key_hash(new_key.as_ref());
+                    }
                     let rights = self.remove_left_entries(*row, &before, out)?;
                     self.orphan_unmatched(rights, out)?;
-                    let lookup = right_lookup.get_or_insert_with(|| self.build_right_lookup());
-                    self.insert_left_matches(
-                        *row,
-                        new_key.and_then(|k| lookup.get(&k)),
-                        &after,
-                        out,
-                    )?;
+                    let matching = new_key.as_ref().and_then(|k| right_matches.get(k));
+                    self.insert_left_matches(*row, matching, &after, out)?;
                 }
                 TableChange::CellUpdated {
                     row,
@@ -872,7 +980,30 @@ impl JoinView {
         structural: bool,
         out: &mut JoinOutput,
     ) -> Result<(), String> {
-        let mut left_lookup: Option<HashMap<JoinKey, Vec<usize>>> = None;
+        // Pre-pass: each key update's row after it, and every key this batch
+        // must match on the left, for one scan of the left's key hashes.
+        let mut after_rows: HashMap<usize, Row> = HashMap::new();
+        let mut targets: Vec<JoinKey> = Vec::new();
+        for (t, change) in changes.iter().enumerate() {
+            match change {
+                TableChange::RowInserted { data, .. } => {
+                    targets.extend(Self::build_composite_key(data, &self.right_keys));
+                }
+                TableChange::CellUpdated { column, .. } if self.right_keys.contains(column) => {
+                    let after =
+                        row_after_update(changes, t, |i| self.right_table.borrow().get_row(i))?;
+                    targets.extend(Self::build_composite_key(&after, &self.right_keys));
+                    after_rows.insert(t, after);
+                }
+                _ => {}
+            }
+        }
+        let left_matches = Self::matching_rows(
+            &mut self.left_key_hashes,
+            &self.left_table,
+            &self.left_keys,
+            targets,
+        );
         // A value-only batch moves no rows: one pass locates every target.
         let positions = if structural {
             HashMap::new()
@@ -897,21 +1028,32 @@ impl JoinView {
                             }
                         }
                     }
+                    if let Some(hashes) = &mut self.right_key_hashes {
+                        hashes.remove(*index);
+                    }
+                    self.right_rows -= 1;
                     self.placehold_unmatched(lefts, out)?;
                 }
                 TableChange::RowInserted { index, data } => {
                     // Right rows are not monotonic in join_index (sorted by
-                    // left), so the shift is a single conditional pass.
-                    for (_, r) in self.join_index.iter_mut() {
-                        if let Some(r) = r {
-                            if *r >= *index {
-                                *r += 1;
+                    // left), so the shift is a single conditional pass. A
+                    // tail insert has no row at or after it to shift.
+                    if *index < self.right_rows {
+                        for (_, r) in self.join_index.iter_mut() {
+                            if let Some(r) = r {
+                                if *r >= *index {
+                                    *r += 1;
+                                }
                             }
                         }
                     }
                     let key = Self::build_composite_key(data, &self.right_keys);
-                    let lookup = left_lookup.get_or_insert_with(|| self.build_left_lookup());
-                    self.insert_right_matches(*index, key.and_then(|k| lookup.get(&k)), data, out)?;
+                    if let Some(hashes) = &mut self.right_key_hashes {
+                        hashes.insert(*index, key_hash(key.as_ref()));
+                    }
+                    self.right_rows += 1;
+                    let matching = key.as_ref().and_then(|k| left_matches.get(k));
+                    self.insert_right_matches(*index, matching, data, out)?;
                 }
                 TableChange::CellUpdated {
                     row,
@@ -919,8 +1061,7 @@ impl JoinView {
                     old_value,
                     new_value,
                 } if self.right_keys.contains(column) => {
-                    let after =
-                        row_after_update(changes, t, |i| self.right_table.borrow().get_row(i))?;
+                    let after = after_rows.remove(&t).expect("pre-pass row for key update");
                     let mut before = after.clone();
                     before.insert(column.clone(), old_value.clone());
                     let new_key = Self::build_composite_key(&after, &self.right_keys);
@@ -935,15 +1076,13 @@ impl JoinView {
                         )?;
                         continue;
                     }
+                    if let Some(hashes) = &mut self.right_key_hashes {
+                        hashes[*row] = key_hash(new_key.as_ref());
+                    }
                     let lefts = self.remove_right_entries(*row, &before, out)?;
                     self.placehold_unmatched(lefts, out)?;
-                    let lookup = left_lookup.get_or_insert_with(|| self.build_left_lookup());
-                    self.insert_right_matches(
-                        *row,
-                        new_key.and_then(|k| lookup.get(&k)),
-                        &after,
-                        out,
-                    )?;
+                    let matching = new_key.as_ref().and_then(|k| left_matches.get(k));
+                    self.insert_right_matches(*row, matching, &after, out)?;
                 }
                 TableChange::CellUpdated {
                     row,
@@ -1160,6 +1299,13 @@ impl JoinView {
         if (left_structural && right_structural)
             || Self::key_update_precedes_row_shift(&left_changes, &self.left_keys)
             || Self::key_update_precedes_row_shift(&right_changes, &self.right_keys)
+        {
+            self.rebuild_index();
+            return true;
+        }
+
+        if !Self::indices_in_range(self.left_rows, &left_changes)
+            || !Self::indices_in_range(self.right_rows, &right_changes)
         {
             self.rebuild_index();
             return true;

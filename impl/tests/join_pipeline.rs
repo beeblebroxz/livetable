@@ -55,6 +55,10 @@ fn customer(cid: i32, customer_name: &str) -> Row {
 
 /// Customers (cid, name).
 fn customers(rows: &[(i32, &str)]) -> Rc<RefCell<Table>> {
+    Rc::new(RefCell::new(customers_table(rows)))
+}
+
+fn customers_table(rows: &[(i32, &str)]) -> Table {
     let mut table = Table::new(
         "customers".into(),
         Schema::new(vec![
@@ -66,7 +70,7 @@ fn customers(rows: &[(i32, &str)]) -> Rc<RefCell<Table>> {
         table.append_row(customer(cid, customer_name)).unwrap();
     }
     table.clear_changeset();
-    Rc::new(RefCell::new(table))
+    table
 }
 
 fn join(
@@ -758,4 +762,130 @@ fn value_edits_land_while_the_left_side_shifts() {
     c.borrow_mut().append_row(customer(20, "c")).unwrap();
     replayed(&mut left, base);
     assert_eq!(left.len(), 2, "order 2 matches both customers with cid 20");
+}
+
+/// Rows as sorted canonical strings, for order-free comparison.
+fn rows_sorted(view: &dyn ReadableTable) -> Vec<String> {
+    let mut rows: Vec<String> = snapshot(view)
+        .into_iter()
+        .map(|row| {
+            let mut cells: Vec<String> = row.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
+            cells.sort();
+            cells.join("|")
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn one_sided_inserts_read_only_matched_rows() {
+    let order_rows: Vec<Order> = (0..50).map(|i| (i, Some(i % 25), i)).collect();
+    let o = Rc::new(RefCell::new(Counted {
+        inner: orders_table(&order_rows),
+        reads: Cell::new(0),
+    }));
+    let names: Vec<String> = (0..25).map(|i| format!("c{i}")).collect();
+    let customer_rows: Vec<(i32, &str)> = (0..25).map(|i| (i, names[i as usize].as_str())).collect();
+    let c = Rc::new(RefCell::new(Counted {
+        inner: customers_table(&customer_rows),
+        reads: Cell::new(0),
+    }));
+    let mut joined = join(o.clone(), c.clone(), JoinType::Inner);
+    // The first insert on each side may build per-side state.
+    o.borrow_mut().inner.append_row(order(100, Some(0), 1)).unwrap();
+    joined.sync();
+    c.borrow_mut().inner.append_row(customer(25, "c25")).unwrap();
+    joined.sync();
+
+    let base = baseline(&joined);
+    o.borrow_mut().inner.append_row(order(101, Some(3), 1)).unwrap();
+    c.borrow().reads.set(0);
+    joined.sync();
+    let reads = c.borrow().reads.get();
+    assert!(reads <= 4, "an order insert read {reads} customer rows");
+    replayed(&mut joined, base);
+
+    let base = baseline(&joined);
+    c.borrow_mut().inner.append_row(customer(7, "dup7")).unwrap(); // matches orders 7 and 32
+    o.borrow().reads.set(0);
+    joined.sync();
+    let reads = o.borrow().reads.get();
+    assert!(reads <= 6, "a customer insert read {reads} order rows");
+    replayed(&mut joined, base);
+}
+
+#[test]
+fn a_customers_only_order_can_be_deleted_and_readded() {
+    for how in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full] {
+        let o = orders(&[(1, Some(10), 5), (2, Some(20), 7)]);
+        let c = customers(&[(10, "a"), (20, "b")]);
+        let mut joined = join(o.clone(), c.clone(), how);
+        let base = baseline(&joined);
+        o.borrow_mut().delete_row(1).unwrap(); // customer 20's only order
+        replayed(&mut joined, base);
+        assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?} delete");
+        let base = baseline(&joined);
+        o.borrow_mut().append_row(order(2, Some(20), 7)).unwrap();
+        replayed(&mut joined, base);
+        assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?} re-add");
+    }
+}
+
+/// A parent over a real table's rows whose changeset the test writes by hand.
+struct Scripted {
+    inner: Table,
+    changes: Changeset,
+    version: u64,
+}
+
+impl ReadableTable for Scripted {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+    fn column_names(&self) -> Vec<String> {
+        self.inner.column_names()
+    }
+    fn get_row(&self, index: usize) -> Result<Row, String> {
+        self.inner.get_row(index)
+    }
+    fn get_value(&self, row: usize, column: &str) -> Result<ColumnValue, String> {
+        self.inner.get_value(row, column)
+    }
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn changeset(&self) -> Option<&Changeset> {
+        Some(&self.changes)
+    }
+}
+
+#[test]
+fn out_of_range_events_rebuild_instead_of_panicking() {
+    let cases = [
+        ("delete at len", deleted(2, order(1, Some(10), 5))),
+        ("insert past len", inserted(3, order(9, Some(10), 1))),
+        ("update at len", update(2, "amount", Int32(5), Int32(6))),
+    ];
+    for (label, change) in cases {
+        let left = Rc::new(RefCell::new(Scripted {
+            inner: orders_table(&[(1, Some(10), 5), (2, Some(20), 7)]),
+            changes: Changeset::new(),
+            version: 0,
+        }));
+        let c = customers(&[(10, "a"), (20, "b")]);
+        let mut joined = join(left.clone(), c.clone(), JoinType::Left);
+        let cursor = joined.changeset().expect("history").total_len();
+        {
+            let mut left = left.borrow_mut();
+            left.changes.push(change);
+            left.version += 1;
+        }
+        joined.sync();
+        assert!(
+            joined.changeset().expect("synced").changes_from(cursor).is_none(),
+            "{label}: an out-of-range event must rebuild"
+        );
+        assert_eq!(rows_sorted(&joined), rows_sorted(&join(left.clone(), c, JoinType::Left)), "{label}");
+    }
 }

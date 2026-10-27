@@ -191,6 +191,15 @@ before a structural change on the same side also require a rebuild to avoid
 mixing row-coordinate frames. Always synchronize parents first; `refresh()`
 unconditionally rebuilds from their current state.
 
+Since 2026-10-26, a one-sided sync finds matches without rebuilding a lookup
+over the other parent. Each side keeps a vector of its rows' join-key hashes,
+built the first time it is needed and updated by that side's inserts, deletes
+and key updates. A sync scans the other side's vector once for the keys it
+needs and verifies each candidate's key, so hash collisions never produce a
+match. A batch of value-only edits on the right side locates its output rows
+in one pass over the join's index. See the
+[view maintenance benchmark](VIEW_MAINTENANCE_BENCHMARK.md) for costs.
+
 Joins publish output history in their own coordinates, so filters, sorts,
 aggregates, and joins built on a join replay it instead of rebuilding. Each
 batch records one event per output-index change: inserted and deleted joined
