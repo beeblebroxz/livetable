@@ -456,18 +456,25 @@ impl JoinView {
     /// scan of the parent's key-hash vector (built from the live parent on
     /// first use) finds candidates; each is verified against its live key, as
     /// hashes can collide. Only for a parent with no structural changes in
-    /// this sync, whose live rows are the view's.
+    /// this sync, whose live rows are the view's: the early return keeps the
+    /// value-only pass that runs first from ever building a vector. A parent
+    /// whose live length disagrees with `rows` (its changeset) is an error,
+    /// which rebuilds, so the vector can never fall out of step.
     fn matching_rows(
         hashes: &mut Option<Vec<u64>>,
         table: &RefCell<dyn ReadableTable>,
         keys: &[String],
+        rows: usize,
         targets: Vec<JoinKey>,
-    ) -> HashMap<JoinKey, Vec<usize>> {
+    ) -> Result<HashMap<JoinKey, Vec<usize>>, String> {
         let mut found: HashMap<JoinKey, Vec<usize>> = HashMap::new();
         if targets.is_empty() {
-            return found;
+            return Ok(found);
         }
         let table = table.borrow();
+        if table.len() != rows {
+            return Err("parent rows disagree with its changeset".to_string());
+        }
         let cols: Vec<usize> = keys.iter().filter_map(|k| table.column_index(k)).collect();
         let hashes = hashes.get_or_insert_with(|| {
             (0..table.len())
@@ -502,7 +509,7 @@ impl JoinView {
                 }
             }
         }
-        found
+        Ok(found)
     }
 
     /// Whether every event's index is in range for the rows before it:
@@ -893,8 +900,9 @@ impl JoinView {
             &mut self.right_key_hashes,
             &self.right_table,
             &self.right_keys,
+            self.right_rows,
             targets,
-        );
+        )?;
         for (t, change) in changes.iter().enumerate() {
             match change {
                 TableChange::RowDeleted { index, data } => {
@@ -1002,8 +1010,9 @@ impl JoinView {
             &mut self.left_key_hashes,
             &self.left_table,
             &self.left_keys,
+            self.left_rows,
             targets,
-        );
+        )?;
         // A value-only batch moves no rows: one pass locates every target.
         let positions = if structural {
             HashMap::new()

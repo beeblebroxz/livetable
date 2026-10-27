@@ -889,3 +889,32 @@ fn out_of_range_events_rebuild_instead_of_panicking() {
         assert_eq!(rows_sorted(&joined), rows_sorted(&join(left.clone(), c, JoinType::Left)), "{label}");
     }
 }
+
+/// A parent whose changeset disagrees with its live rows must make the join
+/// rebuild, not panic: here the changeset claims an insert the rows never got,
+/// and a later lazy build reads the shorter live table.
+#[test]
+fn a_parent_that_disagrees_with_its_changeset_rebuilds_instead_of_panicking() {
+    let left = Rc::new(RefCell::new(Scripted {
+        inner: orders_table(&[(1, Some(10), 5), (2, Some(20), 7)]),
+        changes: Changeset::new(),
+        version: 0,
+    }));
+    let c = customers(&[(10, "a"), (20, "b")]);
+    let mut joined = join(left.clone(), c.clone(), JoinType::Left);
+    {
+        let mut left = left.borrow_mut();
+        left.changes.push(inserted(2, order(3, Some(10), 1)));
+        left.version += 1;
+    }
+    joined.sync();
+    c.borrow_mut().append_row(customer(30, "x")).unwrap();
+    joined.sync(); // builds the left key hashes from the live rows
+    {
+        let mut left = left.borrow_mut();
+        left.changes.push(deleted(2, order(3, Some(10), 1)));
+        left.version += 1;
+    }
+    joined.sync();
+    assert_eq!(rows_sorted(&joined), rows_sorted(&join(left.clone(), c, JoinType::Left)));
+}

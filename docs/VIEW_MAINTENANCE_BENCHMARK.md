@@ -353,9 +353,11 @@ All at 1M rows. Where two values are given, they are FastReads / FastUpdates.
   while its own before run was 91.6 ms on FastUpdates, against 91.0 ms
   after. It still dominates when both joined tables change before either is
   ticked: about 1 s with views over the join.
-- **Other views:** outside the join views, the largest after/before ratio is
-  1.29×, on a filter middle insert at 10k (a tick of a few µs), in code this
-  change did not touch. Everything else is within a few percent.
+- **Other views:** outside the join views, 11 of the 66 cells with ticks of
+  1 µs or more are 1.14–1.29× slower. All 11 are at 10k rows on FastReads
+  (filter, sort and aggregate, code this change did not touch), which points
+  to a run-start effect rather than the change. The rest are within a few
+  percent.
 - **Environment:** the same machine, OS and toolchain as the aggregate fix's
   runs.
   - Before run: commit `de8d67cd3c8136cbe2c8b6c9de18ef02690ee761` (the
