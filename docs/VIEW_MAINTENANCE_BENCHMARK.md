@@ -81,6 +81,9 @@ FastUpdates tick costs match FastReads to within about 10% everywhere.
 
 ## Recommendation
 
+Item 1 was implemented on 2026-10-26; see
+[After the aggregate fix](#after-the-aggregate-fix-2026-10-26).
+
 **Workload assumption.** The ranking below assumes a mixed workload: rows
 inserted and deleted anywhere in the table, on pipelines like the ones
 measured here. That assumption is a judgment, not something this benchmark
@@ -143,6 +146,148 @@ section).
 
 Which to take on, if any, is the user's decision. For the mixed workload,
 item 1 has the best ratio of benefit to risk on these numbers.
+
+## After the aggregate fix (2026-10-26)
+
+Design:
+[2026-10-26 spec](superpowers/specs/2026-10-26-aggregate-reindexing-design.md).
+
+**What changed.** `AggregateView` now maps rows to groups with a vector
+indexed by position, shifted with one memmove per insert or delete, instead
+of rehashing two position-keyed hashes. MIN/MAX keep an ordered value
+multiset per group, so removing an extreme no longer rescans the source.
+
+### Budgets
+
+All at 1M rows. Where two values are given, they are FastReads / FastUpdates.
+
+| Measure | Budget | Before | After |
+|---|---|---:|---:|
+| Aggregate middle insert tick | under 2 ms | 91.0 / 93.4 ms | 79.0 / 73.6 µs |
+| Aggregate middle delete tick | under 2 ms | 89.6 / 90.4 ms | 77.5 / 72.9 µs |
+| Aggregate tail delete tick | under 2 ms | 86.9 / 85.9 ms | 1.04 / 1.04 µs |
+| Aggregate tail append tick | under 50 µs | 2,629 / 2,603 µs | 1.17 / 1.12 µs |
+| MIN/MAX value edit that misses the extreme | under 5 µs | 0.79 µs | 0.92 µs |
+| MIN/MAX value edit that removes the minimum | recorded | 1,250 µs | 0.88 µs |
+| Construction, SUM by `region` (String) | at most 1.10× | 330.6 ms | 198.9 ms (0.60×) |
+| Construction, SUM by `bucket` (Int32 fast path) | at most 1.10× | 121.5 ms | 62.0 ms (0.51×) |
+| Construction, MIN+MAX by `region` | at most 2× | 332.0 ms | 290.1 ms (0.87×) |
+| Construction, MIN+MAX by `bucket` | at most 2× | 122.4 ms | 154.4 ms (1.26×) |
+
+- **Where the numbers come from:**
+  - The tick rows come from the harness.
+  - The value-edit and construction rows come from a throwaway timing
+    program, not committed. It used 1M rows, `amount` =
+    `(i * 7919) % 100_000`, 8 regions or buckets, the median of 5
+    constructions, and 5 warmups plus 31 samples per edit.
+- **Every budget is met.** No bulk-build of the MIN/MAX multiset was needed.
+- **A middle insert or delete** now grows about 3.6× then 9.3× per 10× rows
+  (2.3, 8.5 and 79 µs on FastReads): the memmove of the position vector.
+  Tail events stay flat at about 1 µs.
+
+### Downstream
+
+The join + filter + SUM pipeline (`join_chain`) improves wherever the
+aggregate's re-indexing had dominated. At 1M rows on FastReads:
+
+| Workload | Before | After |
+|---|---:|---:|
+| Middle delete | 52.5 ms | 1.4 ms |
+| Tail delete | 48.3 ms | 0.9 ms |
+| Middle insert | 67.0 ms | 11.6 ms |
+| Two-sided, one side at a time | 145 ms | 76 ms |
+| Two-sided, ticked together | 1,175 ms | 954 ms |
+
+- **Middle insert:** what remains is the join's own lookup and shifting.
+- **Ticked together:** the forced rebuild of the views over the join
+  remains.
+- **Every other view is unchanged:** its after/before tick ratio is at most
+  1.04× for ticks of 1 µs or more.
+
+**What is left.** Of the candidates in the Recommendation:
+- The join's key lookups are now the largest per-event cost: 9–68 ms per
+  one-sided insert, and 31 ms per customer value edit.
+- The two-sided rebuild costs about 0.9 s with views over the join.
+- Filter and sort index shifting costs 0.2–1 ms.
+- The order between them, and whether to pursue any, is the user's
+  decision.
+
+### Environment and noise
+
+- **Machine:** Apple M2, 24 GiB RAM, 8 cores.
+- **OS and toolchain:** macOS 27.2 (26B123), rustc 1.91.1 (ed61e7d7e
+  2025-11-07), release build.
+- **Before run:** commit `a6e860fe07dda39cff588f983f7086a499e14016`.
+- **After run:** commit `7c360546b7402ff50494b2bf62d69097045544a2`.
+- **Comparability:** the OS differs from the 2026-10-23 run, so compare only
+  these two runs with each other.
+- **Wall time:** the before run took 201 s and the after run 479 s. The extra
+  time was machine load: a timestamped rerun of the after code's 1M sizes
+  took 127 s, its usual share, and its tick medians matched.
+- **Noisy cells:** a few cells in the before run look noisy, for example
+  `join_chain` at 100k on FastReads (middle insert 15.8 ms against 4.2 ms on
+  FastUpdates). The aggregate's structural ticks changed by 17× (a tail append
+  at 10k) to 80,000× (a tail delete at 1M), far outside that noise.
+- **Raw output:**
+  [`view_maintenance_2026-10-26-before.jsonl`](../benchmarks/view_maintenance_2026-10-26-before.jsonl)
+  and
+  [`view_maintenance_2026-10-26-after.jsonl`](../benchmarks/view_maintenance_2026-10-26-after.jsonl).
+
+#### `aggregate` tick median, before → after
+
+| Workload | Rows | FastReads before | after | FastUpdates before | after |
+|---|---:|---:|---:|---:|---:|
+| value_edit | 10k | 1.04 | 0.79 | 0.75 | 0.67 |
+| value_edit | 100k | 0.75 | 0.67 | 1.00 | 0.67 |
+| value_edit | 1M | 0.75 | 0.71 | 0.75 | 0.71 |
+| middle_insert | 10k | 707 | 2.33 | 655 | 1.71 |
+| middle_insert | 100k | 6,972 | 8.50 | 6,940 | 8.08 |
+| middle_insert | 1M | 91.0 ms | 79.0 | 93.4 ms | 73.6 |
+| middle_delete | 10k | 680 | 2.21 | 649 | 1.58 |
+| middle_delete | 100k | 6,780 | 8.42 | 6,786 | 7.96 |
+| middle_delete | 1M | 89.6 ms | 77.5 | 90.4 ms | 72.9 |
+| tail_append | 10k | 22.5 | 1.29 | 22.4 | 1.12 |
+| tail_append | 100k | 168 | 1.12 | 257 | 1.12 |
+| tail_append | 1M | 2,629 | 1.17 | 2,603 | 1.12 |
+| tail_delete | 10k | 639 | 1.17 | 646 | 1.04 |
+| tail_delete | 100k | 6,704 | 1.04 | 8,901 | 1.04 |
+| tail_delete | 1M | 86.9 ms | 1.04 | 85.9 ms | 1.04 |
+
+#### `join_chain` tick median, before → after
+
+| Workload | Rows | FastReads before | after | FastUpdates before | after |
+|---|---:|---:|---:|---:|---:|
+| value_edit | 10k | 1.62 | 1.58 | 1.62 | 1.58 |
+| value_edit | 100k | 1.83 | 1.58 | 1.71 | 1.58 |
+| value_edit | 1M | 1.92 | 1.58 | 1.75 | 1.75 |
+| middle_insert | 10k | 424 | 112 | 418 | 115 |
+| middle_insert | 100k | 15.8 ms | 984 | 4,195 | 990 |
+| middle_insert | 1M | 67.0 ms | 11.6 ms | 64.7 ms | 11.7 ms |
+| middle_delete | 10k | 330 | 14.8 | 322 | 15.1 |
+| middle_delete | 100k | 11.9 ms | 121 | 3,205 | 120 |
+| middle_delete | 1M | 52.5 ms | 1,377 | 50.7 ms | 1,370 |
+| tail_append | 10k | 109 | 103 | 112 | 103 |
+| tail_append | 100k | 1,561 | 876 | 980 | 887 |
+| tail_append | 1M | 12.9 ms | 9,151 | 14.7 ms | 9,862 |
+| tail_delete | 10k | 308 | 10.3 | 311 | 10.2 |
+| tail_delete | 100k | 5,289 | 77.3 | 3,245 | 77.1 |
+| tail_delete | 1M | 48.3 ms | 903 | 49.9 ms | 946 |
+| right_value_edit | 10k | 242 | 245 | 247 | 246 |
+| right_value_edit | 100k | 3,724 | 2,484 | 2,790 | 2,489 |
+| right_value_edit | 1M | 35.9 ms | 31.3 ms | 35.8 ms | 33.5 ms |
+| right_insert | 10k | 535 | 533 | 539 | 546 |
+| right_insert | 100k | 16.3 ms | 5,448 | 5,556 | 5,651 |
+| right_insert | 1M | 75.7 ms | 62.6 ms | 64.6 ms | 67.7 ms |
+| right_delete | 10k | 15.2 | 15.2 | 15.2 | 15.2 |
+| right_delete | 100k | 342 | 149 | 152 | 160 |
+| right_delete | 1M | 1,966 | 1,816 | 1,876 | 1,842 |
+| two_sided_both_then_tick | 10k | 9,427 | 8,897 | 9,486 | 9,065 |
+| two_sided_both_then_tick | 100k | 104.0 ms | 90.0 ms | 97.8 ms | 91.7 ms |
+| two_sided_both_then_tick | 1M | 1,174.9 ms | 953.7 ms | 1,091.4 ms | 1,028.3 ms |
+| two_sided_tick_each_side | 10k | 967 | 642 | 961 | 660 |
+| two_sided_tick_each_side | 100k | 10.0 ms | 6,402 | 9,888 | 6,524 |
+| two_sided_tick_each_side | 1M | 145.0 ms | 76.0 ms | 130.4 ms | 81.2 ms |
+
 
 ## Method
 

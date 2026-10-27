@@ -1,6 +1,19 @@
 # Aggregate re-indexing without rehashing
 
-**Status:** Draft 2026-10-26
+**Status:** Implemented 2026-10-26
+Plan: `docs/superpowers/plans/2026-10-26-aggregate-reindexing.md`.
+Results: "After the aggregate fix" in `docs/VIEW_MAINTENANCE_BENCHMARK.md`.
+
+Implementation notes:
+
+- Every budget was met without the bulk-build fallback. At 1M rows:
+  - middle insert or delete 73–79 µs, tail events about 1 µs;
+  - a MIN/MAX edit 0.9 µs whether or not it removes the extreme;
+  - SUM construction 0.51–0.60× of before;
+  - MIN+MAX construction 0.87–1.26×.
+- The signed-zero and tied-extreme tests also pass on the old code (arm64
+  float min/max already order signed zeros), so they are characterization
+  tests. The read-counting test is the one that failed first.
 
 ## Why
 
