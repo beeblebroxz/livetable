@@ -211,10 +211,29 @@ fn build(view: &'static str, n: usize, hint: StorageHint) -> Pipeline {
             }
             p.customers = Some((customers, customers_tick));
             p.join = Some(join);
+            warm_join(&p, n);
         }
         _ => unreachable!("unknown view {view}"),
     }
     p
+}
+
+/// Untimed: one order and one customer added and removed, so any per-side
+/// join state built on first use exists before anything is measured.
+fn warm_join(p: &Pipeline, n: usize) {
+    let (customers, _) = p.customers.as_ref().unwrap();
+    let m = n / 10;
+    p.orders
+        .borrow_mut()
+        .append_row(order(n as i64, n as i64, ((n / 2) % m) as i32, 10.0))
+        .unwrap();
+    p.tick(Side::Orders);
+    p.orders.borrow_mut().delete_row(n).unwrap();
+    p.tick(Side::Orders);
+    customers.borrow_mut().append_row(customer(m as i32, "warm".into())).unwrap();
+    p.tick(Side::Customers);
+    customers.borrow_mut().delete_row(m).unwrap();
+    p.tick(Side::Customers);
 }
 
 struct Ctx {
