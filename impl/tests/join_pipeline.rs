@@ -738,3 +738,24 @@ fn signed_zero_left_insert_matches_existing_rows() {
         }
     }
 }
+
+/// One sync where the left changes structure and the right only edits values
+/// (as for a join over an aggregate of its own table): the value edit lands on
+/// the pre-batch position, and later matches still see the remaining order.
+#[test]
+fn value_edits_land_while_the_left_side_shifts() {
+    let o = orders(&[(1, Some(10), 5), (2, Some(20), 7)]);
+    let c = customers(&[(10, "a"), (20, "b")]);
+    let mut left = join(o.clone(), c.clone(), JoinType::Left);
+    let base = baseline(&left);
+    c.borrow_mut().set_value(1, "name", name("z")).unwrap();
+    o.borrow_mut().delete_row(0).unwrap();
+    replayed(&mut left, base);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left.get_row(0).unwrap()["right_name"], name("z"));
+
+    let base = baseline(&left);
+    c.borrow_mut().append_row(customer(20, "c")).unwrap();
+    replayed(&mut left, base);
+    assert_eq!(left.len(), 2, "order 2 matches both customers with cid 20");
+}

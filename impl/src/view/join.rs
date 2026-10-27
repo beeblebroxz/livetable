@@ -521,16 +521,24 @@ impl JoinView {
             .collect()
     }
 
-    /// Right row → ascending positions, for a right batch that only updates
-    /// values (no position moves while it applies).
-    fn right_position_map(&self) -> HashMap<usize, Vec<usize>> {
-        let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
+    /// Ascending positions of each target right row, found in one pass over
+    /// `join_index`. Valid for a right batch that moves no rows, in any
+    /// ordering: it reads only `join_index`, which is in the events' frame.
+    fn right_targets_positions(&self, rows: &[usize]) -> HashMap<usize, Vec<usize>> {
+        let mut positions: HashMap<usize, Vec<usize>> = HashMap::new();
+        let Some(&max) = rows.iter().max() else {
+            return positions;
+        };
+        let mut wanted = vec![false; max + 1];
+        for &r in rows {
+            wanted[r] = true;
+        }
         for (p, &(_, r)) in self.join_index.iter().enumerate() {
-            if let Some(r) = r {
-                map.entry(r).or_default().push(p);
+            if let Some(r) = r.filter(|&r| r <= max && wanted[r]) {
+                positions.entry(r).or_default().push(p);
             }
         }
-        map
+        positions
     }
 
     fn insert_entry(
@@ -660,10 +668,9 @@ impl JoinView {
             Some(rights) => {
                 if matches!(self.join_type, JoinType::Right | JoinType::Full) {
                     for &r in rights {
-                        let orphan = self
-                            .join_index
-                            .iter()
-                            .position(|&(el, er)| el.is_none() && er == Some(r));
+                        // The orphan tail is sorted by right row.
+                        let pos = self.find_orphan_insert_position(r);
+                        let orphan = (self.join_index.get(pos) == Some(&(None, Some(r)))).then_some(pos);
                         if let Some(pos) = orphan {
                             out.record(|| {
                                 Ok(TableChange::RowDeleted {
@@ -858,7 +865,7 @@ impl JoinView {
 
     /// Apply the right parent's batch in order, recording output events. The
     /// left side has no structural changes, so it is read live. A value-only
-    /// batch (`structural == false`) maps right rows to positions once.
+    /// batch (`structural == false`) locates its rows in one targeted pass.
     fn apply_right_changes(
         &mut self,
         changes: &[TableChange],
@@ -866,7 +873,19 @@ impl JoinView {
         out: &mut JoinOutput,
     ) -> Result<(), String> {
         let mut left_lookup: Option<HashMap<JoinKey, Vec<usize>>> = None;
-        let mut positions: Option<HashMap<usize, Vec<usize>>> = None;
+        // A value-only batch moves no rows: one pass locates every target.
+        let positions = if structural {
+            HashMap::new()
+        } else {
+            let rows: Vec<usize> = changes
+                .iter()
+                .filter_map(|change| match change {
+                    TableChange::CellUpdated { row, .. } => Some(*row),
+                    _ => None,
+                })
+                .collect();
+            self.right_targets_positions(&rows)
+        };
         for (t, change) in changes.iter().enumerate() {
             match change {
                 TableChange::RowDeleted { index, data } => {
@@ -935,8 +954,7 @@ impl JoinView {
                     let at = if structural {
                         self.right_positions(*row)
                     } else {
-                        let map = positions.get_or_insert_with(|| self.right_position_map());
-                        map.get(row).cloned().unwrap_or_default()
+                        positions.get(row).cloned().unwrap_or_default()
                     };
                     Self::update_cells(at, format!("right_{column}"), old_value, new_value, out)?;
                 }
