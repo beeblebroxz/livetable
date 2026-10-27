@@ -79,7 +79,7 @@ fn same_value(old: &ColumnValue, new: &ColumnValue) -> bool {
 /// Temporary identities for a batch with multiple insertions/deletions. Old
 /// rows keep their pre-batch index as identity; inserted rows get fresh IDs.
 /// Replay aggregates against these identities, then remap the index hashes
-/// once, before MIN/MAX rescans. No source rows or aggregate values are copied.
+/// once. No source rows or aggregate values are copied.
 struct BatchRowMapping {
     event_rows: Vec<usize>,
     final_positions: Vec<usize>,
@@ -192,6 +192,7 @@ impl AggregateView {
         self.row_to_group_built = false;
 
         let pct_cols = self.percentile_source_columns();
+        let extreme_cols = self.extreme_source_columns();
 
         // Pre-compute column indices for fast access
         let parent = self.parent.borrow();
@@ -258,7 +259,7 @@ impl AggregateView {
                 let position = int_group_order.len();
                 let state = int_groups
                     .entry(group_val)
-                    .or_insert_with(|| GroupState::new(position, pct_cols.clone()));
+                    .or_insert_with(|| GroupState::new(position, pct_cols.clone(), extreme_cols.clone()));
                 state.row_indices.insert(row_idx);
 
                 // Add aggregation value(s)
@@ -316,7 +317,7 @@ impl AggregateView {
                 let state = self
                     .groups
                     .entry(key.clone())
-                    .or_insert_with(|| GroupState::new(position, pct_cols.clone()));
+                    .or_insert_with(|| GroupState::new(position, pct_cols.clone(), extreme_cols.clone()));
                 state.row_indices.insert(row_idx);
 
                 for (source_col, num) in col_values {
@@ -365,6 +366,15 @@ impl AggregateView {
         result
     }
 
+    /// Source columns with a MIN or MAX aggregation, which keep a value multiset
+    fn extreme_source_columns(&self) -> HashSet<String> {
+        self.aggregations
+            .iter()
+            .filter(|(_, _, func)| matches!(func, AggregateFunction::Min | AggregateFunction::Max))
+            .map(|(_, source_col, _)| source_col.clone())
+            .collect()
+    }
+
     /// Get source columns that need sorted_values for percentile/median
     fn percentile_source_columns(&self) -> HashSet<String> {
         self.aggregations
@@ -405,11 +415,12 @@ impl AggregateView {
         // Get or create group state
         let is_new_group = !self.groups.contains_key(&key);
         let pct_cols = self.percentile_source_columns();
+        let extreme_cols = self.extreme_source_columns();
         let position = self.group_order.len();
         let state = self
             .groups
             .entry(key.clone())
-            .or_insert_with(|| GroupState::new(position, pct_cols));
+            .or_insert_with(|| GroupState::new(position, pct_cols, extreme_cols));
 
         // Add row index to group
         state.row_indices.insert(row_idx);
@@ -430,7 +441,6 @@ impl AggregateView {
         &mut self,
         row_idx: usize,
         row: &HashMap<String, ColumnValue>,
-        pending_recalc: &mut HashSet<(GroupKey, String)>,
         touched: &mut HashMap<GroupKey, Touch>,
         removed_slots: &mut Vec<usize>,
     ) -> bool {
@@ -455,24 +465,13 @@ impl AggregateView {
             state.row_indices.remove(&row_idx);
 
             // Remove values for each unique source column
-            let mut cols_needing_recalc = Vec::new();
             for (source_col, num) in col_values {
-                if !state.remove_column_value(&source_col, num) {
-                    cols_needing_recalc.push(source_col);
-                }
+                state.remove_column_value(&source_col, num);
             }
 
             // If group is now empty, remove it
             if state.row_indices.is_empty() {
                 self.remove_group(&key, touched, removed_slots);
-                return true;
-            }
-
-            // Defer MIN/MAX recalc until all batch index shifts are applied.
-            for source_col in cols_needing_recalc {
-                if self.needs_min_max(&source_col) {
-                    pending_recalc.insert((key.clone(), source_col));
-                }
             }
 
             true
@@ -535,7 +534,7 @@ impl AggregateView {
         }
     }
 
-    /// After a batch's structural changes and deferred MIN/MAX recalcs, emit
+    /// After a batch's structural changes, emit
     /// changed result cells of surviving groups, then insertions of new ones.
     /// Ascending positions put every update before the new groups at the tail.
     fn emit_batch_output(&mut self, touched: HashMap<GroupKey, Touch>) {
@@ -589,43 +588,6 @@ impl AggregateView {
             }
         }
         result
-    }
-
-    fn recalculate_group_column_min_max(&mut self, key: &GroupKey, source_col: &str) {
-        // Collect row indices and values first to avoid borrow conflicts
-        let row_indices: Vec<usize> = if let Some(state) = self.groups.get(key) {
-            state.row_indices.iter().copied().collect()
-        } else {
-            return;
-        };
-
-        let values: Vec<f64> = {
-            let parent = self.parent.borrow();
-            // Get column index once for direct access
-            if let Some(col_idx) = parent.column_index(source_col) {
-                row_indices
-                    .iter()
-                    .filter_map(|&row_idx| {
-                        parent
-                            .get_value_by_index(row_idx, col_idx)
-                            .ok()
-                            .and_then(|value| Self::extract_numeric(&value))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        };
-
-        if let Some(state) = self.groups.get_mut(key) {
-            state.recalculate_column_min_max(source_col, &values);
-        }
-    }
-
-    fn needs_min_max(&self, column: &str) -> bool {
-        self.aggregations.iter().any(|(_, source, function)| {
-            source == column && matches!(function, AggregateFunction::Min | AggregateFunction::Max)
-        })
     }
 
     /// Extract numeric value from ColumnValue, converting to f64
@@ -816,13 +778,6 @@ impl IncrementalView for AggregateView {
             }
         };
         let mut modified = false;
-        // MIN/MAX (and sorted_values) recalcs are DEFERRED to the end of the
-        // batch. `recalculate_group_column_min_max` reads the parent at the
-        // group's row indices, but those indices only line up with the parent
-        // AFTER every insert/delete in this batch has shifted them. Recalcing
-        // mid-batch reads misaligned rows and yields a stale MIN/MAX. (Caught
-        // by the forward_prop_fuzz differential test.)
-        let mut pending_recalc: HashSet<(GroupKey, String)> = HashSet::new();
         // Past every rebuild fallback: this batch replaces retained history.
         self.output_changes.clear();
         let mut touched: HashMap<GroupKey, Touch> = HashMap::new();
@@ -845,11 +800,9 @@ impl IncrementalView for AggregateView {
                 }
 
                 TableChange::RowDeleted { index, data } => {
-                    // Remove from aggregates (records any MIN/MAX recalc needed)
                     self.remove_row_from_aggregates(
                         row_id,
                         data,
-                        &mut pending_recalc,
                         &mut touched,
                         &mut removed_slots,
                     );
@@ -874,7 +827,6 @@ impl IncrementalView for AggregateView {
                         self.remove_row_from_aggregates(
                             row_id,
                             &old_row,
-                            &mut pending_recalc,
                             &mut touched,
                             &mut removed_slots,
                         );
@@ -888,18 +840,12 @@ impl IncrementalView for AggregateView {
                             // Update the aggregate values
                             if let Some(key) = self.row_to_group.get(&row_id).cloned() {
                                 self.touch_existing(&key, &mut touched);
-                                let mut needs_recalc = false;
 
                                 // Remove old value
                                 if let Some(state) = self.groups.get_mut(&key) {
                                     if let Some(old_num) = Self::extract_numeric(old_value) {
-                                        needs_recalc = !state.remove_column_value(column, old_num);
+                                        state.remove_column_value(column, old_num);
                                     }
-                                }
-
-                                // Defer MIN/MAX recalc to end of batch (see above)
-                                if needs_recalc && self.needs_min_max(column) {
-                                    pending_recalc.insert((key.clone(), column.clone()));
                                 }
 
                                 // Add new value
@@ -945,12 +891,6 @@ impl IncrementalView for AggregateView {
             }
         }
 
-        // Apply deferred MIN/MAX recalcs now that all batch index shifts are
-        // done and the view's row indices match the parent layout. recalc
-        // safely no-ops for any group pruned during the batch.
-        for (key, col) in &pending_recalc {
-            self.recalculate_group_column_min_max(key, col);
-        }
         self.compact_group_order(&removed_slots);
         self.emit_batch_output(touched);
 

@@ -12,7 +12,7 @@
 //! - FilterView directly on root (incremental changeset path)
 //! - SortedView directly on root (incremental changeset path)
 //! - AggregateView directly on root (incremental running aggregates, including
-//!   MIN/MAX recalculation and MEDIAN/p90 sorted-values maintenance)
+//!   MIN/MAX value multisets and MEDIAN/p90 sorted-values maintenance)
 //! - SortedView over a FilterView (chained, incremental batch replay)
 //! - AggregateView over the chained sort (chained-of-chained)
 //! - Filter, sort, and FULL join over AggregateViews (aggregate output history)
@@ -38,9 +38,9 @@
 //!   * `differential_chained_forward_prop_fuzz` ticks after EVERY mutation
 //!     (single-change ticks).
 //!   * `differential_batched_forward_prop_fuzz` applies a RANDOM BATCH of
-//!     mutations between ticks (multi-change ticks) — this exercises the
-//!     end-of-batch MIN/MAX recalc: a group's row indices line up with the
-//!     parent only AFTER every insert/delete in the batch has shifted them.
+//!     mutations between ticks (multi-change ticks) — several inserts,
+//!     deletes and group moves land in one aggregate batch, so its index
+//!     shifts and net diff must compose.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -618,8 +618,7 @@ fn differential_batched_forward_prop_fuzz() {
             let before = capture(p.replayed());
             let join_before = capture(p.join_replayed());
             // 1..=6 mutations applied before a single tick() — a multi-change
-            // batch. The deferred end-of-batch MIN/MAX recalc must read row
-            // indices that match the parent only after all batch shifts apply.
+            // batch whose index shifts and group moves must compose.
             let batch = 1 + rng.below(6);
             for _ in 0..batch {
                 apply_random_op(&mut rng, &base, &mut next_id);

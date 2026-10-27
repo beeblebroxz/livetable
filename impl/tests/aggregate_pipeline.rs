@@ -312,7 +312,7 @@ fn moving_a_row_between_groups_updates_both_in_group_order() {
 }
 
 #[test]
-fn deleting_the_max_in_a_mixed_batch_emits_the_rescanned_value() {
+fn deleting_the_max_in_a_mixed_batch_emits_the_next_max() {
     let table = orders(&[("West", 10), ("West", 30), ("West", 25), ("East", 20)]);
     let mut view = by_region(table.clone());
     let changes = sync_replayed(&mut view, || {
@@ -436,4 +436,100 @@ fn filter_and_sort_over_an_aggregate_replay_instead_of_rebuilding() {
     assert_eq!(snapshot(&filtered), snapshot(&fresh_filter));
     assert_eq!(snapshot(&filtered).len(), 1);
     assert_eq!(snapshot(&ranked), snapshot(&fresh_sort));
+}
+
+#[test]
+fn removing_an_extreme_reads_no_parent_rows() {
+    let table = Rc::try_unwrap(orders(&[("West", 10), ("West", 30), ("West", 25)]))
+        .ok()
+        .expect("sole owner")
+        .into_inner();
+    let counted = Rc::new(RefCell::new(Counted {
+        inner: table,
+        reads: Cell::new(0),
+    }));
+    let mut view = by_region(counted.clone());
+    counted.borrow().reads.set(0);
+
+    let changes = sync_replayed(&mut view, || {
+        counted.borrow_mut().inner.delete_row(1).unwrap(); // West's max, 30
+    });
+    assert!(changes.contains(&update(0, "top", Float64(30.0), Float64(25.0))));
+    assert_eq!(counted.borrow().reads.get(), 0, "deleting the max read source rows");
+
+    let changes = sync_replayed(&mut view, || {
+        counted
+            .borrow_mut()
+            .inner
+            .set_value(1, "amount", ColumnValue::Int32(5)) // the new max, 25
+            .unwrap();
+    });
+    assert!(changes.contains(&update(0, "top", Float64(25.0), Float64(10.0))));
+    assert_eq!(counted.borrow().reads.get(), 0, "editing the max read source rows");
+}
+
+#[test]
+fn tied_extremes_survive_one_deletion() {
+    let table = orders(&[("West", 30), ("West", 30), ("West", 10)]);
+    let mut view = by_region(table.clone());
+    let changes = sync_replayed(&mut view, || {
+        table.borrow_mut().delete_row(0).unwrap();
+    });
+    assert!(
+        !changes
+            .iter()
+            .any(|c| matches!(c, TableChange::CellUpdated { column, .. } if column == "top")),
+        "{changes:?}"
+    );
+    assert_eq!(view.get_row(0).unwrap()["top"], Float64(30.0));
+    let changes = sync_replayed(&mut view, || {
+        table.borrow_mut().delete_row(0).unwrap();
+    });
+    assert!(changes.contains(&update(0, "top", Float64(30.0), Float64(10.0))));
+}
+
+#[test]
+fn signed_zero_extremes_are_deterministic() {
+    fn bits(view: &AggregateView, column: &str) -> u64 {
+        match view.get_row(0).unwrap()[column] {
+            Float64(v) => v.to_bits(),
+            ref other => panic!("unexpected {column}: {other:?}"),
+        }
+    }
+    for zeros in [[-0.0, 0.0], [0.0, -0.0]] {
+        let mut table = Table::new(
+            "zeros".into(),
+            Schema::new(vec![
+                ("region".into(), ColumnType::String, false),
+                ("amount".into(), ColumnType::Float64, false),
+            ]),
+        );
+        table.clear_changeset();
+        let table = Rc::new(RefCell::new(table));
+        let mut view = AggregateView::new(
+            "extremes".into(),
+            table.clone(),
+            vec!["region".into()],
+            vec![
+                ("lo".into(), "amount".into(), AggregateFunction::Min),
+                ("hi".into(), "amount".into(), AggregateFunction::Max),
+            ],
+        )
+        .unwrap();
+        for zero in zeros {
+            table
+                .borrow_mut()
+                .append_row(HashMap::from([
+                    ("region".into(), ColumnValue::String("West".into())),
+                    ("amount".into(), Float64(zero)),
+                ]))
+                .unwrap();
+            view.sync();
+        }
+        assert_eq!(bits(&view, "lo"), (-0.0f64).to_bits(), "{zeros:?} incremental MIN");
+        assert_eq!(bits(&view, "hi"), 0.0f64.to_bits(), "{zeros:?} incremental MAX");
+        view.refresh();
+        assert_eq!(bits(&view, "lo"), (-0.0f64).to_bits(), "{zeros:?} rebuilt MIN");
+        assert_eq!(bits(&view, "hi"), 0.0f64.to_bits(), "{zeros:?} rebuilt MAX");
+    }
 }

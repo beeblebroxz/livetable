@@ -135,7 +135,7 @@ When a change alters an invariant, update its rule file.
 
 7. **Pre-epoch datetime**: Use `div_euclid`/`rem_euclid` for ms→days decomposition, not `/`/`%` (truncating division gives wrong results for negative timestamps)
 
-8. **NaN in incremental aggregates**: `AggregateView` excludes NaN values like NULL (`extract_numeric` guard) — NaN would permanently poison running SUM/AVG and can never be binary-searched out of `sorted_values`. Group-by keys canonicalize NaN (one group, Postgres-style) and fold -0.0 into +0.0. Keep these guards when adding aggregate paths.
+8. **NaN in incremental aggregates**: `AggregateView` excludes NaN values like NULL (`extract_numeric` guard) — NaN would permanently poison running SUM/AVG and could never be removed from `sorted_values` or the MIN/MAX value multiset. Group-by keys canonicalize NaN (one group, Postgres-style) and fold -0.0 into +0.0. Keep these guards when adding aggregate paths.
 
 9. **Timezone-aware datetimes are rejected**: `datetime_to_ms_since_epoch` raises `ValueError` for aware datetimes (storage is naive ms-since-epoch; reading wall-clock fields would silently drop the offset). The pandas path falls back to `.timestamp()`, which converts aware values correctly.
 

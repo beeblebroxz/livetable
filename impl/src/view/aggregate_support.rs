@@ -7,7 +7,8 @@
 use super::{canonical_f32_bits, canonical_f64_bits, JoinKeyPart};
 use crate::column::ColumnValue;
 use crate::readable::ReadableTable;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Supported aggregation functions
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,6 +22,31 @@ pub enum AggregateFunction {
     Median,          // Sugar for Percentile(0.5)
 }
 
+/// An f64 ordered by `total_cmp`, so it can key a `BTreeMap`. NaN never
+/// enters: `extract_numeric` excludes it. -0.0 orders below 0.0.
+#[derive(Debug, Clone, Copy)]
+struct OrderedF64(f64);
+
+impl PartialEq for OrderedF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for OrderedF64 {}
+
+impl PartialOrd for OrderedF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF64 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// Internal state for tracking aggregate statistics for one source column
 #[derive(Debug, Clone)]
 pub(super) struct ColumnAggState {
@@ -28,22 +54,21 @@ pub(super) struct ColumnAggState {
     pub(super) sum: f64,
     /// Count of non-null values
     pub(super) count: usize,
-    /// Current minimum value
-    pub(super) min: Option<f64>,
-    /// Current maximum value
-    pub(super) max: Option<f64>,
+    /// Every value with its multiplicity, so MIN/MAX are the first and last
+    /// keys and removing an extreme never rescans the source. Only populated
+    /// when a MIN or MAX aggregation targets this source column.
+    extremes: Option<BTreeMap<OrderedF64, usize>>,
     /// Sorted values for percentile calculations. Only populated when
     /// a Percentile or Median aggregation targets this source column.
     pub(super) sorted_values: Option<Vec<f64>>,
 }
 
 impl ColumnAggState {
-    pub(super) fn new(needs_sorted: bool) -> Self {
+    pub(super) fn new(needs_sorted: bool, needs_extremes: bool) -> Self {
         ColumnAggState {
             sum: 0.0,
             count: 0,
-            min: None,
-            max: None,
+            extremes: needs_extremes.then(BTreeMap::new),
             sorted_values: if needs_sorted { Some(Vec::new()) } else { None },
         }
     }
@@ -52,44 +77,39 @@ impl ColumnAggState {
     pub(super) fn add_value(&mut self, value: f64) {
         self.sum += value;
         self.count += 1;
-        self.min = Some(self.min.map_or(value, |m| m.min(value)));
-        self.max = Some(self.max.map_or(value, |m| m.max(value)));
+        if let Some(extremes) = &mut self.extremes {
+            *extremes.entry(OrderedF64(value)).or_insert(0) += 1;
+        }
         if let Some(ref mut sorted) = self.sorted_values {
             let pos = sorted.partition_point(|&v| v < value);
             sorted.insert(pos, value);
         }
     }
 
-    /// Remove a numeric value from the aggregate state
-    /// Returns false if MIN/MAX needs recalculation (deleted value was min or max)
-    pub(super) fn remove_value(&mut self, value: f64) -> bool {
+    /// Remove a numeric value from the aggregate state. Removed values come
+    /// from changeset payloads, so they are always present.
+    pub(super) fn remove_value(&mut self, value: f64) {
         self.sum -= value;
         self.count = self.count.saturating_sub(1);
 
         if let Some(ref mut sorted) = self.sorted_values {
             let pos = sorted.partition_point(|&v| v < value);
-            if pos < sorted.len() && sorted[pos] == value {
+            let present = pos < sorted.len() && sorted[pos] == value;
+            debug_assert!(present, "removed value {value} missing from sorted_values");
+            if present {
                 sorted.remove(pos);
             }
         }
 
-        let needs_recalc = self.min == Some(value) || self.max == Some(value);
-        !needs_recalc
-    }
-
-    /// Recalculate MIN/MAX from a set of values
-    pub(super) fn recalculate_min_max(&mut self, values: &[f64]) {
-        if values.is_empty() {
-            self.min = None;
-            self.max = None;
-        } else {
-            self.min = values.iter().copied().reduce(f64::min);
-            self.max = values.iter().copied().reduce(f64::max);
-        }
-        if self.sorted_values.is_some() {
-            let mut sorted = values.to_vec();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            self.sorted_values = Some(sorted);
+        if let Some(extremes) = &mut self.extremes {
+            let key = OrderedF64(value);
+            match extremes.get_mut(&key) {
+                Some(1) => {
+                    extremes.remove(&key);
+                }
+                Some(count) => *count -= 1,
+                None => debug_assert!(false, "removed value {value} missing from extremes"),
+            }
         }
     }
 
@@ -113,6 +133,10 @@ impl ColumnAggState {
         Some(sorted[lo] * (1.0 - frac) + sorted[hi] * frac)
     }
 
+    fn extreme(key: Option<&OrderedF64>) -> ColumnValue {
+        key.map_or(ColumnValue::Null, |value| ColumnValue::Float64(value.0))
+    }
+
     pub(super) fn get_result(&self, func: AggregateFunction) -> ColumnValue {
         match func {
             // SQL semantics: SUM over zero non-null values is NULL, not 0. This
@@ -128,8 +152,8 @@ impl ColumnAggState {
                     ColumnValue::Null
                 }
             }
-            AggregateFunction::Min => self.min.map_or(ColumnValue::Null, ColumnValue::Float64),
-            AggregateFunction::Max => self.max.map_or(ColumnValue::Null, ColumnValue::Float64),
+            AggregateFunction::Min => Self::extreme(self.extremes.as_ref().and_then(|e| e.keys().next())),
+            AggregateFunction::Max => Self::extreme(self.extremes.as_ref().and_then(|e| e.keys().next_back())),
             AggregateFunction::Percentile(p) => self
                 .percentile(p)
                 .map_or(ColumnValue::Null, ColumnValue::Float64),
@@ -149,16 +173,23 @@ pub(super) struct GroupState {
     pub(super) row_indices: HashSet<usize>,
     /// Source columns that need sorted_values for percentile calculations
     pub(super) percentile_columns: HashSet<String>,
+    /// Source columns that need a value multiset for MIN/MAX
+    pub(super) extreme_columns: HashSet<String>,
     /// This group's index in the view's group order (its output row).
     pub(super) position: usize,
 }
 
 impl GroupState {
-    pub(super) fn new(position: usize, percentile_columns: HashSet<String>) -> Self {
+    pub(super) fn new(
+        position: usize,
+        percentile_columns: HashSet<String>,
+        extreme_columns: HashSet<String>,
+    ) -> Self {
         GroupState {
             column_stats: HashMap::new(),
             row_indices: HashSet::new(),
             percentile_columns,
+            extreme_columns,
             position,
         }
     }
@@ -166,20 +197,18 @@ impl GroupState {
     /// Add a value for a specific source column
     pub(super) fn add_column_value(&mut self, source_col: &str, value: f64) {
         let needs_sorted = self.percentile_columns.contains(source_col);
+        let needs_extremes = self.extreme_columns.contains(source_col);
         let stats = self
             .column_stats
             .entry(source_col.to_string())
-            .or_insert_with(|| ColumnAggState::new(needs_sorted));
+            .or_insert_with(|| ColumnAggState::new(needs_sorted, needs_extremes));
         stats.add_value(value);
     }
 
     /// Remove a value for a specific source column
-    /// Returns false if MIN/MAX needs recalculation
-    pub(super) fn remove_column_value(&mut self, source_col: &str, value: f64) -> bool {
+    pub(super) fn remove_column_value(&mut self, source_col: &str, value: f64) {
         if let Some(stats) = self.column_stats.get_mut(source_col) {
-            stats.remove_value(value)
-        } else {
-            true
+            stats.remove_value(value);
         }
     }
 
@@ -200,12 +229,6 @@ impl GroupState {
         }
     }
 
-    /// Recalculate MIN/MAX for a source column from a set of values
-    pub(super) fn recalculate_column_min_max(&mut self, source_col: &str, values: &[f64]) {
-        if let Some(stats) = self.column_stats.get_mut(source_col) {
-            stats.recalculate_min_max(values);
-        }
-    }
 }
 
 /// A key for grouping rows — one typed part per group-by column, `None` = NULL.

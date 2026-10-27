@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 #[test]
 fn test_column_agg_state_percentile() {
-    let mut state = ColumnAggState::new(true); // needs_sorted = true
+    let mut state = ColumnAggState::new(true, false); // needs_sorted = true
                                                // Values: 10, 20, 30, 40, 50
     for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
         state.add_value(v);
@@ -38,7 +38,7 @@ fn test_column_agg_state_percentile() {
 
 #[test]
 fn test_column_agg_state_percentile_interpolation() {
-    let mut state = ColumnAggState::new(true);
+    let mut state = ColumnAggState::new(true, false);
     // Even number of values: 10, 20, 30, 40
     for v in [10.0, 20.0, 30.0, 40.0] {
         state.add_value(v);
@@ -50,7 +50,7 @@ fn test_column_agg_state_percentile_interpolation() {
 
 #[test]
 fn test_column_agg_state_percentile_single_value() {
-    let mut state = ColumnAggState::new(true);
+    let mut state = ColumnAggState::new(true, false);
     state.add_value(42.0);
     // Any percentile of a single value = that value
     assert!((state.percentile(0.0).unwrap() - 42.0).abs() < 1e-9);
@@ -60,13 +60,13 @@ fn test_column_agg_state_percentile_single_value() {
 
 #[test]
 fn test_column_agg_state_percentile_empty() {
-    let state = ColumnAggState::new(true);
+    let state = ColumnAggState::new(true, false);
     assert!(state.percentile(0.5).is_none());
 }
 
 #[test]
 fn test_column_agg_state_no_sorted_when_not_needed() {
-    let mut state = ColumnAggState::new(false); // needs_sorted = false
+    let mut state = ColumnAggState::new(false, false); // needs_sorted = false
     state.add_value(10.0);
     assert!(state.sorted_values.is_none());
     assert!(state.percentile(0.5).is_none());
