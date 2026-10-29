@@ -133,7 +133,7 @@ operation.
 | Hash join construction | O(N + M + R) |
 | Filter full rebuild | O(N) |
 | Sort full rebuild | O(N log N) |
-| Group full rebuild | O(N) plus percentile bookkeeping |
+| Group full rebuild | O(N); for groups of g values, MIN/MAX add O(log g) per value and each percentile column O(g log g) per group |
 | Bounded-batch view sync | Depends on view and event types; incremental when history/bounds permit |
 
 `R` is join output size. Many-to-many joins may produce an output much larger

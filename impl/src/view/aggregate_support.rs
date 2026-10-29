@@ -76,16 +76,38 @@ impl ColumnAggState {
 
     /// Add a numeric value to the aggregate state
     pub(super) fn add_value(&mut self, value: f64) {
-        self.sum += value;
-        self.count += 1;
-        if let Some(extremes) = &mut self.extremes {
-            *extremes.entry(OrderedF64(value)).or_insert(0) += 1;
-        }
+        self.add_to_totals(value);
         if let Some(ref mut sorted) = self.sorted_values {
             // Total order, so -0.0 and 0.0 sort apart and removal finds the
             // exact value an incremental sync added.
             let pos = sorted.partition_point(|v| v.total_cmp(&value).is_lt());
             sorted.insert(pos, value);
+        }
+    }
+
+    /// Like `add_value`, but appends to the percentile values without
+    /// keeping them sorted. A build adds every value this way and then calls
+    /// `sort_values` once, instead of paying an insert per value.
+    pub(super) fn add_value_unsorted(&mut self, value: f64) {
+        self.add_to_totals(value);
+        if let Some(ref mut sorted) = self.sorted_values {
+            sorted.push(value);
+        }
+    }
+
+    /// The sum, count and MIN/MAX multiset, which both adds update.
+    fn add_to_totals(&mut self, value: f64) {
+        self.sum += value;
+        self.count += 1;
+        if let Some(extremes) = &mut self.extremes {
+            *extremes.entry(OrderedF64(value)).or_insert(0) += 1;
+        }
+    }
+
+    /// Sort the percentile values in the order `add_value` keeps them.
+    pub(super) fn sort_values(&mut self) {
+        if let Some(ref mut sorted) = self.sorted_values {
+            sorted.sort_unstable_by(f64::total_cmp);
         }
     }
 
@@ -207,13 +229,29 @@ impl GroupState {
 
     /// Add a value for a specific source column
     pub(super) fn add_column_value(&mut self, source_col: &str, value: f64) {
+        self.column_state(source_col).add_value(value);
+    }
+
+    /// Like `add_column_value`, for a build that calls `finish_build` after
+    /// adding every value.
+    pub(super) fn add_column_value_unsorted(&mut self, source_col: &str, value: f64) {
+        self.column_state(source_col).add_value_unsorted(value);
+    }
+
+    /// The state for `source_col`, created on its first value.
+    fn column_state(&mut self, source_col: &str) -> &mut ColumnAggState {
         let needs_sorted = self.percentile_columns.contains(source_col);
         let needs_extremes = self.extreme_columns.contains(source_col);
-        let stats = self
-            .column_stats
+        self.column_stats
             .entry(source_col.to_string())
-            .or_insert_with(|| ColumnAggState::new(needs_sorted, needs_extremes));
-        stats.add_value(value);
+            .or_insert_with(|| ColumnAggState::new(needs_sorted, needs_extremes))
+    }
+
+    /// Sort the percentile values a build added unsorted.
+    pub(super) fn finish_build(&mut self) {
+        for stats in self.column_stats.values_mut() {
+            stats.sort_values();
+        }
     }
 
     /// Remove a value for a specific source column

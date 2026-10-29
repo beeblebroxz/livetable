@@ -218,14 +218,14 @@ impl AggregateView {
                 if has_single_source {
                     if let Ok(v) = parent.get_value_by_index(row_idx, source_col_idx) {
                         if let Some(num) = Self::extract_numeric(&v) {
-                            state.add_column_value(source_col_name_ref.unwrap(), num);
+                            state.add_column_value_unsorted(source_col_name_ref.unwrap(), num);
                         }
                     }
                 } else {
                     for (col_idx, col_name) in &source_col_info {
                         if let Ok(v) = parent.get_value_by_index(row_idx, *col_idx) {
                             if let Some(num) = Self::extract_numeric(&v) {
-                                state.add_column_value(col_name, num);
+                                state.add_column_value_unsorted(col_name, num);
                             }
                         }
                     }
@@ -274,7 +274,7 @@ impl AggregateView {
                 self.row_groups.push(Some(state.key.clone()));
 
                 for (source_col, num) in col_values {
-                    state.add_column_value(&source_col, num);
+                    state.add_column_value_unsorted(&source_col, num);
                 }
 
                 if is_new_group {
@@ -283,6 +283,9 @@ impl AggregateView {
             }
         }
         drop(parent);
+        for state in self.groups.values_mut() {
+            state.finish_build();
+        }
 
         self.last_synced_generation = generation;
         self.last_processed_change_count = change_count;

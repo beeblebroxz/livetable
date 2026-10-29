@@ -610,6 +610,83 @@ slower at every size. This change caused it, not noise:
 | two_sided_tick_each_side | 1M | 2,496 | 2,672 | 2,425 | 2,548 |
 
 
+## After the percentile build fix (2026-10-29)
+
+Design: [percentile build spec](superpowers/specs/2026-10-29-median-build-design.md).
+Harness: [`impl/examples/aggregate_build_benchmark.rs`](../impl/examples/aggregate_build_benchmark.rs).
+
+**What changed.** Building an aggregate with MEDIAN or PERCENTILE used to
+insert each row's value into its group's sorted vector one at a time, so a
+build was quadratic in group size. A build now appends every value and sorts
+each group once, in the same order incremental syncs keep. This applies to
+construction, `refresh()` and every rebuild fallback. Incremental syncs are
+unchanged.
+
+**How this was measured.**
+- **Workload:** the tick harness above times only ticks, so this harness
+  times construction separately:
+  - one Float64 `amount` per row, with values `(i * 7919) % 100_000` so no
+    group receives them in order;
+  - grouped by a String `region` with 8 or 1 groups;
+  - SUM against MEDIAN.
+
+  Each cell is the median of 3 builds. "Tick" is the median of 15 ticks,
+  each after one middle insert into a group.
+- **Back to back:** the harness was built at the parent commit and at the
+  change, and the two builds were run alternately, twice each.
+
+| Rows | Groups | SUM build | MEDIAN build before | after | MEDIAN tick before | after |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10k | 8 | 2.1 ms | 2.8 ms | 2.2 ms | 2.2 µs | 2.5 µs |
+| 100k | 8 | 19.3 ms | 75.7 ms | 21.2 ms | 9.5 µs | 9.5 µs |
+| 1M | 8 | 188 ms | 5,005 ms | 207 ms | 88.3 µs | 85.0 µs |
+| 100k | 1 | 18.2 ms | 383 ms | 20.8 ms | 15.9 µs | 15.8 µs |
+| 300k | 1 | 55.7 ms | 3,347 ms | 63.5 ms | 45.4 µs | 46.7 µs |
+
+- **Which values the table shows:**
+  - The second round.
+  - SUM is the after build. SUM builds don't run the changed code, and the
+    two builds' SUM times were within 5% of each other.
+- **Between rounds:**
+  - Builds agreed within 5%, or within 0.1 ms at 10k.
+  - Tick medians varied by up to 10%. The largest swings were in SUM
+    ticks, which don't run the changed code: 2.0–2.2 µs at 10k and
+    78.8–85.5 µs at 1M, both in the before build.
+- **Budget met:**
+  - In both rounds, a MEDIAN build took at most 1.14× as long as SUM at
+    every measured size (budget: 2×).
+  - At 1M rows in 8 groups it is 24× faster, and at 300k rows in one group
+    53–54× faster.
+- **Incremental ticks:**
+  - The code is unchanged in effect: an incremental add still inserts in
+    sorted position. The shared code it now calls updates the sum, count
+    and MIN/MAX state exactly as before.
+  - At 100k rows and above, every MEDIAN tick was within 1.04× of before in
+    both rounds. At 10k the largest gap was 0.3 µs.
+  - At 300k rows in one group, the after build was 1.03–1.04× slower in
+    both rounds. Two other checks found no consistent difference:
+    - an earlier pair, run before the change shared its add logic with
+      incremental syncs, had 44.8–45.0 µs in both builds (not kept in the
+      raw files);
+    - three alternating rounds of the duplicated against the shared
+      version: 44.5–45.4 µs against 44.9–46.0 µs.
+
+    These runs can't rule out a difference of up to 4% at that size.
+
+### Environment
+
+- **Machine:** Apple M2, 24 GiB RAM, macOS 27.2 (26B123).
+- **Toolchain:** rustc 1.91.1 (ed61e7d7e 2025-11-07), release build.
+- **Before:** commit `7a1c949`, with this harness copied in.
+- **After:** the commit that records these results.
+- **Wall time:** 81 s for both rounds.
+- **Raw output:** both rounds, in order, in
+  [`aggregate_build_2026-10-29-before.jsonl`](../benchmarks/aggregate_build_2026-10-29-before.jsonl)
+  and
+  [`aggregate_build_2026-10-29-after.jsonl`](../benchmarks/aggregate_build_2026-10-29-after.jsonl).
+- **Reproduce:** `cargo run --release --manifest-path impl/Cargo.toml --example aggregate_build_benchmark`.
+
+
 ## Method
 
 - **Pipelines.** Each runs on fresh root tables, with exactly one view (or

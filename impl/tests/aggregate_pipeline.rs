@@ -673,6 +673,54 @@ fn signed_zero_median_matches_a_rebuild() {
     assert_eq!(incremental, 0.0f64.to_bits());
 }
 
+#[test]
+fn a_build_orders_values_that_arrive_out_of_order() {
+    let median = || ("mid".to_string(), "amount".to_string(), AggregateFunction::Median);
+    // A String key, an Int32 key over one source column, and an Int32 key
+    // over several each take their own build loop.
+    for (group_by, aggregations) in [
+        ("region", vec![median()]),
+        ("note", vec![median()]),
+        ("note", vec![median(), ("notes".into(), "note".into(), AggregateFunction::Sum)]),
+    ] {
+        let table = orders(&[("West", 5), ("West", 1), ("West", 4), ("West", 2), ("West", 3)]);
+        let mut view =
+            AggregateView::new("medians".into(), table.clone(), vec![group_by.into()], aggregations)
+                .unwrap();
+        let mid = |view: &AggregateView| view.get_row(0).unwrap()["mid"].clone();
+        assert_eq!(mid(&view), Float64(3.0), "build grouped by {group_by}");
+        // Incremental syncs insert and remove in the order the build left.
+        table.borrow_mut().append_row(order("West", 0)).unwrap();
+        view.sync();
+        assert_eq!(mid(&view), Float64(2.5), "insert grouped by {group_by}");
+        table.borrow_mut().delete_row(0).unwrap(); // the 5
+        view.sync();
+        assert_eq!(mid(&view), Float64(2.0), "delete grouped by {group_by}");
+    }
+}
+
+#[test]
+fn a_build_orders_signed_zeros_for_later_removals() {
+    for zeros in [[-0.0, 0.0], [0.0, -0.0]] {
+        let table = float_amounts();
+        for amount in [zeros[0], zeros[1], 1.0] {
+            append_amount(&table, amount);
+        }
+        let mut view = AggregateView::new(
+            "median".into(),
+            table.clone(),
+            vec!["region".into()],
+            vec![("mid".into(), "amount".into(), AggregateFunction::Median)],
+        )
+        .unwrap();
+        // Removal finds -0.0 only where total_cmp puts it, before 0.0.
+        let negative = zeros.iter().position(|z| z.is_sign_negative()).unwrap();
+        table.borrow_mut().delete_row(negative).unwrap();
+        view.sync();
+        assert_eq!(view.get_row(0).unwrap()["mid"], Float64(0.5), "built from {zeros:?}");
+    }
+}
+
 /// MIN and MAX over `amount`, grouped by region.
 fn extremes_by_region(parent: Rc<RefCell<dyn ReadableTable>>) -> AggregateView {
     AggregateView::new(
