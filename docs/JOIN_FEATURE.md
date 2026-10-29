@@ -186,9 +186,13 @@ For unmatched rows:
 from both parents and handles inserts, deletes, and key updates. Tables and
 synchronized filters/sorts/aggregates expose history that Rust joins can replay. If either
 parent exposes no changeset, the join instead uses version-checked rebuilds.
-Missing history, structural changes on both sides in one batch, or a key update
-before a structural change on the same side also require a rebuild to avoid
-mixing row-coordinate frames. Always synchronize parents first; `refresh()`
+Missing history also requires a rebuild. Since 2026-10-29, a batch with
+structural changes on both sides applies incrementally as a delta join: the
+left changes first, against the right parent as it was before the batch
+(right rows are reconstructed from the batch), then the right changes
+against the updated left. Such batches rebuild only above 256 events on a
+side. A key update before an insert or delete on the same side no longer
+rebuilds either. Always synchronize parents first; `refresh()`
 unconditionally rebuilds from their current state.
 
 Since 2026-10-26, a one-sided sync finds matches without rebuilding a lookup

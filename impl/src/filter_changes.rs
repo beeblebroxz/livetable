@@ -21,12 +21,36 @@ pub(crate) const MAX_FILTER_REPLAY_CHANGES: usize = 256;
 pub(crate) fn row_after_update<E>(
     changes: &[TableChange],
     change_index: usize,
+    get_row: impl FnMut(usize) -> Result<Row, E>,
+) -> Result<Row, E> {
+    replay_row(
+        &changes[change_index + 1..],
+        changes[change_index].row_index(),
+        get_row,
+    )
+}
+
+/// Recover row `index` of the frame before `changes` were applied, from the
+/// live parent after them.
+pub(crate) fn row_before_batch<E>(
+    changes: &[TableChange],
+    index: usize,
+    get_row: impl FnMut(usize) -> Result<Row, E>,
+) -> Result<Row, E> {
+    replay_row(changes, index, get_row)
+}
+
+/// Follow the row at `index` through `later` changes: a deletion supplies its
+/// payload, otherwise the live row at its final position is read. Then undo
+/// every value change made to it, so the earliest old value wins.
+fn replay_row<E>(
+    later: &[TableChange],
+    mut index: usize,
     mut get_row: impl FnMut(usize) -> Result<Row, E>,
 ) -> Result<Row, E> {
-    let mut index = changes[change_index].row_index();
     let mut undo = Vec::new();
     let mut deleted = None;
-    for change in &changes[change_index + 1..] {
+    for change in later {
         match change {
             TableChange::RowInserted {
                 index: inserted, ..

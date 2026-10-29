@@ -3247,8 +3247,9 @@ fn test_table_tick_propagates_to_join_view_from_both_parents() {
 
     assert_eq!(join.borrow().len(), 1);
 
-    // Append on BOTH sides; the frame-mixing guard in sync() handles this
-    // batch via rebuild — a single tick must add the new match exactly once.
+    // Append on BOTH sides; sync() applies this batch in two phases (left
+    // against the pre-batch right, then right against the new left) — a
+    // single tick must add the new match exactly once.
     left.borrow_mut().append_row(left_row(2, "L2")).unwrap();
     right.borrow_mut().append_row(right_row(2, "R2")).unwrap();
     assert!(left_tickable.tick() >= 1);
@@ -3979,7 +3980,7 @@ fn test_left_join_incremental_insert_no_right_match() {
     assert_eq!(result, vec![(Some(1), Some(1)), (Some(2), None)]);
 }
 
-// === Cross-side and same-side frame mixing in JoinView::sync ===
+// === Cross-side and same-side batches in JoinView::sync ===
 
 /// Both parents mutated, then ONE sync handles both changesets (exactly
 /// what TickableTable::tick produces). The pair added for the new left

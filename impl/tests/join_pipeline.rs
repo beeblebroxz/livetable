@@ -377,13 +377,15 @@ fn rebuilds_invalidate_history() {
     inner.refresh();
     assert!(!history_kept(&inner, cursor), "refresh invalidates");
 
-    // Structural changes on both sides take the frame-mixing rebuild.
+    // A two-sided batch over the per-side bound rebuilds.
     let (_, cursor) = baseline(&inner);
-    o.borrow_mut().append_row(order(2, Some(20), 2)).unwrap();
+    for oid in 2..259 {
+        o.borrow_mut().append_row(order(oid, Some(20), 2)).unwrap();
+    }
     c.borrow_mut().append_row(customer(20, "b")).unwrap();
     assert!(inner.sync());
     assert!(!history_kept(&inner, cursor), "a rebuild invalidates");
-    assert_eq!(inner.len(), 2);
+    assert_eq!(inner.len(), 258);
 }
 
 #[test]
@@ -569,11 +571,13 @@ fn self_join_value_edits_update_both_halves() {
         ]
     );
 
-    // An insert is structural on both sides at once: rebuild.
-    let (_, cursor) = baseline(&pairs);
+    // An insert is structural on both sides at once: the two-phase sync
+    // pairs the new row with itself once, in phase 2, and keeps history.
+    let base = baseline(&pairs);
+    let cursor = base.1;
     c.borrow_mut().append_row(customer(30, "c")).unwrap();
-    assert!(pairs.sync());
-    assert!(!history_kept(&pairs, cursor));
+    replayed(&mut pairs, base);
+    assert!(history_kept(&pairs, cursor));
     assert_eq!(pairs.len(), 3);
 }
 
@@ -936,4 +940,104 @@ fn a_key_update_before_an_insert_keeps_history() {
         assert!(history_kept(&joined, cursor), "{how:?}: history kept");
         assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?}");
     }
+}
+
+const ALL_JOINS: [JoinType; 4] = [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full];
+
+#[test]
+fn a_new_customer_and_first_order_sync_together() {
+    for how in ALL_JOINS {
+        let o = orders(&[(1, Some(10), 5), (2, Some(20), 7)]);
+        let c = customers(&[(10, "a"), (20, "b")]);
+        let mut joined = join(o.clone(), c.clone(), how);
+        let base = baseline(&joined);
+        let cursor = base.1;
+        c.borrow_mut().append_row(customer(30, "c")).unwrap();
+        o.borrow_mut().append_row(order(3, Some(30), 9)).unwrap();
+        replayed(&mut joined, base);
+        assert!(history_kept(&joined, cursor), "{how:?}: history kept");
+        assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?}");
+    }
+}
+
+/// Both sides structural: the left batch applies first, against the right as
+/// consumers last saw it, so a deleted order's payload carries the customer's
+/// old name even though the live customers table already has the new one.
+#[test]
+fn phase_one_payloads_show_the_old_right_rows() {
+    let o = orders(&[(1, Some(10), 5), (2, Some(20), 7)]);
+    let c = customers(&[(10, "a"), (20, "b")]);
+    let mut left = join(o.clone(), c.clone(), JoinType::Left);
+    let base = baseline(&left);
+    let cursor = base.1;
+    c.borrow_mut().set_value(0, "name", name("z")).unwrap();
+    c.borrow_mut().append_row(customer(30, "c")).unwrap();
+    o.borrow_mut().delete_row(0).unwrap(); // customer 10's order
+    let changes = replayed(&mut left, base);
+    assert!(history_kept(&left, cursor), "history kept");
+    let payload = changes
+        .iter()
+        .find_map(|change| match change {
+            TableChange::RowDeleted { data, .. } if data["oid"] == Int32(1) => Some(data.clone()),
+            _ => None,
+        })
+        .expect("order 1 deleted");
+    assert_eq!(payload["right_name"], name("a"));
+    assert_eq!(rows_sorted(&left), rows_sorted(&join(o.clone(), c.clone(), JoinType::Left)));
+}
+
+#[test]
+fn a_self_join_syncs_incrementally() {
+    fn abc(id: i32, a: i32, b: i32) -> Row {
+        HashMap::from([("id".into(), Int32(id)), ("a".into(), Int32(a)), ("b".into(), Int32(b))])
+    }
+    for how in ALL_JOINS {
+        let mut table = Table::new(
+            "t".into(),
+            Schema::new(vec![
+                ("id".into(), ColumnType::Int32, false),
+                ("a".into(), ColumnType::Int32, false),
+                ("b".into(), ColumnType::Int32, false),
+            ]),
+        );
+        for (id, a, b) in [(1, 1, 2), (2, 2, 1), (3, 1, 1)] {
+            table.append_row(abc(id, a, b)).unwrap();
+        }
+        table.clear_changeset();
+        let t = Rc::new(RefCell::new(table));
+        let self_join = |name: &str| {
+            JoinView::new(name.into(), t.clone(), t.clone(), "a".into(), "b".into(), how).unwrap()
+        };
+        let mut joined = self_join("self");
+        for step in 0..3 {
+            let base = baseline(&joined);
+            let cursor = base.1;
+            match step {
+                0 => t.borrow_mut().insert_row(1, abc(4, 2, 2)).unwrap(),
+                1 => {
+                    t.borrow_mut().delete_row(0).unwrap();
+                }
+                _ => t.borrow_mut().set_value(0, "a", Int32(1)).unwrap(),
+            }
+            replayed(&mut joined, base);
+            assert!(history_kept(&joined, cursor), "{how:?} step {step}: history kept");
+            assert_eq!(rows_sorted(&joined), rows_sorted(&self_join("fresh")), "{how:?} step {step}");
+        }
+    }
+}
+
+/// Two-sided batches above 256 events on a side still rebuild.
+#[test]
+fn two_sided_batches_over_the_bound_rebuild() {
+    let o = orders(&[]);
+    let c = customers(&[(10, "a")]);
+    let mut joined = join(o.clone(), c.clone(), JoinType::Inner);
+    let (_, cursor) = baseline(&joined);
+    for i in 0..257 {
+        o.borrow_mut().append_row(order(i, Some(10), 1)).unwrap();
+    }
+    c.borrow_mut().append_row(customer(20, "b")).unwrap();
+    joined.sync();
+    assert!(!history_kept(&joined, cursor), "over the bound rebuilds");
+    assert_eq!(joined.len(), 257);
 }

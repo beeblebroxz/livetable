@@ -2,7 +2,7 @@
 
 use crate::changeset::{Changeset, TableChange};
 use crate::column::ColumnValue;
-use crate::filter_changes::{row_after_update, MAX_FILTER_REPLAY_CHANGES};
+use crate::filter_changes::{row_after_update, row_before_batch, MAX_FILTER_REPLAY_CHANGES};
 use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -200,6 +200,9 @@ pub struct JoinView {
     /// Parent row counts as of the last applied event.
     left_rows: usize,
     right_rows: usize,
+    /// During phase 1 of a two-sided sync, the right batch not yet applied:
+    /// every right read then reconstructs the pre-batch row consumers saw.
+    right_before: Option<Vec<TableChange>>,
 }
 
 impl JoinView {
@@ -327,6 +330,7 @@ impl JoinView {
             right_key_hashes: None,
             left_rows: 0,
             right_rows: 0,
+            right_before: None,
         };
 
         view.rebuild_index();
@@ -452,19 +456,22 @@ impl JoinView {
         self.sync_count += 1;
     }
 
-    /// Rows of one parent whose key equals each target key, ascending. One
-    /// scan of the parent's key-hash vector (built from the live parent on
-    /// first use) finds candidates; each is verified against its live key, as
-    /// hashes can collide. Only for a parent with no structural changes in
-    /// this sync, whose live rows are the view's: the early return keeps the
-    /// value-only pass that runs first from ever building a vector. A parent
-    /// whose live length disagrees with `rows` (its changeset) is an error,
-    /// which rebuilds, so the vector can never fall out of step.
+    /// Rows of one parent whose key equals each target key, ascending, in the
+    /// frame the join has applied for that parent: `rows` rows, plus
+    /// `before`, its batch not yet applied (phase 1 of a two-sided sync).
+    /// One scan of the parent's key-hash vector finds candidates; each is
+    /// verified against its key in that frame, as hashes can collide. A vector
+    /// not built yet is built from the live parent, then taken back through
+    /// `before` in reverse. The early return keeps the value-only pass that
+    /// runs first from ever building one. A parent whose live length
+    /// disagrees with its changeset is an error, which rebuilds, so a vector
+    /// can never fall out of step.
     fn matching_rows(
         hashes: &mut Option<Vec<u64>>,
         table: &RefCell<dyn ReadableTable>,
         keys: &[String],
         rows: usize,
+        before: Option<&[TableChange]>,
         targets: Vec<JoinKey>,
     ) -> Result<HashMap<JoinKey, Vec<usize>>, String> {
         let mut found: HashMap<JoinKey, Vec<usize>> = HashMap::new();
@@ -472,15 +479,53 @@ impl JoinView {
             return Ok(found);
         }
         let table = table.borrow();
-        if table.len() != rows {
+        let batch = before.unwrap_or(&[]);
+        let live_rows = batch.iter().fold(rows, |rows, change| match change {
+            TableChange::RowInserted { .. } => rows + 1,
+            TableChange::RowDeleted { .. } => rows - 1,
+            TableChange::CellUpdated { .. } => rows,
+        });
+        if table.len() != live_rows {
             return Err("parent rows disagree with its changeset".to_string());
         }
         let cols: Vec<usize> = keys.iter().filter_map(|k| table.column_index(k)).collect();
-        let hashes = hashes.get_or_insert_with(|| {
-            (0..table.len())
+        if hashes.is_none() {
+            let mut built: Vec<u64> = (0..table.len())
                 .map(|row| key_hash(Self::build_key_from_indices(&*table, row, &cols).as_ref()))
-                .collect()
-        });
+                .collect();
+            for (t, change) in batch.iter().enumerate().rev() {
+                match change {
+                    TableChange::RowInserted { index, .. } => {
+                        built.remove(*index);
+                    }
+                    TableChange::RowDeleted { index, data } => {
+                        built.insert(*index, key_hash(Self::build_composite_key(data, keys).as_ref()));
+                    }
+                    TableChange::CellUpdated {
+                        row,
+                        column,
+                        old_value,
+                        ..
+                    } if keys.contains(column) => {
+                        let mut prior = row_after_update(batch, t, |i| table.get_row(i))?;
+                        prior.insert(column.clone(), old_value.clone());
+                        built[*row] = key_hash(Self::build_composite_key(&prior, keys).as_ref());
+                    }
+                    TableChange::CellUpdated { .. } => {}
+                }
+            }
+            *hashes = Some(built);
+        }
+        let hashes = hashes.as_ref().expect("built above");
+        let key_at = |row: usize| -> Result<Option<JoinKey>, String> {
+            match before {
+                Some(batch) => {
+                    let row = row_before_batch(batch, row, |i| table.get_row(i))?;
+                    Ok(Self::build_composite_key(&row, keys))
+                }
+                None => Ok(Self::build_key_from_indices(&*table, row, &cols)),
+            }
+        };
         let mut by_hash: HashedMap<Vec<JoinKey>> = HashedMap::default();
         for key in targets {
             let keys = by_hash.entry(key_hash(Some(&key))).or_default();
@@ -503,7 +548,7 @@ impl JoinView {
             if !hit {
                 continue;
             }
-            if let Some(key) = Self::build_key_from_indices(&*table, row, &cols) {
+            if let Some(key) = key_at(row)? {
                 if by_hash[hash].contains(&key) {
                     found.entry(key).or_default().push(row);
                 }
@@ -582,7 +627,7 @@ impl JoinView {
         };
         match right {
             Half::Given(right) => row.extend(prefix_right(right.clone())),
-            Half::Live(Some(r)) => row.extend(prefix_right(self.right_table.borrow().get_row(r)?)),
+            Half::Live(Some(r)) => row.extend(prefix_right(self.right_row(r)?)),
             Half::Live(None) => row.extend(
                 self.right_column_names
                     .iter()
@@ -590,6 +635,16 @@ impl JoinView {
             ),
         }
         Ok(row)
+    }
+
+    /// Right row `r` in the frame the join has applied: during phase 1 of a
+    /// two-sided sync, as it was before the right batch.
+    fn right_row(&self, r: usize) -> Result<Row, String> {
+        let right = self.right_table.borrow();
+        match &self.right_before {
+            Some(changes) => row_before_batch(changes, r, |i| right.get_row(i)),
+            None => right.get_row(r),
+        }
     }
 
     /// Positions of left row `l`'s entries: contiguous, since `join_index` is
@@ -901,6 +956,7 @@ impl JoinView {
             &self.right_table,
             &self.right_keys,
             self.right_rows,
+            self.right_before.as_deref(),
             targets,
         )?;
         for (t, change) in changes.iter().enumerate() {
@@ -1011,6 +1067,7 @@ impl JoinView {
             &self.left_table,
             &self.left_keys,
             self.left_rows,
+            None,
             targets,
         )?;
         // A value-only batch moves no rows: one pass locates every target.
@@ -1273,16 +1330,16 @@ impl JoinView {
             return false;
         }
 
-        // Frame-mixing guard. The insert/key-update handlers match new rows
-        // against LIVE lookups of the other parent, while shifts treat
-        // existing join_index entries as pre-batch, so structural changes on
-        // BOTH sides in one batch would mix those frames; a full rebuild is
-        // correct by construction and advances both cursors. (A key update
-        // before a shift on the same side is fine: its handler reconstructs
-        // the row with `row_after_update`.)
+        // When both sides change structure, the sync is a delta join in two
+        // phases (see below). Phase 1 reconstructs each right row it reads
+        // from the right batch, O(batch) per read, so larger batches rebuild.
         let left_structural = Self::has_structural_changes(&left_changes, &self.left_keys);
         let right_structural = Self::has_structural_changes(&right_changes, &self.right_keys);
-        if left_structural && right_structural {
+        let two_sided = left_structural && right_structural;
+        if two_sided
+            && (left_changes.len() > MAX_FILTER_REPLAY_CHANGES
+                || right_changes.len() > MAX_FILTER_REPLAY_CHANGES)
+        {
             self.rebuild_index();
             return true;
         }
@@ -1299,7 +1356,16 @@ impl JoinView {
         let mut out = JoinOutput::default();
         // The value-only side goes first, so the structural side reads the
         // other parent live in the state consumers have already applied.
-        let applied = if left_structural {
+        // Both structural: phase 1 applies the left batch against the right
+        // as consumers last saw it (every right read reconstructed from the
+        // right batch); phase 2 applies the right batch against the left,
+        // which is now the live left parent.
+        let applied = if two_sided {
+            self.right_before = Some(right_changes.clone());
+            let phase_one = self.apply_left_changes(&left_changes, &mut out);
+            self.right_before = None;
+            phase_one.and_then(|()| self.apply_right_changes(&right_changes, true, &mut out))
+        } else if left_structural {
             self.apply_right_changes(&right_changes, false, &mut out)
                 .and_then(|()| self.apply_left_changes(&left_changes, &mut out))
         } else {
