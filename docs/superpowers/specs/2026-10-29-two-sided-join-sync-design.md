@@ -1,6 +1,21 @@
 # Two-sided join syncs without rebuilding
 
-**Status:** Draft 2026-10-29
+**Status:** Implemented 2026-10-29
+Plan: `docs/superpowers/plans/2026-10-29-two-sided-join-sync.md`.
+Results: "After the two-sided join fix" in `docs/VIEW_MAINTENANCE_BENCHMARK.md`.
+
+Implementation notes:
+
+- **Budgets met.** At 1M rows, a two-sided tick costs 1.9–2.0 ms for the
+  join (from 82 ms) and 2.2–2.3 ms with a filter and SUM over it (from about
+  1 s). Every other join workload is within 1.05× of before.
+- **Fuzz.** Both batched join drivers now keep history in every batch
+  (3600/3600). The collision fuzz's exact-order check held without a
+  fallback, and disabling the reverse-application path makes it fail
+  immediately.
+- **Test cost.** Replay-checking `agg_join` adds about 25 s to the batched
+  forward-prop driver (161.5 s to 191 s). The sync path itself is unchanged
+  within noise (167 s without that check).
 
 ## Why
 

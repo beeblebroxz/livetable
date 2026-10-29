@@ -426,7 +426,8 @@ fn kept_history(join: &RefCell<JoinView>, cursor: usize) -> bool {
 }
 
 /// A new customer and that customer's first order, ticked together
-/// (`both_then_tick`, which rebuilds the join) or one side at a time.
+/// (`both_then_tick`: one two-phase sync; before 2026-10-29 it rebuilt the
+/// join) or one side at a time.
 fn two_sided(ctx: &Ctx, p: &Pipeline) {
     let (n, m) = (ctx.rows, ctx.rows / 10);
     let mid = n / 2;
@@ -455,8 +456,8 @@ fn two_sided(ctx: &Ctx, p: &Pipeline) {
                 let mutate_us = insert_order() + insert_customer();
                 let orders_us = tick(Side::Orders);
                 assert!(
-                    !kept_history(join, cursor),
-                    "{n} rows {} {} {variant}: expected a rebuild",
+                    kept_history(join, cursor),
+                    "{n} rows {} {} {variant}: two-sided sync rebuilt",
                     storage_name(ctx.hint),
                     ctx.view
                 );

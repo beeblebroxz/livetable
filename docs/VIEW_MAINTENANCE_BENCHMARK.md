@@ -371,7 +371,8 @@ All at 1M rows. Where two values are given, they are FastReads / FastUpdates.
 
 **What is left now.**
 - **The two-sided rebuild:** about 1 s at 1M with views over the join, when
-  both joined tables change before either is ticked.
+  both joined tables change before either is ticked. Fixed on 2026-10-29;
+  see [After the two-sided join fix](#after-the-two-sided-join-fix-2026-10-29).
 - **O(output) passes:** order middle inserts and deletes, and customer
   deletes, still shift the join's own index (about 1–2 ms at 1M).
 - **Filter and sort index shifting:** 0.2–1 ms per event.
@@ -446,6 +447,141 @@ All at 1M rows. Where two values are given, they are FastReads / FastUpdates.
 | two_sided_tick_each_side | 10k | 660 | 24.7 | 673 | 24.4 |
 | two_sided_tick_each_side | 100k | 6,622 | 211 | 6,722 | 211 |
 | two_sided_tick_each_side | 1M | 77.9 ms | 2,278 | 78.4 ms | 2,203 |
+
+
+## After the two-sided join fix (2026-10-29)
+
+Design:
+[two-sided join sync spec](superpowers/specs/2026-10-29-two-sided-join-sync-design.md).
+
+**What changed.**
+- **Delta join instead of a rebuild.** When both parents change structure in
+  one sync, the join applies:
+  - first the left batch, against the right parent as consumers last saw
+    it, reconstructing each right row it reads from the right batch;
+  - then the right batch, against the updated left.
+
+  History is kept, so views over the join replay instead of rebuilding.
+  Batches above 256 events on a side still rebuild.
+- **A second rebuild trigger is gone.** A key update before an insert or
+  delete on the same side used to rebuild; it hasn't been needed since the
+  key-update handler started reconstructing its row.
+
+**Harness change.** The `two_sided_both_then_tick` workload now asserts that
+the join kept its history, where before it asserted a rebuild. The before
+run used the old assertion, the after run the new one. The timed code is the
+same.
+
+### Budgets
+
+All at 1M rows. Where two values are given, they are FastReads / FastUpdates.
+
+| Measure | Budget | Before | After |
+|---|---|---:|---:|
+| Join, both tables ticked together | under 10 ms | 81.8 / 82.3 ms | 1.99 / 1.90 ms |
+| Join + filter + SUM, both ticked together | under 15 ms | 997 / 977 ms | 2.26 / 2.17 ms |
+| Every other `join`/`join_chain` workload | at most 1.10× | | at most 1.05× |
+
+- **Where the time goes:** almost all of a two-sided tick is now the orders
+  tick, which runs both phases (1.99 ms of 1.99 ms). The customers tick
+  then has nothing left to do (0.1–0.3 µs).
+- **Same cost as one side at a time:** ticking together now costs about
+  what ticking one side at a time does (2.0 and 2.3 ms).
+- **Wall time:** the whole run took 13.5 s, against 102 s before; the
+  rebuilds were most of the old runtime.
+
+### Noise and environment
+
+- **The sort view:** outside the join views, 5 of the 66 cells with ticks of
+  1 µs or more are 1.12–1.13× slower. All five are the sort view's
+  `sort_key_move` workload, in code this change did not touch. They are
+  consistent across sizes, so they may reflect machine state between the
+  runs rather than random noise; they are not explained by this change.
+- **Environment:** the same machine and toolchain as earlier sections, on
+  macOS 27.2.
+  - Before run: commit `97cd236` (before this work).
+  - After run: commit `66601ea`, plus the harness assertion change.
+- **Raw output:**
+  [`view_maintenance_2026-10-29-before.jsonl`](../benchmarks/view_maintenance_2026-10-29-before.jsonl)
+  and
+  [`view_maintenance_2026-10-29-after.jsonl`](../benchmarks/view_maintenance_2026-10-29-after.jsonl).
+
+**What is left now.**
+- **O(output) passes:** order middle inserts and deletes, and customer
+  deletes, still shift the join's own index (about 1–2 ms at 1M).
+- **Filter and sort index shifting:** 0.2–1 ms per event.
+- **Two-sided batches above 256 events on a side** still rebuild.
+- **What to pursue next, if anything, is the user's decision.**
+
+#### `join` tick median, before → after
+
+| Workload | Rows | FastReads before | after | FastUpdates before | after |
+|---|---:|---:|---:|---:|---:|
+| value_edit | 10k | 0.25 | 0.21 | 0.21 | 0.21 |
+| value_edit | 100k | 0.21 | 0.21 | 0.25 | 0.21 |
+| value_edit | 1M | 0.25 | 0.25 | 0.25 | 0.25 |
+| middle_insert | 10k | 12.6 | 11.0 | 10.8 | 10.8 |
+| middle_insert | 100k | 96.3 | 96.4 | 96.0 | 96.1 |
+| middle_insert | 1M | 1,123 | 1,096 | 1,075 | 1,068 |
+| middle_delete | 10k | 11.6 | 10.2 | 9.67 | 9.67 |
+| middle_delete | 100k | 87.4 | 87.4 | 86.8 | 86.7 |
+| middle_delete | 1M | 1,039 | 1,008 | 991 | 979 |
+| tail_append | 10k | 2.54 | 2.21 | 2.17 | 2.12 |
+| tail_append | 100k | 10.1 | 10.2 | 10.1 | 10.2 |
+| tail_append | 1M | 89.8 | 90.1 | 89.8 | 90.3 |
+| tail_delete | 10k | 6.17 | 5.42 | 5.38 | 5.38 |
+| tail_delete | 100k | 45.3 | 45.2 | 45.2 | 45.2 |
+| tail_delete | 1M | 481 | 485 | 477 | 482 |
+| right_value_edit | 10k | 8.00 | 7.08 | 7.00 | 7.04 |
+| right_value_edit | 100k | 55.9 | 55.8 | 55.7 | 55.8 |
+| right_value_edit | 1M | 571 | 572 | 569 | 577 |
+| right_insert | 10k | 10.7 | 9.46 | 9.38 | 9.38 |
+| right_insert | 100k | 88.6 | 89.2 | 88.6 | 89.1 |
+| right_insert | 1M | 889 | 896 | 889 | 892 |
+| right_delete | 10k | 17.2 | 15.1 | 15.1 | 15.0 |
+| right_delete | 100k | 148 | 147 | 147 | 147 |
+| right_delete | 1M | 1,566 | 1,551 | 1,563 | 1,552 |
+| two_sided_both_then_tick | 10k | 722 | 21.3 | 727 | 20.1 |
+| two_sided_both_then_tick | 100k | 6,974 | 185 | 6,970 | 185 |
+| two_sided_both_then_tick | 1M | 81.8 ms | 1,988 | 82.3 ms | 1,904 |
+| two_sided_tick_each_side | 10k | 20.5 | 21.1 | 20.0 | 20.1 |
+| two_sided_tick_each_side | 100k | 185 | 185 | 185 | 185 |
+| two_sided_tick_each_side | 1M | 2,037 | 1,989 | 1,916 | 1,917 |
+
+#### `join_chain` tick median, before → after
+
+| Workload | Rows | FastReads before | after | FastUpdates before | after |
+|---|---:|---:|---:|---:|---:|
+| value_edit | 10k | 1.58 | 1.67 | 1.67 | 1.62 |
+| value_edit | 100k | 1.67 | 1.67 | 1.71 | 1.67 |
+| value_edit | 1M | 1.71 | 1.71 | 1.71 | 1.71 |
+| middle_insert | 10k | 15.2 | 15.6 | 14.9 | 14.9 |
+| middle_insert | 100k | 122 | 123 | 122 | 122 |
+| middle_insert | 1M | 1,392 | 1,367 | 1,326 | 1,321 |
+| middle_delete | 10k | 15.7 | 16.1 | 15.6 | 15.5 |
+| middle_delete | 100k | 127 | 127 | 127 | 127 |
+| middle_delete | 1M | 1,440 | 1,425 | 1,374 | 1,368 |
+| tail_append | 10k | 3.83 | 3.96 | 3.92 | 3.88 |
+| tail_append | 100k | 12.0 | 12.0 | 12.0 | 12.0 |
+| tail_append | 1M | 91.7 | 92.0 | 91.9 | 92.3 |
+| tail_delete | 10k | 10.1 | 10.4 | 10.2 | 10.2 |
+| tail_delete | 100k | 76.8 | 76.8 | 76.8 | 76.6 |
+| tail_delete | 1M | 780 | 779 | 791 | 782 |
+| right_value_edit | 10k | 33.0 | 33.5 | 33.1 | 33.0 |
+| right_value_edit | 100k | 84.4 | 84.5 | 85.2 | 84.8 |
+| right_value_edit | 1M | 624 | 624 | 626 | 624 |
+| right_insert | 10k | 9.42 | 9.71 | 9.42 | 9.50 |
+| right_insert | 100k | 88.7 | 89.2 | 88.8 | 89.4 |
+| right_insert | 1M | 891 | 894 | 888 | 894 |
+| right_delete | 10k | 15.2 | 15.5 | 15.2 | 15.2 |
+| right_delete | 100k | 148 | 148 | 148 | 148 |
+| right_delete | 1M | 1,573 | 1,552 | 1,588 | 1,551 |
+| two_sided_both_then_tick | 10k | 9,081 | 25.4 | 9,120 | 24.5 |
+| two_sided_both_then_tick | 100k | 91.6 ms | 212 | 93.2 ms | 211 |
+| two_sided_both_then_tick | 1M | 996.7 ms | 2,256 | 976.6 ms | 2,169 |
+| two_sided_tick_each_side | 10k | 24.7 | 24.8 | 24.4 | 24.4 |
+| two_sided_tick_each_side | 100k | 211 | 212 | 211 | 211 |
+| two_sided_tick_each_side | 1M | 2,273 | 2,260 | 2,161 | 2,174 |
 
 
 ## Method
