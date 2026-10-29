@@ -4535,6 +4535,9 @@ fn test_tickable_propagates_through_view_chain() {
 /// constantly share hashes and every match must be verified.
 #[test]
 fn test_join_incremental_matches_rebuild_under_collisions() {
+    use crate::changeset::TableChange;
+    use crate::readable::ReadableTable;
+    type Row = HashMap<String, ColumnValue>;
     struct Lcg(u64);
     impl Lcg {
         fn below(&mut self, n: usize) -> usize {
@@ -4575,10 +4578,36 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
         rows.sort();
         rows
     }
+    fn rows(view: &dyn ReadableTable) -> Vec<Row> {
+        (0..view.len()).map(|i| view.get_row(i).unwrap()).collect()
+    }
+    /// Apply history to an old snapshot, checking deletion payloads and old values.
+    fn replay(rows: &mut Vec<Row>, changes: &[TableChange], label: &str) {
+        for change in changes {
+            match change {
+                TableChange::RowInserted { index, data } => rows.insert(*index, data.clone()),
+                TableChange::RowDeleted { index, data } => {
+                    assert_eq!(rows.remove(*index), *data, "{label}: deletion payload")
+                }
+                TableChange::CellUpdated {
+                    row,
+                    column,
+                    old_value,
+                    new_value,
+                } => {
+                    assert_eq!(&rows[*row][column], old_value, "{label}: old value");
+                    rows[*row].insert(column.clone(), new_value.clone());
+                }
+            }
+        }
+    }
     for how in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full] {
         for trial in 0..30u64 {
             let mut rng = Lcg(0x5EED_1234_ABCD_0001 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let (left, right) = (table("l"), table("r"));
+            // Every third trial is a self-join: one table as both parents.
+            let self_join = trial % 3 == 2;
+            let left = table("l");
+            let right = if self_join { left.clone() } else { table("r") };
             let mut joined = JoinView::new(
                 "j".to_string(),
                 left.clone(),
@@ -4591,8 +4620,10 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
             let mut next_id = 0i64;
             for step in 0..60 {
                 // Odd trials batch several ops (both sides may change, which
-                // rebuilds and drops per-side state); even trials sync each op.
+                // takes the two-phase sync); even trials sync each op.
                 let ops = if trial % 2 == 1 { 1 + rng.below(3) } else { 1 };
+                let before = rows(&joined);
+                let cursor = joined.changeset().map(|history| history.total_len());
                 for _ in 0..ops {
                     let side = if rng.below(2) == 0 { &left } else { &right };
                     let len = side.borrow().len();
@@ -4622,6 +4653,14 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
                     }
                 }
                 joined.sync();
+                let label = format!("{how:?} trial {trial} step {step}");
+                if let Some(changes) = cursor
+                    .and_then(|cursor| joined.changeset().and_then(|history| history.changes_from(cursor)))
+                {
+                    let mut replayed = before;
+                    replay(&mut replayed, changes, &label);
+                    assert_eq!(replayed, rows(&joined), "{label}: history replays");
+                }
                 let fresh = JoinView::new(
                     "f".to_string(),
                     left.clone(),
@@ -4631,7 +4670,13 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
                     how,
                 )
                 .unwrap();
-                assert_eq!(canon(&joined), canon(&fresh), "{how:?} trial {trial} step {step}");
+                assert_eq!(canon(&joined), canon(&fresh), "{label}");
+                assert_eq!(rows(&joined), rows(&fresh), "{label}: exact order");
+                // A refresh drops per-side state, so the next two-sided sync
+                // rebuilds the right vector through the reverse path.
+                if step % 10 == 9 {
+                    joined.refresh();
+                }
             }
         }
     }

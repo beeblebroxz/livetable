@@ -370,10 +370,11 @@ impl Pipeline {
         ]
     }
 
-    /// The joins and their children. A join rebuilds when a batch updates a
-    /// region before inserting or deleting an order.
+    /// The joins and their children, including `agg_join`, which is
+    /// two-sided on many ticks (base and an aggregate of base both change).
     fn join_replayed(&self) -> Vec<(&'static str, Rc<RefCell<dyn ReadableTable>>)> {
         vec![
+            ("agg_join", self.agg_join.clone()),
             ("dim_join", self.dim_join.clone()),
             ("join_filter", self.join_filter.clone()),
             ("join_sorted", self.join_sorted.clone()),
@@ -1127,14 +1128,15 @@ fn differential_join_batched_fuzz() {
             }
         }
         // An implementation that always invalidated would pass the replay
-        // check; most small batches must keep history.
+        // check. Since two-sided syncs became incremental (2026-10-29) both
+        // joins keep history in every batch here (3600/3600); the floors are
+        // half that.
         assert!(
-            kept * 4 >= steps,
+            kept * 2 >= steps,
             "[join_batched:{jt_name}] history kept in only {kept}/{steps} batches"
         );
-        // Observed 2071/3600 (57%) on 2026-10-23; the floor is about half that.
         assert!(
-            view_kept * 4 >= steps,
+            view_kept * 2 >= steps,
             "[view_join_batched:{jt_name}] history kept in only {view_kept}/{steps} batches"
         );
     }
