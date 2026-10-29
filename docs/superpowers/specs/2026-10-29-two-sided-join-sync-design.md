@@ -6,13 +6,21 @@ Results: "After the two-sided join fix" in `docs/VIEW_MAINTENANCE_BENCHMARK.md`.
 
 Implementation notes:
 
-- **Budgets met.** At 1M rows, a two-sided tick costs 1.9–2.0 ms for the
-  join (from 82 ms) and 2.2–2.3 ms with a filter and SUM over it (from about
-  1 s). Every other join workload is within 1.05× of before.
-- **Fuzz.** Both batched join drivers now keep history in every batch
-  (3600/3600). The collision fuzz's exact-order check held without a
-  fallback, and disabling the reverse-application path makes it fail
-  immediately.
+- **Budgets.** At 1M rows, a two-sided tick costs 2.2–2.3 ms for the join
+  (from about 83 ms), and 2.5–2.7 ms with a filter and SUM over it (from
+  about 1.1 s), in a back-to-back before/after pair.
+- **The 1.10× budget for other join workloads can't be resolved by single
+  runs on this machine.** Their spread (at most 1.15×) matches untouched
+  views. Interleaved A/B rounds put them within noise. See the report.
+- **A regression found in final review, and fixed.** Making
+  `row_after_update` a wrapper around a shared walk slowed SortedView's key
+  moves about 12%. Inlining the walk instead slowed the join's candidate
+  scan. `row_after_update` keeps its original body, and `row_before_batch`
+  has its own copy.
+- **Fuzz.** The collision fuzz asserts history is kept on every sync, and
+  the batched join drivers require it in every batch (3600/3600). Exact
+  order held without a fallback, and disabling the reverse-application path
+  fails the collision fuzz immediately.
 - **Test cost.** Replay-checking `agg_join` adds about 25 s to the batched
   forward-prop driver (161.5 s to 191 s). The sync path itself is unchanged
   within noise (167 s without that check).

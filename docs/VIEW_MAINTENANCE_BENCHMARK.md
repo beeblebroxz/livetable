@@ -467,10 +467,14 @@ Design:
   delete on the same side used to rebuild; it hasn't been needed since the
   key-update handler started reconstructing its row.
 
-**Harness change.** The `two_sided_both_then_tick` workload now asserts that
-the join kept its history, where before it asserted a rebuild. The before
-run used the old assertion, the after run the new one. The timed code is the
-same.
+**How this was measured.**
+- **Back to back.** Run-to-run variation on this laptop reached 15–35% at 1M
+  rows across runs taken hours apart, including in views this change did not
+  touch. So the before run (the pre-change build, commit `97cd236`) and the
+  after run (the final build) were recorded back to back.
+- **Harness change.** The `two_sided_both_then_tick` workload now asserts
+  that the join kept its history, where before it asserted a rebuild; each
+  run used its own build's assertion, and the timed code is the same.
 
 ### Budgets
 
@@ -478,29 +482,51 @@ All at 1M rows. Where two values are given, they are FastReads / FastUpdates.
 
 | Measure | Budget | Before | After |
 |---|---|---:|---:|
-| Join, both tables ticked together | under 10 ms | 81.8 / 82.3 ms | 1.99 / 1.90 ms |
-| Join + filter + SUM, both ticked together | under 15 ms | 997 / 977 ms | 2.26 / 2.17 ms |
-| Every other `join`/`join_chain` workload | at most 1.10× | | at most 1.05× |
+| Join, both tables ticked together | under 10 ms | 83.7 / 82.3 ms | 2.25 / 2.24 ms |
+| Join + filter + SUM, both ticked together | under 15 ms | 1,043 / 1,109 ms | 2.68 / 2.53 ms |
+| Every other `join`/`join_chain` workload | at most 1.10× | | see below |
 
 - **Where the time goes:** almost all of a two-sided tick is now the orders
-  tick, which runs both phases (1.99 ms of 1.99 ms). The customers tick
-  then has nothing left to do (0.1–0.3 µs).
-- **Same cost as one side at a time:** ticking together now costs about
-  what ticking one side at a time does (2.0 and 2.3 ms).
-- **Wall time:** the whole run took 13.5 s, against 102 s before; the
-  rebuilds were most of the old runtime.
+  tick, which runs both phases (2.25 ms of 2.25 ms). The customers tick then
+  has nothing left to do (0.2–0.4 µs).
+- **Same cost as one side at a time:** ticking together now costs about what
+  ticking one side at a time does (2.1–2.7 ms).
+- **Wall time:** the whole run takes about 15 s, against about 100 s before;
+  the rebuilds were most of the old runtime.
+- **Other join workloads:** in this pair they reach at most 1.15×, with 14
+  of 102 cells above 1.10×. Untouched views show the same spread: at most
+  1.15×, with 17 of 66 cells above 1.10×. So single runs can't confirm or
+  refute 1.10× on this machine.
+- **Interleaved check:** two interleaved A/B rounds of the same two builds:
+  - **At 1M:** round 1 had every other join cell within 1.11× (1 of 34
+    above 1.10×). Round 2's higher ratios came from single noisy samples.
+  - **At 100k:** the two-round means are within 1.10× (2 of 36 cells at
+    1.10×). Single rounds varied by ±15% in both directions; round 1 alone
+    had 23 of 34 cells at 1.10–1.15×.
 
-### Noise and environment
+  No cell differs consistently across rounds.
 
-- **The sort view:** outside the join views, 5 of the 66 cells with ticks of
-  1 µs or more are 1.12–1.13× slower. All five are the sort view's
-  `sort_key_move` workload, in code this change did not touch. They are
-  consistent across sizes, so they may reflect machine state between the
-  runs rather than random noise; they are not explained by this change.
-- **Environment:** the same machine and toolchain as earlier sections, on
-  macOS 27.2.
-  - Before run: commit `97cd236` (before this work).
-  - After run: commit `66601ea`, plus the harness assertion change.
+### A regression found in review, and its fix
+
+An earlier after run showed the sort view's `sort_key_move` 1.12–1.13×
+slower at every size. This change caused it, not noise:
+- **The cause:** turning `row_after_update` into a wrapper around a walk
+  shared with the new `row_before_batch` slowed SortedView's key moves, a
+  codegen effect on its O(N) path.
+- **A first fix that backfired:** inlining the shared walk instead slowed the
+  join's candidate scan, by about 1.4× on customer inserts.
+- **The fix kept:** `row_after_update` keeps its original body, and
+  `row_before_batch` has its own copy of the walk. A comment in
+  `filter_changes.rs` explains why the two stay duplicated.
+- **Evidence:** interleaved at 100k, `sort_key_move` took 45–49 µs before the
+  change, 51–54 µs with the shared helper, and 45–48 µs with the fix. In the
+  back-to-back pair it is 1.00–1.07×.
+
+### Environment
+
+- **Machine and toolchain:** the same as earlier sections, on macOS 27.2.
+- **Before:** commit `97cd236`.
+- **After:** the commit that records these results.
 - **Raw output:**
   [`view_maintenance_2026-10-29-before.jsonl`](../benchmarks/view_maintenance_2026-10-29-before.jsonl)
   and
@@ -517,71 +543,71 @@ All at 1M rows. Where two values are given, they are FastReads / FastUpdates.
 
 | Workload | Rows | FastReads before | after | FastUpdates before | after |
 |---|---:|---:|---:|---:|---:|
-| value_edit | 10k | 0.25 | 0.21 | 0.21 | 0.21 |
-| value_edit | 100k | 0.21 | 0.21 | 0.25 | 0.21 |
+| value_edit | 10k | 0.25 | 0.21 | 0.21 | 0.25 |
+| value_edit | 100k | 0.25 | 0.25 | 0.25 | 0.25 |
 | value_edit | 1M | 0.25 | 0.25 | 0.25 | 0.25 |
-| middle_insert | 10k | 12.6 | 11.0 | 10.8 | 10.8 |
-| middle_insert | 100k | 96.3 | 96.4 | 96.0 | 96.1 |
-| middle_insert | 1M | 1,123 | 1,096 | 1,075 | 1,068 |
-| middle_delete | 10k | 11.6 | 10.2 | 9.67 | 9.67 |
-| middle_delete | 100k | 87.4 | 87.4 | 86.8 | 86.7 |
-| middle_delete | 1M | 1,039 | 1,008 | 991 | 979 |
-| tail_append | 10k | 2.54 | 2.21 | 2.17 | 2.12 |
-| tail_append | 100k | 10.1 | 10.2 | 10.1 | 10.2 |
-| tail_append | 1M | 89.8 | 90.1 | 89.8 | 90.3 |
-| tail_delete | 10k | 6.17 | 5.42 | 5.38 | 5.38 |
-| tail_delete | 100k | 45.3 | 45.2 | 45.2 | 45.2 |
-| tail_delete | 1M | 481 | 485 | 477 | 482 |
-| right_value_edit | 10k | 8.00 | 7.08 | 7.00 | 7.04 |
-| right_value_edit | 100k | 55.9 | 55.8 | 55.7 | 55.8 |
-| right_value_edit | 1M | 571 | 572 | 569 | 577 |
-| right_insert | 10k | 10.7 | 9.46 | 9.38 | 9.38 |
-| right_insert | 100k | 88.6 | 89.2 | 88.6 | 89.1 |
-| right_insert | 1M | 889 | 896 | 889 | 892 |
-| right_delete | 10k | 17.2 | 15.1 | 15.1 | 15.0 |
-| right_delete | 100k | 148 | 147 | 147 | 147 |
-| right_delete | 1M | 1,566 | 1,551 | 1,563 | 1,552 |
-| two_sided_both_then_tick | 10k | 722 | 21.3 | 727 | 20.1 |
-| two_sided_both_then_tick | 100k | 6,974 | 185 | 6,970 | 185 |
-| two_sided_both_then_tick | 1M | 81.8 ms | 1,988 | 82.3 ms | 1,904 |
-| two_sided_tick_each_side | 10k | 20.5 | 21.1 | 20.0 | 20.1 |
-| two_sided_tick_each_side | 100k | 185 | 185 | 185 | 185 |
-| two_sided_tick_each_side | 1M | 2,037 | 1,989 | 1,916 | 1,917 |
+| middle_insert | 10k | 11.8 | 11.8 | 10.8 | 11.5 |
+| middle_insert | 100k | 96.4 | 103 | 96.5 | 106 |
+| middle_insert | 1M | 1,262 | 1,262 | 1,186 | 1,225 |
+| middle_delete | 10k | 10.8 | 10.9 | 9.67 | 10.3 |
+| middle_delete | 100k | 87.3 | 93.1 | 87.1 | 95.8 |
+| middle_delete | 1M | 1,169 | 1,163 | 1,084 | 1,111 |
+| tail_append | 10k | 2.38 | 2.38 | 2.17 | 2.33 |
+| tail_append | 100k | 10.2 | 10.8 | 10.2 | 11.2 |
+| tail_append | 1M | 90.5 | 99.3 | 90.4 | 104 |
+| tail_delete | 10k | 5.71 | 5.75 | 5.38 | 5.75 |
+| tail_delete | 100k | 45.3 | 48.1 | 45.3 | 49.9 |
+| tail_delete | 1M | 656 | 567 | 581 | 588 |
+| right_value_edit | 10k | 7.50 | 7.50 | 7.00 | 7.50 |
+| right_value_edit | 100k | 55.8 | 59.3 | 56.0 | 61.4 |
+| right_value_edit | 1M | 650 | 657 | 642 | 673 |
+| right_insert | 10k | 10.0 | 10.0 | 9.29 | 9.96 |
+| right_insert | 100k | 94.3 | 94.8 | 88.7 | 98.0 |
+| right_insert | 1M | 893 | 986 | 890 | 1,022 |
+| right_delete | 10k | 16.1 | 16.0 | 15.1 | 16.0 |
+| right_delete | 100k | 157 | 157 | 148 | 163 |
+| right_delete | 1M | 1,865 | 1,815 | 1,784 | 1,848 |
+| two_sided_both_then_tick | 10k | 727 | 22.0 | 738 | 21.5 |
+| two_sided_both_then_tick | 100k | 7,379 | 198 | 6,999 | 204 |
+| two_sided_both_then_tick | 1M | 83.7 ms | 2,249 | 82.3 ms | 2,240 |
+| two_sided_tick_each_side | 10k | 20.5 | 21.9 | 20.1 | 21.5 |
+| two_sided_tick_each_side | 100k | 197 | 204 | 191 | 204 |
+| two_sided_tick_each_side | 1M | 2,449 | 2,340 | 2,140 | 2,263 |
 
 #### `join_chain` tick median, before → after
 
 | Workload | Rows | FastReads before | after | FastUpdates before | after |
 |---|---:|---:|---:|---:|---:|
-| value_edit | 10k | 1.58 | 1.67 | 1.67 | 1.62 |
-| value_edit | 100k | 1.67 | 1.67 | 1.71 | 1.67 |
-| value_edit | 1M | 1.71 | 1.71 | 1.71 | 1.71 |
-| middle_insert | 10k | 15.2 | 15.6 | 14.9 | 14.9 |
-| middle_insert | 100k | 122 | 123 | 122 | 122 |
-| middle_insert | 1M | 1,392 | 1,367 | 1,326 | 1,321 |
-| middle_delete | 10k | 15.7 | 16.1 | 15.6 | 15.5 |
-| middle_delete | 100k | 127 | 127 | 127 | 127 |
-| middle_delete | 1M | 1,440 | 1,425 | 1,374 | 1,368 |
-| tail_append | 10k | 3.83 | 3.96 | 3.92 | 3.88 |
-| tail_append | 100k | 12.0 | 12.0 | 12.0 | 12.0 |
-| tail_append | 1M | 91.7 | 92.0 | 91.9 | 92.3 |
-| tail_delete | 10k | 10.1 | 10.4 | 10.2 | 10.2 |
-| tail_delete | 100k | 76.8 | 76.8 | 76.8 | 76.6 |
-| tail_delete | 1M | 780 | 779 | 791 | 782 |
-| right_value_edit | 10k | 33.0 | 33.5 | 33.1 | 33.0 |
-| right_value_edit | 100k | 84.4 | 84.5 | 85.2 | 84.8 |
-| right_value_edit | 1M | 624 | 624 | 626 | 624 |
-| right_insert | 10k | 9.42 | 9.71 | 9.42 | 9.50 |
-| right_insert | 100k | 88.7 | 89.2 | 88.8 | 89.4 |
-| right_insert | 1M | 891 | 894 | 888 | 894 |
-| right_delete | 10k | 15.2 | 15.5 | 15.2 | 15.2 |
-| right_delete | 100k | 148 | 148 | 148 | 148 |
-| right_delete | 1M | 1,573 | 1,552 | 1,588 | 1,551 |
-| two_sided_both_then_tick | 10k | 9,081 | 25.4 | 9,120 | 24.5 |
-| two_sided_both_then_tick | 100k | 91.6 ms | 212 | 93.2 ms | 211 |
-| two_sided_both_then_tick | 1M | 996.7 ms | 2,256 | 976.6 ms | 2,169 |
-| two_sided_tick_each_side | 10k | 24.7 | 24.8 | 24.4 | 24.4 |
-| two_sided_tick_each_side | 100k | 211 | 212 | 211 | 211 |
-| two_sided_tick_each_side | 1M | 2,273 | 2,260 | 2,161 | 2,174 |
+| value_edit | 10k | 1.62 | 1.75 | 1.58 | 1.75 |
+| value_edit | 100k | 1.75 | 1.71 | 1.79 | 1.83 |
+| value_edit | 1M | 1.67 | 1.83 | 1.79 | 1.88 |
+| middle_insert | 10k | 15.2 | 16.2 | 15.0 | 15.9 |
+| middle_insert | 100k | 123 | 135 | 123 | 135 |
+| middle_insert | 1M | 1,636 | 1,585 | 1,543 | 1,542 |
+| middle_delete | 10k | 15.7 | 16.7 | 15.5 | 16.5 |
+| middle_delete | 100k | 127 | 140 | 127 | 140 |
+| middle_delete | 1M | 1,707 | 1,662 | 1,605 | 1,588 |
+| tail_append | 10k | 3.88 | 4.17 | 3.83 | 4.17 |
+| tail_append | 100k | 12.1 | 13.1 | 12.0 | 13.2 |
+| tail_append | 1M | 92.4 | 102 | 93.4 | 101 |
+| tail_delete | 10k | 10.2 | 10.8 | 10.1 | 10.8 |
+| tail_delete | 100k | 77.3 | 84.4 | 76.7 | 84.5 |
+| tail_delete | 1M | 942 | 942 | 953 | 927 |
+| right_value_edit | 10k | 33.0 | 34.9 | 35.2 | 35.2 |
+| right_value_edit | 100k | 85.2 | 92.9 | 85.0 | 93.3 |
+| right_value_edit | 1M | 738 | 735 | 723 | 718 |
+| right_insert | 10k | 9.42 | 10.0 | 9.38 | 10.0 |
+| right_insert | 100k | 94.6 | 98.2 | 89.2 | 98.2 |
+| right_insert | 1M | 894 | 1,023 | 894 | 1,021 |
+| right_delete | 10k | 15.2 | 16.1 | 15.2 | 16.2 |
+| right_delete | 100k | 159 | 163 | 148 | 163 |
+| right_delete | 1M | 1,849 | 1,984 | 1,879 | 1,855 |
+| two_sided_both_then_tick | 10k | 9,210 | 26.5 | 9,163 | 26.1 |
+| two_sided_both_then_tick | 100k | 93.1 ms | 233 | 95.1 ms | 233 |
+| two_sided_both_then_tick | 1M | 1,042.8 ms | 2,683 | 1,108.7 ms | 2,534 |
+| two_sided_tick_each_side | 10k | 24.8 | 26.4 | 24.4 | 26.1 |
+| two_sided_tick_each_side | 100k | 211 | 239 | 211 | 233 |
+| two_sided_tick_each_side | 1M | 2,496 | 2,672 | 2,425 | 2,548 |
 
 
 ## Method

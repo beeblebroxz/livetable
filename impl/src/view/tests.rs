@@ -4654,13 +4654,14 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
                 }
                 joined.sync();
                 let label = format!("{how:?} trial {trial} step {step}");
-                if let Some(changes) = cursor
+                // Every sync here stays under the bounds, so every sync keeps
+                // history: a silent rebuild would cost 40-500x at scale.
+                let changes = cursor
                     .and_then(|cursor| joined.changeset().and_then(|history| history.changes_from(cursor)))
-                {
-                    let mut replayed = before;
-                    replay(&mut replayed, changes, &label);
-                    assert_eq!(replayed, rows(&joined), "{label}: history replays");
-                }
+                    .unwrap_or_else(|| panic!("{label}: history kept"));
+                let mut replayed = before;
+                replay(&mut replayed, changes, &label);
+                assert_eq!(replayed, rows(&joined), "{label}: history replays");
                 let fresh = JoinView::new(
                     "f".to_string(),
                     left.clone(),

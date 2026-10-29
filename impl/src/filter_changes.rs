@@ -18,39 +18,66 @@ pub(crate) const MAX_FILTER_REPLAY_CHANGES: usize = 256;
 
 /// Recover the row immediately after one CellUpdated event. A later deletion
 /// supplies a complete row even if it no longer exists in the live parent.
+///
+/// `row_before_batch` repeats this walk on purpose. Sharing one helper slowed
+/// SortedView's key moves by about 12% (2026-10-29), and inlining that helper
+/// instead slowed JoinView's candidate scans: a codegen effect on the callers'
+/// O(N) loops. Keep the two walks identical.
 pub(crate) fn row_after_update<E>(
     changes: &[TableChange],
     change_index: usize,
-    get_row: impl FnMut(usize) -> Result<Row, E>,
+    mut get_row: impl FnMut(usize) -> Result<Row, E>,
 ) -> Result<Row, E> {
-    replay_row(
-        &changes[change_index + 1..],
-        changes[change_index].row_index(),
-        get_row,
-    )
+    let mut index = changes[change_index].row_index();
+    let mut undo = Vec::new();
+    let mut deleted = None;
+    for change in &changes[change_index + 1..] {
+        match change {
+            TableChange::RowInserted {
+                index: inserted, ..
+            } if *inserted <= index => index += 1,
+            TableChange::RowDeleted {
+                index: removed,
+                data,
+            } if *removed == index => {
+                deleted = Some(data.clone());
+                break;
+            }
+            TableChange::RowDeleted { index: removed, .. } if *removed < index => index -= 1,
+            TableChange::CellUpdated {
+                row,
+                column,
+                old_value,
+                ..
+            } if *row == index => {
+                undo.push((column, old_value));
+            }
+            _ => {}
+        }
+    }
+    let mut row = match deleted {
+        Some(row) => row,
+        None => get_row(index)?,
+    };
+    for (column, value) in undo.into_iter().rev() {
+        row.insert(column.clone(), value.clone());
+    }
+    Ok(row)
 }
 
 /// Recover row `index` of the frame before `changes` were applied, from the
-/// live parent after them.
+/// live parent after them: follow the row through every change (a deletion
+/// supplies its payload, otherwise the live row at its final position is
+/// read), then undo every value change made to it, so the earliest old value
+/// wins. The same walk as `row_after_update`, started before the batch.
 pub(crate) fn row_before_batch<E>(
     changes: &[TableChange],
-    index: usize,
-    get_row: impl FnMut(usize) -> Result<Row, E>,
-) -> Result<Row, E> {
-    replay_row(changes, index, get_row)
-}
-
-/// Follow the row at `index` through `later` changes: a deletion supplies its
-/// payload, otherwise the live row at its final position is read. Then undo
-/// every value change made to it, so the earliest old value wins.
-fn replay_row<E>(
-    later: &[TableChange],
     mut index: usize,
     mut get_row: impl FnMut(usize) -> Result<Row, E>,
 ) -> Result<Row, E> {
     let mut undo = Vec::new();
     let mut deleted = None;
-    for change in later {
+    for change in changes {
         match change {
             TableChange::RowInserted {
                 index: inserted, ..

@@ -191,10 +191,10 @@ pub struct JoinView {
     /// The latest incremental batch in JOIN coordinates (join_index
     /// positions). Rebuilds and oversized batches invalidate it.
     output_changes: Changeset,
-    /// Each parent row's `key_hash`, by position, once first needed. Read only
-    /// to find matches while that side has no structural changes in the sync
-    /// (the frame-mixing guard rebuilds when both do), so its live rows are
-    /// the view's. Maintained by that side's structural events; rebuilds drop it.
+    /// Each parent row's `key_hash`, by position, once first needed, in the
+    /// frame the join has applied for that side (see `matching_rows`). Read
+    /// only to find matches. Maintained by that side's structural events;
+    /// rebuilds drop it.
     left_key_hashes: Option<Vec<u64>>,
     right_key_hashes: Option<Vec<u64>>,
     /// Parent row counts as of the last applied event.
@@ -926,8 +926,10 @@ impl JoinView {
         Ok(())
     }
 
-    /// Apply the left parent's batch in order, recording output events. The
-    /// right side has no structural changes, so it is read live.
+    /// Apply the left parent's batch in order, recording output events. Right
+    /// reads go through `right_row` and `matching_rows`: live when the right
+    /// has no structural changes, pre-batch during phase 1 of a two-sided
+    /// sync.
     fn apply_left_changes(
         &mut self,
         changes: &[TableChange],
@@ -1269,9 +1271,10 @@ impl JoinView {
     /// history. Returns true if the output changed (rows moved or any value
     /// changed).
     ///
-    /// Single-side batches (all structural changes on one parent) are handled
-    /// incrementally. Batches that mix reference frames fall back to a full
-    /// rebuild — see the guard below for the two cases.
+    /// Batches with structural changes on one side apply incrementally, the
+    /// value-only side first. Batches with structural changes on both sides
+    /// apply as a delta join in two phases, and rebuild only above 256 events
+    /// on a side. Unreadable rows and out-of-range indices also rebuild.
     pub fn sync(&mut self) -> bool {
         let left_table = self.left_table.borrow();
         let right_table = self.right_table.borrow();

@@ -168,8 +168,8 @@ fn assert_replays(trial: u64, step: usize, captured: Replayed) {
 }
 
 /// Replay history when the batch kept it and report whether it did. Rebuilds
-/// (both join parents changed structure, or a key update preceded a shift)
-/// invalidate it instead.
+/// (for example a sort or filter batch over its replay bound) invalidate it
+/// instead.
 fn replay_unless_invalidated(
     label: &str,
     trial: u64,
@@ -1093,7 +1093,8 @@ fn differential_join_batched_fuzz() {
                 if replay_unless_invalidated(&format!("join_batched:{jt_name}"), trial, step, before, cursor, &joined) {
                     kept += 1;
                 }
-                // Both view parents can change structure in one batch, which rebuilds.
+                // Both view parents can change structure in one batch: the
+                // two-phase sync.
                 sync_view_parent_join(&lf, &rs, &mut view_joined);
                 if replay_unless_invalidated(
                     &format!("view_join_batched:{jt_name}"),
@@ -1128,15 +1129,15 @@ fn differential_join_batched_fuzz() {
             }
         }
         // An implementation that always invalidated would pass the replay
-        // check. Since two-sided syncs became incremental (2026-10-29) both
-        // joins keep history in every batch here (3600/3600); the floors are
-        // half that.
+        // check. Since two-sided syncs became incremental (2026-10-29) every
+        // batch here stays under the bounds, so every batch must keep history:
+        // a silent rebuild would cost 40-500x at scale.
         assert!(
-            kept * 2 >= steps,
+            kept == steps,
             "[join_batched:{jt_name}] history kept in only {kept}/{steps} batches"
         );
         assert!(
-            view_kept * 2 >= steps,
+            view_kept == steps,
             "[view_join_batched:{jt_name}] history kept in only {view_kept}/{steps} batches"
         );
     }
