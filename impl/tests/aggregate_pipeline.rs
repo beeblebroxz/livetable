@@ -455,7 +455,11 @@ fn removing_an_extreme_reads_no_parent_rows() {
         counted.borrow_mut().inner.delete_row(1).unwrap(); // West's max, 30
     });
     assert!(changes.contains(&update(0, "top", Float64(30.0), Float64(25.0))));
-    assert_eq!(counted.borrow().reads.get(), 0, "deleting the max read source rows");
+    assert_eq!(
+        counted.borrow().reads.get(),
+        0,
+        "deleting the max read source rows"
+    );
 
     let changes = sync_replayed(&mut view, || {
         counted
@@ -465,7 +469,11 @@ fn removing_an_extreme_reads_no_parent_rows() {
             .unwrap();
     });
     assert!(changes.contains(&update(0, "top", Float64(25.0), Float64(10.0))));
-    assert_eq!(counted.borrow().reads.get(), 0, "editing the max read source rows");
+    assert_eq!(
+        counted.borrow().reads.get(),
+        0,
+        "editing the max read source rows"
+    );
 }
 
 #[test]
@@ -526,10 +534,22 @@ fn signed_zero_extremes_are_deterministic() {
                 .unwrap();
             view.sync();
         }
-        assert_eq!(bits(&view, "lo"), (-0.0f64).to_bits(), "{zeros:?} incremental MIN");
-        assert_eq!(bits(&view, "hi"), 0.0f64.to_bits(), "{zeros:?} incremental MAX");
+        assert_eq!(
+            bits(&view, "lo"),
+            (-0.0f64).to_bits(),
+            "{zeros:?} incremental MIN"
+        );
+        assert_eq!(
+            bits(&view, "hi"),
+            0.0f64.to_bits(),
+            "{zeros:?} incremental MAX"
+        );
         view.refresh();
-        assert_eq!(bits(&view, "lo"), (-0.0f64).to_bits(), "{zeros:?} rebuilt MIN");
+        assert_eq!(
+            bits(&view, "lo"),
+            (-0.0f64).to_bits(),
+            "{zeros:?} rebuilt MIN"
+        );
         assert_eq!(bits(&view, "hi"), 0.0f64.to_bits(), "{zeros:?} rebuilt MAX");
     }
 }
@@ -580,16 +600,43 @@ fn out_of_range_events_rebuild_instead_of_panicking() {
     let rebuilds: Vec<(&str, Vec<TableChange>)> = vec![
         ("delete at len", vec![deleted(2)]),
         ("insert past len", vec![inserted(3)]),
-        ("aggregated update at len", vec![update(2, "amount", ColumnValue::Int32(10), ColumnValue::Int32(11))]),
-        ("other update at len", vec![update(2, "note", ColumnValue::Int32(0), ColumnValue::Int32(1))]),
+        (
+            "aggregated update at len",
+            vec![update(
+                2,
+                "amount",
+                ColumnValue::Int32(10),
+                ColumnValue::Int32(11),
+            )],
+        ),
+        (
+            "other update at len",
+            vec![update(
+                2,
+                "note",
+                ColumnValue::Int32(0),
+                ColumnValue::Int32(1),
+            )],
+        ),
         (
             "key update at len",
-            vec![update(2, "region", ColumnValue::String("West".into()), ColumnValue::String("East".into()))],
+            vec![update(
+                2,
+                "region",
+                ColumnValue::String("West".into()),
+                ColumnValue::String("East".into()),
+            )],
         ),
-        ("second delete past the shrunk len", vec![deleted(0), deleted(1)]),
+        (
+            "second delete past the shrunk len",
+            vec![deleted(0), deleted(1)],
+        ),
         (
             "update past the shrunk len",
-            vec![deleted(0), update(1, "amount", ColumnValue::Int32(20), ColumnValue::Int32(21))],
+            vec![
+                deleted(0),
+                update(1, "amount", ColumnValue::Int32(20), ColumnValue::Int32(21)),
+            ],
         ),
     ];
     let keeps: Vec<(&str, Vec<TableChange>)> = vec![
@@ -617,10 +664,18 @@ fn out_of_range_events_rebuild_instead_of_panicking() {
             parent.version += 1;
         }
         view.sync();
-        let kept = view.changeset().expect("synced").changes_from(cursor).is_some();
+        let kept = view
+            .changeset()
+            .expect("synced")
+            .changes_from(cursor)
+            .is_some();
         assert_eq!(kept, !rebuild, "{label}: kept history = {kept}");
         if rebuild {
-            assert_eq!(snapshot(&view), snapshot(&by_region(parent.clone())), "{label}");
+            assert_eq!(
+                snapshot(&view),
+                snapshot(&by_region(parent.clone())),
+                "{label}"
+            );
         }
     }
 }
@@ -669,24 +724,50 @@ fn signed_zero_median_matches_a_rebuild() {
     };
     let incremental = bits(&view);
     view.refresh();
-    assert_eq!(incremental, bits(&view), "incremental median differs from a rebuild");
+    assert_eq!(
+        incremental,
+        bits(&view),
+        "incremental median differs from a rebuild"
+    );
     assert_eq!(incremental, 0.0f64.to_bits());
 }
 
 #[test]
 fn a_build_orders_values_that_arrive_out_of_order() {
-    let median = || ("mid".to_string(), "amount".to_string(), AggregateFunction::Median);
+    let median = || {
+        (
+            "mid".to_string(),
+            "amount".to_string(),
+            AggregateFunction::Median,
+        )
+    };
     // A String key, an Int32 key over one source column, and an Int32 key
     // over several each take their own build loop.
     for (group_by, aggregations) in [
         ("region", vec![median()]),
         ("note", vec![median()]),
-        ("note", vec![median(), ("notes".into(), "note".into(), AggregateFunction::Sum)]),
+        (
+            "note",
+            vec![
+                median(),
+                ("notes".into(), "note".into(), AggregateFunction::Sum),
+            ],
+        ),
     ] {
-        let table = orders(&[("West", 5), ("West", 1), ("West", 4), ("West", 2), ("West", 3)]);
-        let mut view =
-            AggregateView::new("medians".into(), table.clone(), vec![group_by.into()], aggregations)
-                .unwrap();
+        let table = orders(&[
+            ("West", 5),
+            ("West", 1),
+            ("West", 4),
+            ("West", 2),
+            ("West", 3),
+        ]);
+        let mut view = AggregateView::new(
+            "medians".into(),
+            table.clone(),
+            vec![group_by.into()],
+            aggregations,
+        )
+        .unwrap();
         let mid = |view: &AggregateView| view.get_row(0).unwrap()["mid"].clone();
         assert_eq!(mid(&view), Float64(3.0), "build grouped by {group_by}");
         // Incremental syncs insert and remove in the order the build left.
@@ -717,7 +798,11 @@ fn a_build_orders_signed_zeros_for_later_removals() {
         let negative = zeros.iter().position(|z| z.is_sign_negative()).unwrap();
         table.borrow_mut().delete_row(negative).unwrap();
         view.sync();
-        assert_eq!(view.get_row(0).unwrap()["mid"], Float64(0.5), "built from {zeros:?}");
+        assert_eq!(
+            view.get_row(0).unwrap()["mid"],
+            Float64(0.5),
+            "built from {zeros:?}"
+        );
     }
 }
 
@@ -748,7 +833,11 @@ fn removing_a_minimum_reads_no_parent_rows() {
         counted.borrow_mut().inner.delete_row(0).unwrap(); // West's min, 10
     });
     assert!(changes.contains(&update(0, "low", Float64(10.0), Float64(25.0))));
-    assert_eq!(counted.borrow().reads.get(), 0, "deleting the min read source rows");
+    assert_eq!(
+        counted.borrow().reads.get(),
+        0,
+        "deleting the min read source rows"
+    );
 
     let changes = sync_replayed(&mut view, || {
         counted
@@ -758,7 +847,11 @@ fn removing_a_minimum_reads_no_parent_rows() {
             .unwrap();
     });
     assert!(changes.contains(&update(0, "low", Float64(25.0), Float64(30.0))));
-    assert_eq!(counted.borrow().reads.get(), 0, "editing the min read source rows");
+    assert_eq!(
+        counted.borrow().reads.get(),
+        0,
+        "editing the min read source rows"
+    );
 }
 
 #[test]

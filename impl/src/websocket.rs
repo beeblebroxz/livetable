@@ -248,16 +248,28 @@ impl Handler<LabCommand> for TableEngineActor {
                         self.broadcast_base("lab", snapshot);
                     }
                 } else {
-                    for update in flat { self.broadcast_base("lab", update); }
+                    for update in flat {
+                        self.broadcast_base("lab", update);
+                    }
                 }
                 self.propagate_views("lab");
-                Self::send(&message.requester, ServerMessage::LabComplete {
-                    request_id: message.request_id, rows, step, mutations,
-                });
+                Self::send(
+                    &message.requester,
+                    ServerMessage::LabComplete {
+                        request_id: message.request_id,
+                        rows,
+                        step,
+                        mutations,
+                    },
+                );
             }
-            Err(error) => Self::send(&message.requester, ServerMessage::LabError {
-                request_id: message.request_id, message: error,
-            }),
+            Err(error) => Self::send(
+                &message.requester,
+                ServerMessage::LabError {
+                    request_id: message.request_id,
+                    message: error,
+                },
+            ),
         }
     }
 }
@@ -417,7 +429,11 @@ impl TableWebSocket {
         let requester = ctx.address().recipient();
         match message {
             ClientMessage::LabCommand { request_id, action } => {
-                self.state.engine.do_send(LabCommand { request_id, action, requester });
+                self.state.engine.do_send(LabCommand {
+                    request_id,
+                    action,
+                    requester,
+                });
             }
             ClientMessage::Subscribe { table_name } => {
                 self.state.engine.do_send(SubscribeBase {

@@ -2,7 +2,9 @@
 
 use crate::changeset::{Changeset, IncrementalView, TableChange};
 use crate::column::{ColumnType, ColumnValue};
-use crate::filter_changes::{apply_filter_changes, prepare_filter_changes, MAX_FILTER_REPLAY_CHANGES};
+use crate::filter_changes::{
+    apply_filter_changes, prepare_filter_changes, MAX_FILTER_REPLAY_CHANGES,
+};
 use crate::readable::ReadableTable;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -173,7 +175,9 @@ impl FilterView {
     }
 
     pub(crate) fn root_changeset_cursor(&self) -> usize {
-        self.parent.borrow().root_changeset_cursor(self.last_processed_change_count)
+        self.parent
+            .borrow()
+            .root_changeset_cursor(self.last_processed_change_count)
     }
 }
 
@@ -194,9 +198,9 @@ impl IncrementalView for FilterView {
         );
         drop(parent);
         match prepared {
-            Ok(prepared) => apply_filter_changes(
-                &mut self.view_to_parent, &mut self.output_changes, prepared,
-            ),
+            Ok(prepared) => {
+                apply_filter_changes(&mut self.view_to_parent, &mut self.output_changes, prepared)
+            }
             Err(_) => {
                 self.rebuild_index();
                 true
@@ -258,7 +262,6 @@ impl ReadableTable for FilterView {
     fn changeset(&self) -> Option<&Changeset> {
         // A child built while this filter is stale has no coherent delta
         // baseline. It must refresh once we synchronize the parent.
-        (self.parent.borrow().version() == self.last_parent_version)
-            .then_some(&self.output_changes)
+        (self.parent.borrow().version() == self.last_parent_version).then_some(&self.output_changes)
     }
 }

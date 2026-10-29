@@ -20,9 +20,9 @@ use crate::table::{Schema, Table};
 use crate::view::TickableTable;
 
 mod delivery;
-mod lab;
 #[cfg(test)]
 mod delivery_tests;
+mod lab;
 use delivery::DeliveryState;
 
 pub type ConnId = u64;

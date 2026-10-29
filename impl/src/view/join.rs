@@ -40,7 +40,11 @@ fn key_hash(key: Option<&JoinKey>) -> u64 {
     };
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
-    let hash = if cfg!(test) { hasher.finish() & 0b11 } else { hasher.finish() };
+    let hash = if cfg!(test) {
+        hasher.finish() & 0b11
+    } else {
+        hasher.finish()
+    };
     if hash == NO_KEY {
         NO_KEY - 1
     } else {
@@ -499,7 +503,10 @@ impl JoinView {
                         built.remove(*index);
                     }
                     TableChange::RowDeleted { index, data } => {
-                        built.insert(*index, key_hash(Self::build_composite_key(data, keys).as_ref()));
+                        built.insert(
+                            *index,
+                            key_hash(Self::build_composite_key(data, keys).as_ref()),
+                        );
                     }
                     TableChange::CellUpdated {
                         row,
@@ -812,7 +819,8 @@ impl JoinView {
                     for &r in rights {
                         // The orphan tail is sorted by right row.
                         let pos = self.find_orphan_insert_position(r);
-                        let orphan = (self.join_index.get(pos) == Some(&(None, Some(r)))).then_some(pos);
+                        let orphan =
+                            (self.join_index.get(pos) == Some(&(None, Some(r)))).then_some(pos);
                         if let Some(pos) = orphan {
                             out.record(|| {
                                 Ok(TableChange::RowDeleted {
@@ -1252,8 +1260,12 @@ impl JoinView {
 
     pub(crate) fn root_changeset_cursors(&self) -> (usize, usize) {
         (
-            self.left_table.borrow().root_changeset_cursor(self.left_last_processed_change_count),
-            self.right_table.borrow().root_changeset_cursor(self.right_last_processed_change_count),
+            self.left_table
+                .borrow()
+                .root_changeset_cursor(self.left_last_processed_change_count),
+            self.right_table
+                .borrow()
+                .root_changeset_cursor(self.right_last_processed_change_count),
         )
     }
 

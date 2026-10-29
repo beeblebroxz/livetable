@@ -329,8 +329,7 @@ impl PyFilterViewInner {
 /// does), so no GIL is needed here.
 impl crate::readable::ReadableTable for PyFilterViewInner {
     fn changeset(&self) -> Option<&crate::changeset::Changeset> {
-        (self.parent.borrow().version() == self.last_parent_version)
-            .then_some(&self.output_changes)
+        (self.parent.borrow().version() == self.last_parent_version).then_some(&self.output_changes)
     }
 
     fn len(&self) -> usize {
@@ -379,8 +378,7 @@ impl crate::readable::ReadableTable for PyFilterViewInner {
     }
 
     fn version(&self) -> u64 {
-        self.sync_count
-            .wrapping_add(self.parent.borrow().version())
+        self.sync_count.wrapping_add(self.parent.borrow().version())
     }
 }
 
@@ -1659,7 +1657,11 @@ impl PyFilterView {
         let parent: Rc<RefCell<dyn crate::readable::ReadableTable>> = self.inner.clone();
         let view = RustSortedView::new(name, parent, sort_keys).map_err(PyValueError::new_err)?;
         let inner = Rc::new(RefCell::new(view));
-        register_on_roots(&self.roots, &RegisteredView::Sorted(Rc::downgrade(&inner)), |_| false);
+        register_on_roots(
+            &self.roots,
+            &RegisteredView::Sorted(Rc::downgrade(&inner)),
+            |_| false,
+        );
         Ok(PySortedView {
             inner,
             roots: self.roots.clone(),
@@ -1682,7 +1684,11 @@ impl PyFilterView {
             .map_err(PyValueError::new_err)?;
         let inner = Rc::new(RefCell::new(view));
 
-        register_on_roots(&self.roots, &RegisteredView::Aggregate(Rc::downgrade(&inner)), |_| false);
+        register_on_roots(
+            &self.roots,
+            &RegisteredView::Aggregate(Rc::downgrade(&inner)),
+            |_| false,
+        );
 
         Ok(PyAggregateView { inner })
     }
@@ -2192,7 +2198,11 @@ impl PyJoinView {
         let name = self.inner.borrow().name().to_string();
         let view = PyFilterView::over(parent, name, self.roots(), predicate)?;
         self.ensure_registered();
-        register_on_roots(&view.roots, &RegisteredView::Filter(Rc::downgrade(&view.inner)), |_| false);
+        register_on_roots(
+            &view.roots,
+            &RegisteredView::Filter(Rc::downgrade(&view.inner)),
+            |_| false,
+        );
         Ok(view)
     }
 
@@ -2210,7 +2220,11 @@ impl PyJoinView {
         let inner = Rc::new(RefCell::new(view));
         self.ensure_registered();
         let roots = self.roots();
-        register_on_roots(&roots, &RegisteredView::Sorted(Rc::downgrade(&inner)), |_| false);
+        register_on_roots(
+            &roots,
+            &RegisteredView::Sorted(Rc::downgrade(&inner)),
+            |_| false,
+        );
         Ok(PySortedView { inner, roots })
     }
 
@@ -2227,7 +2241,11 @@ impl PyJoinView {
             .map_err(PyValueError::new_err)?;
         let inner = Rc::new(RefCell::new(view));
         self.ensure_registered();
-        register_on_roots(&self.roots(), &RegisteredView::Aggregate(Rc::downgrade(&inner)), |_| false);
+        register_on_roots(
+            &self.roots(),
+            &RegisteredView::Aggregate(Rc::downgrade(&inner)),
+            |_| false,
+        );
         Ok(PyAggregateView { inner })
     }
 
@@ -2260,14 +2278,18 @@ impl PyJoinView {
     /// the first time a view is chained on it.
     fn ensure_registered(&self) {
         let join = Rc::downgrade(&self.inner);
-        let left = |view: &RegisteredView| {
-            matches!(view, RegisteredView::JoinLeft(existing) if existing.ptr_eq(&join))
-        };
-        register_on_roots(std::slice::from_ref(&self.left), &RegisteredView::JoinLeft(join.clone()), left);
-        let right = |view: &RegisteredView| {
-            matches!(view, RegisteredView::JoinRight(existing) if existing.ptr_eq(&join))
-        };
-        register_on_roots(std::slice::from_ref(&self.right), &RegisteredView::JoinRight(join.clone()), right);
+        let left = |view: &RegisteredView| matches!(view, RegisteredView::JoinLeft(existing) if existing.ptr_eq(&join));
+        register_on_roots(
+            std::slice::from_ref(&self.left),
+            &RegisteredView::JoinLeft(join.clone()),
+            left,
+        );
+        let right = |view: &RegisteredView| matches!(view, RegisteredView::JoinRight(existing) if existing.ptr_eq(&join));
+        register_on_roots(
+            std::slice::from_ref(&self.right),
+            &RegisteredView::JoinRight(join.clone()),
+            right,
+        );
     }
 }
 
@@ -2507,11 +2529,17 @@ impl PySortedView {
             .map_err(PyValueError::new_err)?;
         let inner = Rc::new(RefCell::new(view));
         let sorted = Rc::downgrade(&self.inner);
-        let registered = |view: &RegisteredView| {
-            matches!(view, RegisteredView::Sorted(existing) if existing.ptr_eq(&sorted))
-        };
-        register_on_roots(&self.roots, &RegisteredView::Sorted(sorted.clone()), registered);
-        register_on_roots(&self.roots, &RegisteredView::Aggregate(Rc::downgrade(&inner)), |_| false);
+        let registered = |view: &RegisteredView| matches!(view, RegisteredView::Sorted(existing) if existing.ptr_eq(&sorted));
+        register_on_roots(
+            &self.roots,
+            &RegisteredView::Sorted(sorted.clone()),
+            registered,
+        );
+        register_on_roots(
+            &self.roots,
+            &RegisteredView::Aggregate(Rc::downgrade(&inner)),
+            |_| false,
+        );
         Ok(PyAggregateView { inner })
     }
 

@@ -10,7 +10,7 @@ use std::rc::Rc;
 #[test]
 fn test_column_agg_state_percentile() {
     let mut state = ColumnAggState::new(true, false); // needs_sorted = true
-                                               // Values: 10, 20, 30, 40, 50
+                                                      // Values: 10, 20, 30, 40, 50
     for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
         state.add_value(v);
     }
@@ -3875,8 +3875,15 @@ fn test_join_signed_zero_keys_match() {
         table
     }
     let join = |left: &Rc<RefCell<Table>>, right: &Rc<RefCell<Table>>, how: JoinType| {
-        JoinView::new("j".to_string(), left.clone(), right.clone(), "k".to_string(), "k".to_string(), how)
-            .unwrap()
+        JoinView::new(
+            "j".to_string(),
+            left.clone(),
+            right.clone(),
+            "k".to_string(),
+            "k".to_string(),
+            how,
+        )
+        .unwrap()
     };
     let f64_left = keyed(
         "L",
@@ -3908,8 +3915,16 @@ fn test_join_signed_zero_keys_match() {
     let full = join(&f64_left, &f64_right, JoinType::Full);
     assert_eq!(full.len(), 4);
 
-    let f32_left = keyed("L32", ColumnType::Float32, &[(ColumnValue::Float32(-0.0), "L")]);
-    let f32_right = keyed("R32", ColumnType::Float32, &[(ColumnValue::Float32(0.0), "R")]);
+    let f32_left = keyed(
+        "L32",
+        ColumnType::Float32,
+        &[(ColumnValue::Float32(-0.0), "L")],
+    );
+    let f32_right = keyed(
+        "R32",
+        ColumnType::Float32,
+        &[(ColumnValue::Float32(0.0), "R")],
+    );
     assert_eq!(join(&f32_left, &f32_right, JoinType::Inner).len(), 1);
 
     // A float part of a composite key folds too.
@@ -3940,7 +3955,10 @@ fn test_join_signed_zero_keys_match() {
     )
     .unwrap();
     assert_eq!(composite.len(), 1);
-    assert_eq!(composite.get_row(0).unwrap()["right_tag"], ColumnValue::Int32(7));
+    assert_eq!(
+        composite.get_row(0).unwrap()["right_tag"],
+        ColumnValue::Int32(7)
+    );
 }
 
 // === Regression coverage for hot-path optimizations in JoinView left-insert ===
@@ -4601,7 +4619,12 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
             }
         }
     }
-    for how in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full] {
+    for how in [
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+    ] {
         for trial in 0..30u64 {
             let mut rng = Lcg(0x5EED_1234_ABCD_0001 ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             // Every third trial is a self-join: one table as both parents.
@@ -4627,7 +4650,13 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
                 for _ in 0..ops {
                     let side = if rng.below(2) == 0 { &left } else { &right };
                     let len = side.borrow().len();
-                    let op = if len == 0 { 0 } else if len >= 16 { 1 } else { rng.below(4) };
+                    let op = if len == 0 {
+                        0
+                    } else if len >= 16 {
+                        1
+                    } else {
+                        rng.below(4)
+                    };
                     let mut t = side.borrow_mut();
                     match op {
                         0 => {
@@ -4648,7 +4677,8 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
                         }
                         _ => {
                             next_id += 1;
-                            t.set_value(rng.below(len), "id", ColumnValue::Int64(next_id)).unwrap();
+                            t.set_value(rng.below(len), "id", ColumnValue::Int64(next_id))
+                                .unwrap();
                         }
                     }
                 }
@@ -4657,7 +4687,11 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
                 // Every sync here stays under the bounds, so every sync keeps
                 // history: a silent rebuild would cost 40-500x at scale.
                 let changes = cursor
-                    .and_then(|cursor| joined.changeset().and_then(|history| history.changes_from(cursor)))
+                    .and_then(|cursor| {
+                        joined
+                            .changeset()
+                            .and_then(|history| history.changes_from(cursor))
+                    })
                     .unwrap_or_else(|| panic!("{label}: history kept"));
                 let mut replayed = before;
                 replay(&mut replayed, changes, &label);

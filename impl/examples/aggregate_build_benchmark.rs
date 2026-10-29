@@ -28,8 +28,14 @@ fn orders(rows: usize, groups: usize) -> Rc<RefCell<Table>> {
     for i in 0..rows {
         table
             .append_row(HashMap::from([
-                ("region".into(), ColumnValue::String(format!("r{}", i % groups))),
-                ("amount".into(), ColumnValue::Float64(((i * 7919) % 100_000) as f64)),
+                (
+                    "region".into(),
+                    ColumnValue::String(format!("r{}", i % groups)),
+                ),
+                (
+                    "amount".into(),
+                    ColumnValue::Float64(((i * 7919) % 100_000) as f64),
+                ),
             ]))
             .unwrap();
     }
@@ -47,9 +53,18 @@ fn main() {
         !cfg!(debug_assertions),
         "debug builds give meaningless timings: run with --release"
     );
-    for (rows, groups) in [(10_000, 8), (100_000, 8), (1_000_000, 8), (100_000, 1), (300_000, 1)] {
+    for (rows, groups) in [
+        (10_000, 8),
+        (100_000, 8),
+        (1_000_000, 8),
+        (100_000, 1),
+        (300_000, 1),
+    ] {
         let table = orders(rows, groups);
-        for (name, func) in [("sum", AggregateFunction::Sum), ("median", AggregateFunction::Median)] {
+        for (name, func) in [
+            ("sum", AggregateFunction::Sum),
+            ("median", AggregateFunction::Median),
+        ] {
             eprintln!("{rows} {groups} {name}");
             let build = || {
                 AggregateView::new(

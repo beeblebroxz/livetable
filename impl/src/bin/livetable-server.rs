@@ -20,7 +20,10 @@ async fn main() -> std::io::Result<()> {
     if std::env::args().any(|arg| arg == "--lab") {
         // Reset/load controls are explicitly local-only and opt-in.
         if !["127.0.0.1", "::1", "localhost"].contains(&host.as_str()) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--lab requires a loopback HOST"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--lab requires a loopback HOST",
+            ));
         }
         let mut engine = livetable::engine::TableEngine::new();
         engine.enable_lab().map_err(std::io::Error::other)?;

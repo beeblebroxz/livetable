@@ -24,7 +24,10 @@ fn order(id: i64, rank: i64, cust: i32, amount: f64) -> Row {
         ("id".into(), ColumnValue::Int64(id)),
         ("rank".into(), ColumnValue::Int64(rank)),
         ("cust".into(), ColumnValue::Int32(cust)),
-        ("region".into(), ColumnValue::String(format!("region{}", id % 8))),
+        (
+            "region".into(),
+            ColumnValue::String(format!("region{}", id % 8)),
+        ),
         ("amount".into(), ColumnValue::Float64(amount)),
     ])
 }
@@ -70,7 +73,9 @@ fn customers(m: usize, hint: StorageHint) -> Rc<RefCell<Table>> {
         hint,
     );
     for i in 0..m {
-        table.append_row(customer(i as i32, format!("c{i}"))).unwrap();
+        table
+            .append_row(customer(i as i32, format!("c{i}")))
+            .unwrap();
     }
     table.clear_changeset();
     Rc::new(RefCell::new(table))
@@ -113,7 +118,13 @@ struct Pipeline {
 impl Pipeline {
     fn new(orders: Rc<RefCell<Table>>) -> Self {
         let orders_tick = TickableTable::new(orders.clone());
-        Pipeline { orders, orders_tick, customers: None, join: None, views: Vec::new() }
+        Pipeline {
+            orders,
+            orders_tick,
+            customers: None,
+            join: None,
+            views: Vec::new(),
+        }
     }
 
     fn keep(&mut self, name: &'static str, view: SharedView) {
@@ -148,13 +159,22 @@ fn build(view: &'static str, n: usize, hint: StorageHint) -> Pipeline {
     match view {
         "none" => {}
         "filter" => {
-            let filter = Rc::new(RefCell::new(FilterView::new("f".into(), p.orders.clone(), passes)));
+            let filter = Rc::new(RefCell::new(FilterView::new(
+                "f".into(),
+                p.orders.clone(),
+                passes,
+            )));
             p.orders_tick.register_filter(&filter);
             p.keep("filter", filter);
         }
         "sort" => {
             let sorted = Rc::new(RefCell::new(
-                SortedView::new("s".into(), p.orders.clone(), vec![SortKey::ascending("rank")]).unwrap(),
+                SortedView::new(
+                    "s".into(),
+                    p.orders.clone(),
+                    vec![SortKey::ascending("rank")],
+                )
+                .unwrap(),
             ));
             p.orders_tick.register_sorted(&sorted);
             p.keep("sort", sorted);
@@ -192,7 +212,11 @@ fn build(view: &'static str, n: usize, hint: StorageHint) -> Pipeline {
             if view == "join_chain" {
                 // Children of a join register on both roots, as Python's
                 // chaining does, so a tick on either side updates them.
-                let filter = Rc::new(RefCell::new(FilterView::new("jf".into(), join.clone(), passes)));
+                let filter = Rc::new(RefCell::new(FilterView::new(
+                    "jf".into(),
+                    join.clone(),
+                    passes,
+                )));
                 let totals = Rc::new(RefCell::new(
                     AggregateView::new(
                         "jg".into(),
@@ -230,7 +254,10 @@ fn warm_join(p: &Pipeline, n: usize) {
     p.tick(Side::Orders);
     p.orders.borrow_mut().delete_row(n).unwrap();
     p.tick(Side::Orders);
-    customers.borrow_mut().append_row(customer(m as i32, "warm".into())).unwrap();
+    customers
+        .borrow_mut()
+        .append_row(customer(m as i32, "warm".into()))
+        .unwrap();
     p.tick(Side::Customers);
     customers.borrow_mut().delete_row(m).unwrap();
     p.tick(Side::Customers);
@@ -253,7 +280,10 @@ fn round3(us: f64) -> f64 {
 /// Median and nearest-rank p95 of the measured samples.
 fn stats(mut values: Vec<f64>) -> (f64, f64) {
     values.sort_by(f64::total_cmp);
-    (values[values.len() / 2], values[(values.len() * 95).div_ceil(100) - 1])
+    (
+        values[values.len() / 2],
+        values[(values.len() * 95).div_ceil(100) - 1],
+    )
 }
 
 fn report(rows: usize, hint: StorageHint, view: &str, workload: &str, samples: &[Sample]) {
@@ -282,7 +312,12 @@ fn timed(p: &Pipeline, side: Side, mutate: &dyn Fn()) -> Sample {
     let cursors: Vec<usize> = p
         .views
         .iter()
-        .map(|(_, view, _)| view.borrow().changeset().expect("synced view exposes history").total_len())
+        .map(|(_, view, _)| {
+            view.borrow()
+                .changeset()
+                .expect("synced view exposes history")
+                .total_len()
+        })
         .collect();
     let start = Instant::now();
     mutate();
@@ -292,10 +327,19 @@ fn timed(p: &Pipeline, side: Side, mutate: &dyn Fn()) -> Sample {
     let tick_us = micros(start);
     black_box(p.views.first().map(|(_, view, _)| view.borrow().len()));
     for ((name, view, _), cursor) in p.views.iter().zip(cursors) {
-        let kept = view.borrow().changeset().expect("synced view exposes history").changes_from(cursor).is_some();
+        let kept = view
+            .borrow()
+            .changeset()
+            .expect("synced view exposes history")
+            .changes_from(cursor)
+            .is_some();
         assert!(kept, "{name} rebuilt instead of syncing incrementally");
     }
-    Sample { mutate_us, tick_us, tick_parts: None }
+    Sample {
+        mutate_us,
+        tick_us,
+        tick_parts: None,
+    }
 }
 
 /// One step of a two-step workload. `workload: None` marks an untimed step
@@ -330,13 +374,26 @@ fn left_workloads(ctx: &Ctx, p: &Pipeline) {
     let cust = (mid % (n / 10)) as i32;
     let orders = &p.orders;
     let set = |row: usize, column: &'static str, value: ColumnValue| {
-        move || orders.borrow_mut().set_value(row, column, value.clone()).unwrap()
+        move || {
+            orders
+                .borrow_mut()
+                .set_value(row, column, value.clone())
+                .unwrap()
+        }
     };
     run_pair(
         ctx,
         p,
-        Step { workload: Some("value_edit"), side: Side::Orders, mutate: Box::new(set(mid, "amount", ColumnValue::Float64(11.0))) },
-        Step { workload: None, side: Side::Orders, mutate: Box::new(set(mid, "amount", ColumnValue::Float64(10.0))) },
+        Step {
+            workload: Some("value_edit"),
+            side: Side::Orders,
+            mutate: Box::new(set(mid, "amount", ColumnValue::Float64(11.0))),
+        },
+        Step {
+            workload: None,
+            side: Side::Orders,
+            mutate: Box::new(set(mid, "amount", ColumnValue::Float64(10.0))),
+        },
     );
     run_pair(
         ctx,
@@ -344,7 +401,12 @@ fn left_workloads(ctx: &Ctx, p: &Pipeline) {
         Step {
             workload: Some("middle_insert"),
             side: Side::Orders,
-            mutate: Box::new(move || orders.borrow_mut().insert_row(mid, order(n as i64, mid as i64, cust, 10.0)).unwrap()),
+            mutate: Box::new(move || {
+                orders
+                    .borrow_mut()
+                    .insert_row(mid, order(n as i64, mid as i64, cust, 10.0))
+                    .unwrap()
+            }),
         },
         Step {
             workload: Some("middle_delete"),
@@ -360,7 +422,12 @@ fn left_workloads(ctx: &Ctx, p: &Pipeline) {
         Step {
             workload: Some("tail_append"),
             side: Side::Orders,
-            mutate: Box::new(move || orders.borrow_mut().append_row(order(n as i64, n as i64, cust, 10.0)).unwrap()),
+            mutate: Box::new(move || {
+                orders
+                    .borrow_mut()
+                    .append_row(order(n as i64, n as i64, cust, 10.0))
+                    .unwrap()
+            }),
         },
         Step {
             workload: Some("tail_delete"),
@@ -375,12 +442,27 @@ fn left_workloads(ctx: &Ctx, p: &Pipeline) {
 fn sort_key_move(ctx: &Ctx, p: &Pipeline) {
     let mid = ctx.rows / 2;
     let orders = &p.orders;
-    let rank = |value: i64| move || orders.borrow_mut().set_value(mid, "rank", ColumnValue::Int64(value)).unwrap();
+    let rank = |value: i64| {
+        move || {
+            orders
+                .borrow_mut()
+                .set_value(mid, "rank", ColumnValue::Int64(value))
+                .unwrap()
+        }
+    };
     run_pair(
         ctx,
         p,
-        Step { workload: Some("sort_key_move"), side: Side::Orders, mutate: Box::new(rank(-1)) },
-        Step { workload: None, side: Side::Orders, mutate: Box::new(rank(mid as i64)) },
+        Step {
+            workload: Some("sort_key_move"),
+            side: Side::Orders,
+            mutate: Box::new(rank(-1)),
+        },
+        Step {
+            workload: None,
+            side: Side::Orders,
+            mutate: Box::new(rank(mid as i64)),
+        },
     );
 }
 
@@ -390,13 +472,26 @@ fn right_workloads(ctx: &Ctx, p: &Pipeline) {
     let m = ctx.rows / 10;
     let mid = m / 2;
     let name = |value: String| {
-        move || customers.borrow_mut().set_value(mid, "name", ColumnValue::String(value.clone())).unwrap()
+        move || {
+            customers
+                .borrow_mut()
+                .set_value(mid, "name", ColumnValue::String(value.clone()))
+                .unwrap()
+        }
     };
     run_pair(
         ctx,
         p,
-        Step { workload: Some("right_value_edit"), side: Side::Customers, mutate: Box::new(name("alt".into())) },
-        Step { workload: None, side: Side::Customers, mutate: Box::new(name(format!("c{mid}"))) },
+        Step {
+            workload: Some("right_value_edit"),
+            side: Side::Customers,
+            mutate: Box::new(name("alt".into())),
+        },
+        Step {
+            workload: None,
+            side: Side::Customers,
+            mutate: Box::new(name(format!("c{mid}"))),
+        },
     );
     run_pair(
         ctx,
@@ -404,7 +499,12 @@ fn right_workloads(ctx: &Ctx, p: &Pipeline) {
         Step {
             workload: Some("right_insert"),
             side: Side::Customers,
-            mutate: Box::new(move || customers.borrow_mut().append_row(customer(m as i32, "new".into())).unwrap()),
+            mutate: Box::new(move || {
+                customers
+                    .borrow_mut()
+                    .append_row(customer(m as i32, "new".into()))
+                    .unwrap()
+            }),
         },
         Step {
             workload: Some("right_delete"),
@@ -418,11 +518,18 @@ fn right_workloads(ctx: &Ctx, p: &Pipeline) {
 
 /// The join's history cursor; only valid while both parents are synced.
 fn join_cursor(join: &RefCell<JoinView>) -> usize {
-    join.borrow().changeset().expect("synced join exposes history").total_len()
+    join.borrow()
+        .changeset()
+        .expect("synced join exposes history")
+        .total_len()
 }
 
 fn kept_history(join: &RefCell<JoinView>, cursor: usize) -> bool {
-    join.borrow().changeset().expect("synced join exposes history").changes_from(cursor).is_some()
+    join.borrow()
+        .changeset()
+        .expect("synced join exposes history")
+        .changes_from(cursor)
+        .is_some()
 }
 
 /// A new customer and that customer's first order, ticked together
@@ -435,12 +542,18 @@ fn two_sided(ctx: &Ctx, p: &Pipeline) {
     let join = p.join.as_ref().unwrap();
     let insert_order = || {
         let start = Instant::now();
-        p.orders.borrow_mut().insert_row(mid, order(n as i64, mid as i64, m as i32, 10.0)).unwrap();
+        p.orders
+            .borrow_mut()
+            .insert_row(mid, order(n as i64, mid as i64, m as i32, 10.0))
+            .unwrap();
         micros(start)
     };
     let insert_customer = || {
         let start = Instant::now();
-        customers.borrow_mut().append_row(customer(m as i32, "new".into())).unwrap();
+        customers
+            .borrow_mut()
+            .append_row(customer(m as i32, "new".into()))
+            .unwrap();
         micros(start)
     };
     let tick = |side| {
@@ -462,7 +575,11 @@ fn two_sided(ctx: &Ctx, p: &Pipeline) {
                     ctx.view
                 );
                 let customers_us = tick(Side::Customers);
-                Sample { mutate_us, tick_us: orders_us + customers_us, tick_parts: Some((orders_us, customers_us)) }
+                Sample {
+                    mutate_us,
+                    tick_us: orders_us + customers_us,
+                    tick_parts: Some((orders_us, customers_us)),
+                }
             } else {
                 let order_us = insert_order();
                 let orders_us = tick(Side::Orders);
@@ -495,7 +612,13 @@ fn two_sided(ctx: &Ctx, p: &Pipeline) {
             p.tick(Side::Customers);
             p.check(ctx, variant);
         }
-        report(n, ctx.hint, ctx.view, &format!("two_sided_{variant}"), &samples);
+        report(
+            n,
+            ctx.hint,
+            ctx.view,
+            &format!("two_sided_{variant}"),
+            &samples,
+        );
     }
 }
 
@@ -514,7 +637,10 @@ fn main() {
         sizes
     };
     for &rows in &sizes {
-        assert!(rows >= 1000 && rows % 10 == 0, "row counts must be >= 1000 and divisible by 10");
+        assert!(
+            rows >= 1000 && rows % 10 == 0,
+            "row counts must be >= 1000 and divisible by 10"
+        );
         for hint in [StorageHint::FastReads, StorageHint::FastUpdates] {
             for view in ["none", "filter", "sort", "aggregate", "join", "join_chain"] {
                 eprintln!("{rows} {} {view}", storage_name(hint));

@@ -98,12 +98,19 @@ pub enum LabAction {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    LabCommand { request_id: u32, action: LabAction },
+    LabCommand {
+        request_id: u32,
+        action: LabAction,
+    },
     /// Subscribe to table updates
-    Subscribe { table_name: String },
+    Subscribe {
+        table_name: String,
+    },
 
     /// Request current table data
-    Query { table_name: String },
+    Query {
+        table_name: String,
+    },
 
     /// Insert a new row
     InsertRow {
@@ -120,7 +127,10 @@ pub enum ClientMessage {
     },
 
     /// Delete a row
-    DeleteRow { table_name: String, row_id: u64 },
+    DeleteRow {
+        table_name: String,
+        row_id: u64,
+    },
 
     /// Define/replace this connection's derived-view pipeline over `table_name`.
     /// Re-sent on every expression edit (the server rebuilds the affected views).
@@ -162,7 +172,10 @@ pub enum ServerMessage {
         step: u64,
         mutations: usize,
     },
-    LabError { request_id: u32, message: String },
+    LabError {
+        request_id: u32,
+        message: String,
+    },
     /// Full table data in response to Query
     TableData {
         table_name: String,
@@ -255,7 +268,9 @@ pub enum ServerMessage {
     },
 
     /// Error occurred
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Current server→client wire-protocol version. Bump on breaking changes to

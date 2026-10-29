@@ -642,7 +642,10 @@ fn keyed(name: &str, key_type: ColumnType, rows: &[(i32, ColumnValue)]) -> Rc<Re
     );
     for (id, k) in rows {
         table
-            .append_row(HashMap::from([("id".into(), Int32(*id)), ("k".into(), k.clone())]))
+            .append_row(HashMap::from([
+                ("id".into(), Int32(*id)),
+                ("k".into(), k.clone()),
+            ]))
             .unwrap();
     }
     table.clear_changeset();
@@ -651,12 +654,23 @@ fn keyed(name: &str, key_type: ColumnType, rows: &[(i32, ColumnValue)]) -> Rc<Re
 
 /// Rows (id, k) with a Float64 join key `k`.
 fn float_keyed(name: &str, rows: &[(i32, f64)]) -> Rc<RefCell<Table>> {
-    let rows: Vec<_> = rows.iter().map(|&(id, k)| (id, ColumnValue::Float64(k))).collect();
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|&(id, k)| (id, ColumnValue::Float64(k)))
+        .collect();
     keyed(name, ColumnType::Float64, &rows)
 }
 
 fn float_join(left: &Rc<RefCell<Table>>, right: &Rc<RefCell<Table>>, how: JoinType) -> JoinView {
-    JoinView::new("j".into(), left.clone(), right.clone(), "k".into(), "k".into(), how).unwrap()
+    JoinView::new(
+        "j".into(),
+        left.clone(),
+        right.clone(),
+        "k".into(),
+        "k".into(),
+        how,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -675,7 +689,12 @@ fn signed_zero_insert_fills_the_placeholder() {
     let mut filled: Vec<&str> = changes
         .iter()
         .map(|change| match change {
-            TableChange::CellUpdated { row: 0, column, old_value: Null, .. } => column.as_str(),
+            TableChange::CellUpdated {
+                row: 0,
+                column,
+                old_value: Null,
+                ..
+            } => column.as_str(),
             other => panic!("expected a placeholder fill, got {other:?}"),
         })
         .collect();
@@ -690,10 +709,15 @@ fn signed_zero_key_update_rematches() {
     let r = float_keyed("r", &[(10, 1.0)]);
     let mut inner = float_join(&l, &r, JoinType::Inner);
     let base = baseline(&inner);
-    r.borrow_mut().set_value(0, "k", ColumnValue::Float64(-0.0)).unwrap();
+    r.borrow_mut()
+        .set_value(0, "k", ColumnValue::Float64(-0.0))
+        .unwrap();
     let changes = replayed(&mut inner, base);
     assert!(
-        matches!(changes.as_slice(), [TableChange::RowInserted { index: 0, .. }]),
+        matches!(
+            changes.as_slice(),
+            [TableChange::RowInserted { index: 0, .. }]
+        ),
         "{changes:?}"
     );
     assert_eq!(inner.len(), 1);
@@ -705,12 +729,19 @@ fn signed_zero_key_update_in_place() {
     let r = float_keyed("r", &[(10, -0.0)]);
     let mut inner = float_join(&l, &r, JoinType::Inner);
     let base = baseline(&inner);
-    r.borrow_mut().set_value(0, "k", ColumnValue::Float64(0.0)).unwrap();
+    r.borrow_mut()
+        .set_value(0, "k", ColumnValue::Float64(0.0))
+        .unwrap();
     let changes = replayed(&mut inner, base);
     // ColumnValue equality treats the zeros as equal, so check the old sign too.
     assert_eq!(
         changes,
-        [update(0, "right_k", ColumnValue::Float64(-0.0), ColumnValue::Float64(0.0))]
+        [update(
+            0,
+            "right_k",
+            ColumnValue::Float64(-0.0),
+            ColumnValue::Float64(0.0)
+        )]
     );
     assert!(matches!(
         changes[0],
@@ -721,20 +752,36 @@ fn signed_zero_key_update_in_place() {
 #[test]
 fn signed_zero_left_insert_matches_existing_rows() {
     let zeros = [
-        (ColumnType::Float64, ColumnValue::Float64(-0.0), ColumnValue::Float64(0.0)),
-        (ColumnType::Float32, ColumnValue::Float32(-0.0), ColumnValue::Float32(0.0)),
+        (
+            ColumnType::Float64,
+            ColumnValue::Float64(-0.0),
+            ColumnValue::Float64(0.0),
+        ),
+        (
+            ColumnType::Float32,
+            ColumnValue::Float32(-0.0),
+            ColumnValue::Float32(0.0),
+        ),
     ];
     for (key_type, negative, positive) in zeros {
         for how in [JoinType::Inner, JoinType::Full] {
             let l = keyed("l", key_type, &[]);
             let r = keyed("r", key_type, &[(10, positive.clone())]);
-            let mut joined = JoinView::new("j".into(), l.clone(), r, "k".into(), "k".into(), how).unwrap();
+            let mut joined =
+                JoinView::new("j".into(), l.clone(), r, "k".into(), "k".into(), how).unwrap();
             let base = baseline(&joined);
             l.borrow_mut()
-                .append_row(HashMap::from([("id".into(), Int32(1)), ("k".into(), negative.clone())]))
+                .append_row(HashMap::from([
+                    ("id".into(), Int32(1)),
+                    ("k".into(), negative.clone()),
+                ]))
                 .unwrap();
             replayed(&mut joined, base);
-            assert_eq!(joined.len(), 1, "{key_type:?} {how:?}: -0.0 joins the existing 0.0 row");
+            assert_eq!(
+                joined.len(),
+                1,
+                "{key_type:?} {how:?}: -0.0 joins the existing 0.0 row"
+            );
             let row = joined.get_row(0).unwrap();
             assert_eq!((&row["id"], &row["right_id"]), (&Int32(1), &Int32(10)));
             let left_key_negative = match row["k"] {
@@ -742,7 +789,10 @@ fn signed_zero_left_insert_matches_existing_rows() {
                 ColumnValue::Float32(v) => v.is_sign_negative(),
                 ref other => panic!("unexpected key {other:?}"),
             };
-            assert!(left_key_negative, "{key_type:?} {how:?}: output keeps the stored -0.0");
+            assert!(
+                left_key_negative,
+                "{key_type:?} {how:?}: output keeps the stored -0.0"
+            );
         }
     }
 }
@@ -790,20 +840,30 @@ fn one_sided_inserts_read_only_matched_rows() {
         reads: Cell::new(0),
     }));
     let names: Vec<String> = (0..25).map(|i| format!("c{i}")).collect();
-    let customer_rows: Vec<(i32, &str)> = (0..25).map(|i| (i, names[i as usize].as_str())).collect();
+    let customer_rows: Vec<(i32, &str)> =
+        (0..25).map(|i| (i, names[i as usize].as_str())).collect();
     let c = Rc::new(RefCell::new(Counted {
         inner: customers_table(&customer_rows),
         reads: Cell::new(0),
     }));
     let mut joined = join(o.clone(), c.clone(), JoinType::Inner);
     // The first insert on each side may build per-side state.
-    o.borrow_mut().inner.append_row(order(100, Some(0), 1)).unwrap();
+    o.borrow_mut()
+        .inner
+        .append_row(order(100, Some(0), 1))
+        .unwrap();
     joined.sync();
-    c.borrow_mut().inner.append_row(customer(25, "c25")).unwrap();
+    c.borrow_mut()
+        .inner
+        .append_row(customer(25, "c25"))
+        .unwrap();
     joined.sync();
 
     let base = baseline(&joined);
-    o.borrow_mut().inner.append_row(order(101, Some(3), 1)).unwrap();
+    o.borrow_mut()
+        .inner
+        .append_row(order(101, Some(3), 1))
+        .unwrap();
     c.borrow().reads.set(0);
     joined.sync();
     let reads = c.borrow().reads.get();
@@ -811,7 +871,10 @@ fn one_sided_inserts_read_only_matched_rows() {
     replayed(&mut joined, base);
 
     let base = baseline(&joined);
-    c.borrow_mut().inner.append_row(customer(7, "dup7")).unwrap(); // matches orders 7 and 32
+    c.borrow_mut()
+        .inner
+        .append_row(customer(7, "dup7"))
+        .unwrap(); // matches orders 7 and 32
     o.borrow().reads.set(0);
     joined.sync();
     let reads = o.borrow().reads.get();
@@ -821,18 +884,31 @@ fn one_sided_inserts_read_only_matched_rows() {
 
 #[test]
 fn a_customers_only_order_can_be_deleted_and_readded() {
-    for how in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full] {
+    for how in [
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+    ] {
         let o = orders(&[(1, Some(10), 5), (2, Some(20), 7)]);
         let c = customers(&[(10, "a"), (20, "b")]);
         let mut joined = join(o.clone(), c.clone(), how);
         let base = baseline(&joined);
         o.borrow_mut().delete_row(1).unwrap(); // customer 20's only order
         replayed(&mut joined, base);
-        assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?} delete");
+        assert_eq!(
+            rows_sorted(&joined),
+            rows_sorted(&join(o.clone(), c.clone(), how)),
+            "{how:?} delete"
+        );
         let base = baseline(&joined);
         o.borrow_mut().append_row(order(2, Some(20), 7)).unwrap();
         replayed(&mut joined, base);
-        assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?} re-add");
+        assert_eq!(
+            rows_sorted(&joined),
+            rows_sorted(&join(o.clone(), c.clone(), how)),
+            "{how:?} re-add"
+        );
     }
 }
 
@@ -887,10 +963,18 @@ fn out_of_range_events_rebuild_instead_of_panicking() {
         }
         joined.sync();
         assert!(
-            joined.changeset().expect("synced").changes_from(cursor).is_none(),
+            joined
+                .changeset()
+                .expect("synced")
+                .changes_from(cursor)
+                .is_none(),
             "{label}: an out-of-range event must rebuild"
         );
-        assert_eq!(rows_sorted(&joined), rows_sorted(&join(left.clone(), c, JoinType::Left)), "{label}");
+        assert_eq!(
+            rows_sorted(&joined),
+            rows_sorted(&join(left.clone(), c, JoinType::Left)),
+            "{label}"
+        );
     }
 }
 
@@ -920,7 +1004,10 @@ fn a_parent_that_disagrees_with_its_changeset_rebuilds_instead_of_panicking() {
         left.version += 1;
     }
     joined.sync();
-    assert_eq!(rows_sorted(&joined), rows_sorted(&join(left.clone(), c, JoinType::Left)));
+    assert_eq!(
+        rows_sorted(&joined),
+        rows_sorted(&join(left.clone(), c, JoinType::Left))
+    );
 }
 
 /// A key update recorded before an insert on the same side: the key-update
@@ -928,7 +1015,12 @@ fn a_parent_that_disagrees_with_its_changeset_rebuilds_instead_of_panicking() {
 /// incrementally instead of rebuilding.
 #[test]
 fn a_key_update_before_an_insert_keeps_history() {
-    for how in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full] {
+    for how in [
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+    ] {
         let o = orders(&[(1, Some(10), 5), (2, Some(20), 7)]);
         let c = customers(&[(10, "a"), (20, "b")]);
         let mut joined = join(o.clone(), c.clone(), how);
@@ -938,11 +1030,20 @@ fn a_key_update_before_an_insert_keeps_history() {
         o.borrow_mut().insert_row(0, order(3, Some(10), 1)).unwrap();
         replayed(&mut joined, base);
         assert!(history_kept(&joined, cursor), "{how:?}: history kept");
-        assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?}");
+        assert_eq!(
+            rows_sorted(&joined),
+            rows_sorted(&join(o.clone(), c.clone(), how)),
+            "{how:?}"
+        );
     }
 }
 
-const ALL_JOINS: [JoinType; 4] = [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full];
+const ALL_JOINS: [JoinType; 4] = [
+    JoinType::Inner,
+    JoinType::Left,
+    JoinType::Right,
+    JoinType::Full,
+];
 
 #[test]
 fn a_new_customer_and_first_order_sync_together() {
@@ -956,7 +1057,11 @@ fn a_new_customer_and_first_order_sync_together() {
         o.borrow_mut().append_row(order(3, Some(30), 9)).unwrap();
         replayed(&mut joined, base);
         assert!(history_kept(&joined, cursor), "{how:?}: history kept");
-        assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?}");
+        assert_eq!(
+            rows_sorted(&joined),
+            rows_sorted(&join(o.clone(), c.clone(), how)),
+            "{how:?}"
+        );
     }
 }
 
@@ -983,13 +1088,20 @@ fn phase_one_payloads_show_the_old_right_rows() {
         })
         .expect("order 1 deleted");
     assert_eq!(payload["right_name"], name("a"));
-    assert_eq!(rows_sorted(&left), rows_sorted(&join(o.clone(), c.clone(), JoinType::Left)));
+    assert_eq!(
+        rows_sorted(&left),
+        rows_sorted(&join(o.clone(), c.clone(), JoinType::Left))
+    );
 }
 
 #[test]
 fn a_self_join_syncs_incrementally() {
     fn abc(id: i32, a: i32, b: i32) -> Row {
-        HashMap::from([("id".into(), Int32(id)), ("a".into(), Int32(a)), ("b".into(), Int32(b))])
+        HashMap::from([
+            ("id".into(), Int32(id)),
+            ("a".into(), Int32(a)),
+            ("b".into(), Int32(b)),
+        ])
     }
     for how in ALL_JOINS {
         let mut table = Table::new(
@@ -1006,7 +1118,15 @@ fn a_self_join_syncs_incrementally() {
         table.clear_changeset();
         let t = Rc::new(RefCell::new(table));
         let self_join = |name: &str| {
-            JoinView::new(name.into(), t.clone(), t.clone(), "a".into(), "b".into(), how).unwrap()
+            JoinView::new(
+                name.into(),
+                t.clone(),
+                t.clone(),
+                "a".into(),
+                "b".into(),
+                how,
+            )
+            .unwrap()
         };
         let mut joined = self_join("self");
         for step in 0..3 {
@@ -1020,8 +1140,15 @@ fn a_self_join_syncs_incrementally() {
                 _ => t.borrow_mut().set_value(0, "a", Int32(1)).unwrap(),
             }
             replayed(&mut joined, base);
-            assert!(history_kept(&joined, cursor), "{how:?} step {step}: history kept");
-            assert_eq!(rows_sorted(&joined), rows_sorted(&self_join("fresh")), "{how:?} step {step}");
+            assert!(
+                history_kept(&joined, cursor),
+                "{how:?} step {step}: history kept"
+            );
+            assert_eq!(
+                rows_sorted(&joined),
+                rows_sorted(&self_join("fresh")),
+                "{how:?} step {step}"
+            );
         }
     }
 }
