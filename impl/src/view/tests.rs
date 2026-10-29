@@ -4041,9 +4041,9 @@ fn test_inner_join_sync_shifted_new_left_not_double_counted() {
     assert_eq!(collect_join_rows(&join), vec![(Some(10), Some(10))]);
 }
 
-/// Same-side frame mixing: a key update recorded BEFORE an insert in the
-/// same batch. The update handler reads the row by its recorded index from
-/// the live table — where the later insert has already shifted it.
+/// A key update recorded BEFORE an insert in the same batch: the live table
+/// has already shifted the updated row, so the update handler reconstructs it
+/// with `row_after_update` rather than reading its recorded index.
 #[test]
 fn test_inner_join_sync_key_update_then_insert_same_batch() {
     let left = make_left_table();

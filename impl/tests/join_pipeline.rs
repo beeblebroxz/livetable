@@ -918,3 +918,22 @@ fn a_parent_that_disagrees_with_its_changeset_rebuilds_instead_of_panicking() {
     joined.sync();
     assert_eq!(rows_sorted(&joined), rows_sorted(&join(left.clone(), c, JoinType::Left)));
 }
+
+/// A key update recorded before an insert on the same side: the key-update
+/// handler reconstructs its row with `row_after_update`, so this applies
+/// incrementally instead of rebuilding.
+#[test]
+fn a_key_update_before_an_insert_keeps_history() {
+    for how in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full] {
+        let o = orders(&[(1, Some(10), 5), (2, Some(20), 7)]);
+        let c = customers(&[(10, "a"), (20, "b")]);
+        let mut joined = join(o.clone(), c.clone(), how);
+        let base = baseline(&joined);
+        let cursor = base.1;
+        o.borrow_mut().set_value(0, "cust", Int32(20)).unwrap();
+        o.borrow_mut().insert_row(0, order(3, Some(10), 1)).unwrap();
+        replayed(&mut joined, base);
+        assert!(history_kept(&joined, cursor), "{how:?}: history kept");
+        assert_eq!(rows_sorted(&joined), rows_sorted(&join(o.clone(), c.clone(), how)), "{how:?}");
+    }
+}

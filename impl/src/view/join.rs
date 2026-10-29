@@ -1208,28 +1208,6 @@ impl JoinView {
         })
     }
 
-    /// True if a join-key update is recorded BEFORE an insert/delete in the
-    /// same batch. The key-update handler reads the row's current data from
-    /// the live parent by its recorded index — which the later insert/delete
-    /// has already shifted, so it would read the wrong row.
-    fn key_update_precedes_row_shift(changes: &[TableChange], keys: &[String]) -> bool {
-        let mut seen_key_update = false;
-        for c in changes {
-            match c {
-                TableChange::CellUpdated { column, .. } if keys.contains(column) => {
-                    seen_key_update = true;
-                }
-                TableChange::RowInserted { .. } | TableChange::RowDeleted { .. }
-                    if seen_key_update =>
-                {
-                    return true;
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
     /// Incrementally sync with both parents' changes, recording output
     /// history. Returns true if the output changed (rows moved or any value
     /// changed).
@@ -1297,18 +1275,14 @@ impl JoinView {
 
         // Frame-mixing guard. The insert/key-update handlers match new rows
         // against LIVE lookups of the other parent, while shifts treat
-        // existing join_index entries as pre-batch. Two batch shapes mix those
-        // frames irreparably:
-        //   1. Structural changes on BOTH sides in one batch.
-        //   2. A key update recorded BEFORE an insert/delete on the same side.
-        // Both are rare under tick()-driven usage; a full rebuild is correct
-        // by construction and advances both cursors.
+        // existing join_index entries as pre-batch, so structural changes on
+        // BOTH sides in one batch would mix those frames; a full rebuild is
+        // correct by construction and advances both cursors. (A key update
+        // before a shift on the same side is fine: its handler reconstructs
+        // the row with `row_after_update`.)
         let left_structural = Self::has_structural_changes(&left_changes, &self.left_keys);
         let right_structural = Self::has_structural_changes(&right_changes, &self.right_keys);
-        if (left_structural && right_structural)
-            || Self::key_update_precedes_row_shift(&left_changes, &self.left_keys)
-            || Self::key_update_precedes_row_shift(&right_changes, &self.right_keys)
-        {
+        if left_structural && right_structural {
             self.rebuild_index();
             return true;
         }
