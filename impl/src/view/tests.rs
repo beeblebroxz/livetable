@@ -4684,6 +4684,9 @@ fn test_join_incremental_matches_rebuild_under_collisions() {
                 }
                 joined.sync();
                 let label = format!("{how:?} trial {trial} step {step}");
+                joined
+                    .check_bookkeeping()
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
                 // Every sync here stays under the bounds, so every sync keeps
                 // history: a silent rebuild would cost 40-500x at scale.
                 let changes = cursor

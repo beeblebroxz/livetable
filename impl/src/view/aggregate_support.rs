@@ -258,6 +258,11 @@ impl GroupState {
     pub(super) fn remove_column_value(&mut self, source_col: &str, value: f64) {
         if let Some(stats) = self.column_stats.get_mut(source_col) {
             stats.remove_value(value);
+        } else {
+            debug_assert!(
+                false,
+                "removed value {value} from {source_col}, which has no state"
+            );
         }
     }
 

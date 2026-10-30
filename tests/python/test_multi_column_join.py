@@ -4,6 +4,8 @@ Tests for multi-column joins.
 This module tests JoinView with multiple join keys (composite keys).
 """
 
+import math
+
 import pytest
 import livetable
 
@@ -241,6 +243,9 @@ class TestSingleColumnJoinBackwardCompat:
         row = joined.get_row(0)
         assert row["val"] == "neg"
         assert row["right_data"] == "pos"
+        # Keys fold only for matching: each side keeps its own sign.
+        assert math.copysign(1.0, row["k"]) == -1.0
+        assert math.copysign(1.0, row["right_k"]) == 1.0
 
 
 # ============================================================================

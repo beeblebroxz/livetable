@@ -673,6 +673,16 @@ fn build_pipeline(base: &Rc<RefCell<Table>>) -> Pipeline {
 
 /// Assert every live view equals a from-scratch rebuild on the current root.
 fn assert_pipeline_matches(trial: u64, step: usize, base: &Rc<RefCell<Table>>, p: &Pipeline) {
+    for (label, join) in [
+        ("agg_join", &p.agg_join),
+        ("dim_join", &p.dim_join),
+        ("filter_join", &p.filter_join),
+        ("sorted_join", &p.sorted_join),
+    ] {
+        join.borrow()
+            .check_bookkeeping()
+            .unwrap_or_else(|e| panic!("[{label}] trial {trial} step {step}: {e}"));
+    }
     let ob = clone_base(base);
     let of = Rc::new(RefCell::new(FilterView::new(
         "of".to_string(),
@@ -975,22 +985,28 @@ fn differential_int_group_by_fuzz() {
 
         for step in 0..200usize {
             let before = capture(vec![("int_agg", agg.clone())]);
-            let len = base.borrow().len();
-            let roll = rng.pct();
-            if len == 0 || roll < 45 {
-                insert(&mut rng, &base, &mut next_id);
-            } else if roll < 70 {
-                let idx = rng.below(len);
-                let a = amount(&mut rng);
-                base.borrow_mut().set_value(idx, "amount", a).unwrap();
-            } else if roll < 85 {
-                let idx = rng.below(len);
-                base.borrow_mut()
-                    .set_value(idx, "bucket", ColumnValue::Int32(rng.below(4) as i32))
-                    .unwrap();
-            } else {
-                let idx = rng.below(len);
-                base.borrow_mut().delete_row(idx).unwrap();
+            // Odd trials tick after several mutations, so incremental
+            // batches of several events run over the state the Int32 fast
+            // path built.
+            let batch = if trial % 2 == 1 { 1 + rng.below(5) } else { 1 };
+            for _ in 0..batch {
+                let len = base.borrow().len();
+                let roll = rng.pct();
+                if len == 0 || roll < 45 {
+                    insert(&mut rng, &base, &mut next_id);
+                } else if roll < 70 {
+                    let idx = rng.below(len);
+                    let a = amount(&mut rng);
+                    base.borrow_mut().set_value(idx, "amount", a).unwrap();
+                } else if roll < 85 {
+                    let idx = rng.below(len);
+                    base.borrow_mut()
+                        .set_value(idx, "bucket", ColumnValue::Int32(rng.below(4) as i32))
+                        .unwrap();
+                } else {
+                    let idx = rng.below(len);
+                    base.borrow_mut().delete_row(idx).unwrap();
+                }
             }
             tick.tick();
             assert_replays(trial, step, before);
@@ -1225,6 +1241,9 @@ fn differential_join_fuzz() {
                 }
 
                 joined.sync();
+                joined
+                    .check_bookkeeping()
+                    .unwrap_or_else(|e| panic!("[join:{jt_name}] trial {trial} step {step}: {e}"));
                 // One parent change per step: never a rebuild, so history
                 // must always replay.
                 assert_replay(
@@ -1237,6 +1256,9 @@ fn differential_join_fuzz() {
                 );
                 // Only one view parent emits per step, so this never rebuilds either.
                 sync_view_parent_join(&lf, &rs, &mut view_joined);
+                view_joined.check_bookkeeping().unwrap_or_else(|e| {
+                    panic!("[view_join:{jt_name}] trial {trial} step {step}: {e}")
+                });
                 assert_replay(
                     &format!("view_join:{jt_name}"),
                     trial,
@@ -1497,6 +1519,9 @@ fn differential_join_batched_fuzz() {
                     join_random_op(&mut rng, &left, &right, &mut next_lid, &mut next_rid);
                 }
                 joined.sync();
+                joined.check_bookkeeping().unwrap_or_else(|e| {
+                    panic!("[join_batched:{jt_name}] trial {trial} step {step}: {e}")
+                });
                 steps += 1;
                 if replay_unless_invalidated(
                     &format!("join_batched:{jt_name}"),
@@ -1511,6 +1536,9 @@ fn differential_join_batched_fuzz() {
                 // Both view parents can change structure in one batch: the
                 // two-phase sync.
                 sync_view_parent_join(&lf, &rs, &mut view_joined);
+                view_joined.check_bookkeeping().unwrap_or_else(|e| {
+                    panic!("[view_join_batched:{jt_name}] trial {trial} step {step}: {e}")
+                });
                 if replay_unless_invalidated(
                     &format!("view_join_batched:{jt_name}"),
                     trial,

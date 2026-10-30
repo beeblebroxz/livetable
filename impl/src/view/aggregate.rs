@@ -405,21 +405,24 @@ impl AggregateView {
             if state.row_count == 0 {
                 self.remove_group(&key, touched, removed_slots);
             }
+        } else {
+            debug_assert!(false, "removing a row from missing group {key:?}");
         }
     }
 
-    /// Whether every event's index is in range for the rows before it:
-    /// inserts at or before the end, deletes and updates before it.
-    fn indices_in_range(mut len: usize, changes: &[TableChange]) -> bool {
+    /// The length the batch leaves, or None if an event's index is out of
+    /// range for the rows before it: inserts at or before the end, deletes
+    /// and updates before it.
+    fn final_len(mut len: usize, changes: &[TableChange]) -> Option<usize> {
         for change in changes {
             match change {
                 TableChange::RowInserted { index, .. } if *index <= len => len += 1,
                 TableChange::RowDeleted { index, .. } if *index < len => len -= 1,
                 TableChange::CellUpdated { row, .. } if *row < len => {}
-                _ => return false,
+                _ => return None,
             }
         }
-        true
+        Some(len)
     }
 
     /// Record an existing group's output row the first time a batch touches
@@ -700,7 +703,9 @@ impl IncrementalView for AggregateView {
             .count()
             == 2;
         if (multiple_shifts && changes.len() > MAX_FILTER_REPLAY_CHANGES * 2)
-            || !Self::indices_in_range(self.row_groups.len(), changes)
+            // A parent whose rows disagree with its changeset rebuilds
+            // rather than drift.
+            || Self::final_len(self.row_groups.len(), changes) != Some(self.parent.borrow().len())
         {
             self.rebuild_index();
             return true;
@@ -752,18 +757,15 @@ impl IncrementalView for AggregateView {
                                 let key: &GroupKey = &shared;
                                 self.touch_existing(key, &mut touched);
 
-                                // Remove old value
                                 if let Some(state) = self.groups.get_mut(key) {
                                     if let Some(old_num) = Self::extract_numeric(old_value) {
                                         state.remove_column_value(column, old_num);
                                     }
-                                }
-
-                                // Add new value
-                                if let Some(state) = self.groups.get_mut(key) {
                                     if let Some(new_num) = Self::extract_numeric(new_value) {
                                         state.add_column_value(column, new_num);
                                     }
+                                } else {
+                                    debug_assert!(false, "updating row {row} of missing group");
                                 }
                                 modified = true;
                             }

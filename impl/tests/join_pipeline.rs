@@ -1153,6 +1153,31 @@ fn a_self_join_syncs_incrementally() {
     }
 }
 
+/// Exactly 256 events on each side keep history; 257 on the right
+/// rebuilds (257 on the left: the test below).
+#[test]
+fn two_sided_batches_at_the_bound_stay_incremental() {
+    let o = orders(&[]);
+    let c = customers(&[(10, "a")]);
+    let mut joined = join(o.clone(), c.clone(), JoinType::Inner);
+    let before = baseline(&joined);
+    for i in 0..256 {
+        o.borrow_mut().append_row(order(i, Some(10), 1)).unwrap();
+        c.borrow_mut().append_row(customer(1000 + i, "b")).unwrap();
+    }
+    replayed(&mut joined, before);
+    assert_eq!(joined.len(), 256);
+
+    let (_, cursor) = baseline(&joined);
+    o.borrow_mut().append_row(order(256, Some(10), 1)).unwrap();
+    for i in 0..257 {
+        c.borrow_mut().append_row(customer(2000 + i, "c")).unwrap();
+    }
+    joined.sync();
+    assert!(!history_kept(&joined, cursor), "257 on the right rebuilds");
+    assert_eq!(joined.len(), 257);
+}
+
 /// Two-sided batches above 256 events on a side still rebuild.
 #[test]
 fn two_sided_batches_over_the_bound_rebuild() {

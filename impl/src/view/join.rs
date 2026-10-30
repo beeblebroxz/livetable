@@ -207,6 +207,11 @@ pub struct JoinView {
     /// During phase 1 of a two-sided sync, the right batch not yet applied:
     /// every right read then reconstructs the pre-batch row consumers saw.
     right_before: Option<Vec<TableChange>>,
+    /// During a sync, whether each side's batch is still unapplied. Reading
+    /// such a side live would mix frames (debug-asserted); phase 1 reads the
+    /// right through `right_before` instead.
+    left_pending: bool,
+    right_pending: bool,
 }
 
 impl JoinView {
@@ -335,6 +340,8 @@ impl JoinView {
             left_rows: 0,
             right_rows: 0,
             right_before: None,
+            left_pending: false,
+            right_pending: false,
         };
 
         view.rebuild_index();
@@ -456,6 +463,8 @@ impl JoinView {
         drop(right);
         self.left_key_hashes = None;
         self.right_key_hashes = None;
+        self.left_pending = false;
+        self.right_pending = false;
         self.output_changes.invalidate();
         self.sync_count += 1;
     }
@@ -476,12 +485,17 @@ impl JoinView {
         keys: &[String],
         rows: usize,
         before: Option<&[TableChange]>,
+        pending: bool,
         targets: Vec<JoinKey>,
     ) -> Result<HashMap<JoinKey, Vec<usize>>, String> {
         let mut found: HashMap<JoinKey, Vec<usize>> = HashMap::new();
         if targets.is_empty() {
             return Ok(found);
         }
+        debug_assert!(
+            !pending || before.is_some(),
+            "matching against a parent whose batch is unapplied"
+        );
         let table = table.borrow();
         let batch = before.unwrap_or(&[]);
         let live_rows = batch.iter().fold(rows, |rows, change| match change {
@@ -625,7 +639,13 @@ impl JoinView {
     fn output_row(&self, left: Half, right: Half) -> Result<Row, String> {
         let mut row = match left {
             Half::Given(row) => row.clone(),
-            Half::Live(Some(l)) => self.left_table.borrow().get_row(l)?,
+            Half::Live(Some(l)) => {
+                debug_assert!(
+                    !self.left_pending,
+                    "live read of left row {l}, batch unapplied"
+                );
+                self.left_table.borrow().get_row(l)?
+            }
             Half::Live(None) => self
                 .left_column_names
                 .iter()
@@ -650,7 +670,13 @@ impl JoinView {
         let right = self.right_table.borrow();
         match &self.right_before {
             Some(changes) => row_before_batch(changes, r, |i| right.get_row(i)),
-            None => right.get_row(r),
+            None => {
+                debug_assert!(
+                    !self.right_pending,
+                    "live read of right row {r}, batch unapplied"
+                );
+                right.get_row(r)
+            }
         }
     }
 
@@ -967,6 +993,7 @@ impl JoinView {
             &self.right_keys,
             self.right_rows,
             self.right_before.as_deref(),
+            self.right_pending,
             targets,
         )?;
         for (t, change) in changes.iter().enumerate() {
@@ -1042,6 +1069,7 @@ impl JoinView {
                 }
             }
         }
+        self.left_pending = false;
         Ok(())
     }
 
@@ -1078,6 +1106,7 @@ impl JoinView {
             &self.left_keys,
             self.left_rows,
             None,
+            self.left_pending,
             targets,
         )?;
         // A value-only batch moves no rows: one pass locates every target.
@@ -1173,6 +1202,58 @@ impl JoinView {
                     };
                     Self::update_cells(at, format!("right_{column}"), old_value, new_value, out)?;
                 }
+            }
+        }
+        self.right_pending = false;
+        Ok(())
+    }
+
+    /// Test support: whether the state kept across syncs matches the live
+    /// parents. Call it after a sync, before either parent changes again. It
+    /// is O(N + M + R), so it runs in tests, never inside `sync`.
+    #[doc(hidden)]
+    pub fn check_bookkeeping(&self) -> Result<(), String> {
+        if self.left_pending || self.right_pending || self.right_before.is_some() {
+            return Err("a sync left a batch marked unapplied".to_string());
+        }
+        let sides = [
+            (
+                "left",
+                &self.left_table,
+                &self.left_keys,
+                self.left_rows,
+                &self.left_key_hashes,
+            ),
+            (
+                "right",
+                &self.right_table,
+                &self.right_keys,
+                self.right_rows,
+                &self.right_key_hashes,
+            ),
+        ];
+        for (side, table, keys, rows, hashes) in sides {
+            let table = table.borrow();
+            if rows != table.len() {
+                return Err(format!("{side} rows {rows}, parent has {}", table.len()));
+            }
+            let Some(hashes) = hashes else { continue };
+            if hashes.len() != rows {
+                return Err(format!("{side} key hashes {}, rows {rows}", hashes.len()));
+            }
+            let cols: Vec<usize> = keys.iter().filter_map(|k| table.column_index(k)).collect();
+            for (row, &hash) in hashes.iter().enumerate() {
+                let live = key_hash(Self::build_key_from_indices(&*table, row, &cols).as_ref());
+                if hash != live {
+                    return Err(format!("{side} key hash for row {row} is stale"));
+                }
+            }
+        }
+        for (pos, &(l, r)) in self.join_index.iter().enumerate() {
+            if l.is_some_and(|l| l >= self.left_rows) || r.is_some_and(|r| r >= self.right_rows) {
+                return Err(format!(
+                    "join_index[{pos}] = ({l:?}, {r:?}) is out of range"
+                ));
             }
         }
         Ok(())
@@ -1368,6 +1449,8 @@ impl JoinView {
 
         // Past every rebuild fallback: this batch replaces retained history.
         self.output_changes.clear();
+        self.left_pending = !left_changes.is_empty();
+        self.right_pending = !right_changes.is_empty();
         let mut out = JoinOutput::default();
         // The value-only side goes first, so the structural side reads the
         // other parent live in the state consumers have already applied.

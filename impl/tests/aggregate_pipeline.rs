@@ -657,7 +657,21 @@ fn out_of_range_events_rebuild_instead_of_panicking() {
         let mut view = by_region(parent.clone());
         let cursor = view.changeset().expect("history").total_len();
         {
+            // The rows take the batch's net length, so only the indices
+            // decide whether it rebuilds.
+            let net = changes.iter().fold(0isize, |net, change| match change {
+                TableChange::RowInserted { .. } => net + 1,
+                TableChange::RowDeleted { .. } => net - 1,
+                TableChange::CellUpdated { .. } => net,
+            });
             let mut parent = parent.borrow_mut();
+            for _ in 0..net {
+                parent.inner.append_row(order("West", 5)).unwrap();
+            }
+            for _ in net..0 {
+                let last = parent.inner.len() - 1;
+                parent.inner.delete_row(last).unwrap();
+            }
             for change in changes {
                 parent.changes.push(change);
             }
@@ -678,6 +692,35 @@ fn out_of_range_events_rebuild_instead_of_panicking() {
             );
         }
     }
+}
+
+#[test]
+fn a_batch_that_disagrees_with_the_parent_length_rebuilds() {
+    let parent = Rc::new(RefCell::new(Scripted {
+        inner: orders_table(&[("West", 10), ("East", 20)]),
+        changes: Changeset::new(),
+        version: 0,
+    }));
+    let mut view = by_region(parent.clone());
+    let cursor = view.changeset().expect("history").total_len();
+    {
+        // The changeset records an insert the rows never received.
+        let mut parent = parent.borrow_mut();
+        parent.changes.push(TableChange::RowInserted {
+            index: 2,
+            data: order("West", 5),
+        });
+        parent.version += 1;
+    }
+    view.sync();
+    assert!(
+        view.changeset()
+            .expect("synced")
+            .changes_from(cursor)
+            .is_none(),
+        "a rebuild invalidates history"
+    );
+    assert_eq!(snapshot(&view), snapshot(&by_region(parent.clone())));
 }
 
 /// A one-column Float64 table grouped into a single region.
