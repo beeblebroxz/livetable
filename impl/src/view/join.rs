@@ -1,7 +1,7 @@
 //! JoinView — LEFT/INNER/RIGHT/FULL joins with incremental sync.
 
 use crate::changeset::{Changeset, TableChange};
-use crate::column::ColumnValue;
+use crate::column::{ColumnType, ColumnValue};
 use crate::filter_changes::{row_after_update, row_before_batch, MAX_FILTER_REPLAY_CHANGES};
 use crate::readable::ReadableTable;
 use std::cell::RefCell;
@@ -113,10 +113,33 @@ enum Half<'a> {
     Live(Option<usize>),
 }
 
-/// A right-parent row with its columns named as the join outputs them.
-fn prefix_right(row: Row) -> Row {
-    row.into_iter()
-        .map(|(column, value)| (format!("right_{column}"), value))
+/// Joins compare integer keys by value, so an Int32 key matches an Int64 key
+/// (`from_csv`/`from_json` pick the width per table). Group keys share the
+/// part type but keep their width, since a group's key reads back as its
+/// column's type.
+fn widen_integer(part: JoinKeyPart) -> JoinKeyPart {
+    match part {
+        JoinKeyPart::Int32(value) => JoinKeyPart::Int64(i64::from(value)),
+        other => other,
+    }
+}
+
+/// Output names for the right parent's columns: `right_` plus the column
+/// name, with `right_` applied again while the result is a left column or an
+/// earlier right output name. A join over a join has left columns that start
+/// with `right_` already; without this they would share a name with a right
+/// column, and one of the two values would be lost.
+fn right_output_names(left: &[String], right: &[String]) -> Vec<String> {
+    let mut taken: HashSet<String> = left.iter().cloned().collect();
+    right
+        .iter()
+        .map(|column| {
+            let mut name = format!("right_{column}");
+            while !taken.insert(name.clone()) {
+                name = format!("right_{name}");
+            }
+            name
+        })
         .collect()
 }
 
@@ -181,6 +204,9 @@ pub struct JoinView {
     /// after Table construction in this crate).
     left_column_names: Vec<String>,
     right_column_names: Vec<String>,
+    /// Each right column's output name, aligned with `right_column_names`
+    /// (see `right_output_names`). Every row, event and name lookup uses it.
+    right_output_names: Vec<String>,
     /// Number of changes already processed from left table (absolute index).
     /// usize::MAX without a coherent baseline. root_changeset_cursors()
     /// translates both parent cursors for root compaction.
@@ -303,6 +329,31 @@ impl JoinView {
             }
         }
 
+        // Keys of different types can never be equal: reject them rather
+        // than return a join with no matches. Integers of either width
+        // compare by value. A column without a static type is not checked.
+        {
+            let left = left_table.borrow();
+            let right = right_table.borrow();
+            let integer = |ty| matches!(ty, ColumnType::Int32 | ColumnType::Int64);
+            for (left_key, right_key) in left_keys.iter().zip(&right_keys) {
+                let left_type = left
+                    .column_index(left_key)
+                    .and_then(|index| left.column_type(index));
+                let right_type = right
+                    .column_index(right_key)
+                    .and_then(|index| right.column_type(index));
+                if let (Some(left_type), Some(right_type)) = (left_type, right_type) {
+                    if left_type != right_type && !(integer(left_type) && integer(right_type)) {
+                        return Err(format!(
+                            "Join key type mismatch: left '{left_key}' is {left_type:?}, \
+                             right '{right_key}' is {right_type:?}"
+                        ));
+                    }
+                }
+            }
+        }
+
         let left_change_count = left_table
             .borrow()
             .changeset()
@@ -318,6 +369,7 @@ impl JoinView {
         // so we never need to re-read them on each get_row call.
         let left_column_names: Vec<String> = left_table.borrow().column_names();
         let right_column_names: Vec<String> = right_table.borrow().column_names();
+        let right_output_names = right_output_names(&left_column_names, &right_column_names);
 
         let mut view = JoinView {
             name,
@@ -329,6 +381,7 @@ impl JoinView {
             join_index: Vec::new(),
             left_column_names,
             right_column_names,
+            right_output_names,
             left_last_processed_change_count: left_change_count,
             right_last_processed_change_count: right_change_count,
             sync_count: 0,
@@ -356,7 +409,7 @@ impl JoinView {
         let mut parts: Vec<JoinKeyPart> = Vec::with_capacity(keys.len());
         for key in keys {
             let value = row.get(key)?;
-            parts.push(column_value_to_join_key_part(value)?);
+            parts.push(widen_integer(column_value_to_join_key_part(value)?));
         }
         Some(parts)
     }
@@ -372,7 +425,7 @@ impl JoinView {
         let mut parts: Vec<JoinKeyPart> = Vec::with_capacity(col_indices.len());
         for &col_idx in col_indices {
             let value = table.get_value_by_index(row, col_idx).ok()?;
-            parts.push(column_value_into_join_key_part(value)?);
+            parts.push(widen_integer(column_value_into_join_key_part(value)?));
         }
         Some(parts)
     }
@@ -653,15 +706,35 @@ impl JoinView {
                 .collect(),
         };
         match right {
-            Half::Given(right) => row.extend(prefix_right(right.clone())),
-            Half::Live(Some(r)) => row.extend(prefix_right(self.right_row(r)?)),
+            Half::Given(right) => row.extend(self.prefix_right(right.clone())),
+            Half::Live(Some(r)) => row.extend(self.prefix_right(self.right_row(r)?)),
             Half::Live(None) => row.extend(
-                self.right_column_names
+                self.right_output_names
                     .iter()
-                    .map(|column| (format!("right_{column}"), ColumnValue::Null)),
+                    .map(|name| (name.clone(), ColumnValue::Null)),
             ),
         }
         Ok(row)
+    }
+
+    /// A right-parent row with its columns named as the join outputs them.
+    fn prefix_right(&self, mut row: Row) -> Row {
+        self.right_column_names
+            .iter()
+            .zip(&self.right_output_names)
+            .filter_map(|(column, name)| Some((name.clone(), row.remove(column)?)))
+            .collect()
+    }
+
+    /// The output name of a right-parent column named in a change event.
+    fn right_output_name(&self, column: &str) -> String {
+        self.right_column_names
+            .iter()
+            .position(|c| c == column)
+            .map_or_else(
+                || format!("right_{column}"),
+                |index| self.right_output_names[index].clone(),
+            )
     }
 
     /// Right row `r` in the frame the join has applied: during phase 1 of a
@@ -899,13 +972,15 @@ impl JoinView {
                     let placeholder = self.left_range(l).find(|&p| self.join_index[p].1.is_none());
                     if let Some(pos) = placeholder {
                         self.join_index[pos] = (Some(l), Some(r));
-                        for column in &self.right_column_names {
+                        for (column, name) in
+                            self.right_column_names.iter().zip(&self.right_output_names)
+                        {
                             let value = right.get(column).cloned().unwrap_or(ColumnValue::Null);
                             if value != ColumnValue::Null {
                                 out.record(|| {
                                     Ok(TableChange::CellUpdated {
                                         row: pos,
-                                        column: format!("right_{column}"),
+                                        column: name.clone(),
                                         old_value: ColumnValue::Null,
                                         new_value: value,
                                     })
@@ -1172,13 +1247,8 @@ impl JoinView {
                     let new_key = Self::build_composite_key(&after, &self.right_keys);
                     if Self::build_composite_key(&before, &self.right_keys) == new_key {
                         let at = self.right_positions(*row);
-                        Self::update_cells(
-                            at,
-                            format!("right_{column}"),
-                            old_value,
-                            new_value,
-                            out,
-                        )?;
+                        let name = self.right_output_name(column);
+                        Self::update_cells(at, name, old_value, new_value, out)?;
                         continue;
                     }
                     if let Some(hashes) = &mut self.right_key_hashes {
@@ -1200,7 +1270,8 @@ impl JoinView {
                     } else {
                         positions.get(row).cloned().unwrap_or_default()
                     };
-                    Self::update_cells(at, format!("right_{column}"), old_value, new_value, out)?;
+                    let name = self.right_output_name(column);
+                    Self::update_cells(at, name, old_value, new_value, out)?;
                 }
             }
         }
@@ -1287,33 +1358,24 @@ impl JoinView {
             return Err(format!("Row {} out of range [0, {})", row, self.len()));
         }
 
+        // Resolve the name from the cached output names, left columns
+        // first: a left column may itself start with `right_`.
         let (left_idx_opt, right_idx_opt) = self.join_index[row];
-        if let Some(right_column) = column.strip_prefix("right_") {
-            if self
-                .right_table
-                .borrow()
-                .column_index(right_column)
-                .is_none()
-            {
-                return Err(format!("Column '{}' not found in joined view", column));
-            }
-
-            return match right_idx_opt {
-                Some(right_idx) => self.right_table.borrow().get_value(right_idx, right_column),
+        if self.left_column_names.iter().any(|c| c == column) {
+            return match left_idx_opt {
+                Some(left_idx) => self.left_table.borrow().get_value(left_idx, column),
                 None => Ok(ColumnValue::Null),
             };
         }
-
-        // Left column
-        match left_idx_opt {
-            Some(left_idx) => self.left_table.borrow().get_value(left_idx, column),
-            None => {
-                // Verify the column exists in left schema
-                if self.left_table.borrow().column_index(column).is_none() {
-                    return Err(format!("Column '{}' not found in joined view", column));
-                }
-                Ok(ColumnValue::Null)
-            }
+        let Some(index) = self.right_output_names.iter().position(|c| c == column) else {
+            return Err(format!("Column '{}' not found in joined view", column));
+        };
+        match right_idx_opt {
+            Some(right_idx) => self
+                .right_table
+                .borrow()
+                .get_value(right_idx, &self.right_column_names[index]),
+            None => Ok(ColumnValue::Null),
         }
     }
 
@@ -1509,9 +1571,7 @@ impl ReadableTable for JoinView {
 
     fn column_names(&self) -> Vec<String> {
         let mut names = self.left_column_names.clone();
-        for col in &self.right_column_names {
-            names.push(format!("right_{}", col));
-        }
+        names.extend(self.right_output_names.iter().cloned());
         names
     }
 

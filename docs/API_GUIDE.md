@@ -249,7 +249,8 @@ let grouped = Rc::new(RefCell::new(AggregateView::new(
 Supported functions are `Sum`, `Count`, `Avg`, `Min`, `Max`, `Median`, and
 `Percentile(f64)`. Count is non-null count of its source column. NaN aggregate
 values are excluded like NULL; NaN group keys form one canonical group and
-`-0.0` groups with `0.0`.
+`-0.0` groups with `0.0`. Infinite values are kept: a group holding one sums to
+it (NaN for both signs), and to its finite sum again once the infinity leaves.
 
 ### Joins
 
@@ -276,7 +277,9 @@ let composite = JoinView::new_multi(
 ```
 
 LiveTable implements `Left`, `Inner`, `Right`, and `Full` joins. NULL and NaN
-keys do not match; `-0.0` and `0.0` keys do. Right-side output columns are prefixed with `right_`.
+keys do not match; `-0.0` and `0.0` keys do. `Int32` and `Int64` keys compare by value; any other
+key type mismatch is an error at construction. Right-side output columns are prefixed with `right_`,
+applied again if the name is already taken (as in a join over a join).
 `JoinView::sync()` incrementally consumes changes from both parents;
 `refresh()` performs a complete rebuild. See [JOIN_FEATURE.md](JOIN_FEATURE.md)
 for details.

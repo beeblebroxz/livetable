@@ -439,6 +439,28 @@ class TestAggregateViewIncremental:
 class TestAggregateViewEdgeCases:
     """Test edge cases for AggregateView"""
 
+    def test_removed_infinity_leaves_the_finite_sum(self):
+        """An infinity that leaves a group must not leave its sum at NaN."""
+        schema = livetable.Schema([
+            ("region", livetable.ColumnType.STRING, False),
+            ("amount", livetable.ColumnType.FLOAT64, False),
+        ])
+        table = livetable.Table("amounts", schema)
+        table.append_row({"region": "North", "amount": 1.0})
+        totals = table.group_by("region", agg=[
+            ("total", "amount", "sum"),
+            ("mean", "amount", "avg"),
+        ])
+
+        table.append_row({"region": "North", "amount": float("inf")})
+        table.tick()
+        assert totals[0]["total"] == float("inf")
+
+        table.delete_row(1)
+        table.tick()
+        assert totals[0]["total"] == 1.0
+        assert totals[0]["mean"] == 1.0
+
     def test_empty_table(self):
         """Test AggregateView on empty table"""
         schema = livetable.Schema([

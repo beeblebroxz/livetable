@@ -916,3 +916,94 @@ fn tied_minimums_survive_one_deletion() {
     });
     assert!(changes.contains(&update(0, "low", Float64(10.0), Float64(30.0))));
 }
+
+fn total_and_mean(parent: Rc<RefCell<dyn ReadableTable>>) -> AggregateView {
+    AggregateView::new(
+        "totals".into(),
+        parent,
+        vec!["region".into()],
+        vec![
+            ("total".into(), "amount".into(), AggregateFunction::Sum),
+            ("mean".into(), "amount".into(), AggregateFunction::Avg),
+        ],
+    )
+    .unwrap()
+}
+
+/// A Float64 result cell of the single group.
+fn float_cell(view: &AggregateView, column: &str) -> f64 {
+    match view.get_row(0).unwrap()[column] {
+        Float64(v) => v,
+        ref other => panic!("unexpected {column} {other:?}"),
+    }
+}
+
+/// An infinity that leaves a group, by a delete or an edit, must not leave
+/// the running sum at `inf - inf`.
+#[test]
+fn a_removed_infinity_leaves_the_finite_sum() {
+    let table = float_amounts();
+    append_amount(&table, 1.0);
+    let mut view = total_and_mean(table.clone());
+    sync_replayed(&mut view, || append_amount(&table, f64::INFINITY));
+    assert_eq!(float_cell(&view, "total"), f64::INFINITY);
+    sync_replayed(&mut view, || {
+        table.borrow_mut().delete_row(1).unwrap();
+    });
+    assert_eq!(snapshot(&view), snapshot(&total_and_mean(table.clone())));
+    assert_eq!(float_cell(&view, "total"), 1.0);
+
+    let amount = |value| {
+        table
+            .borrow_mut()
+            .set_value(0, "amount", Float64(value))
+            .unwrap();
+    };
+    sync_replayed(&mut view, || amount(f64::NEG_INFINITY));
+    assert_eq!(float_cell(&view, "mean"), f64::NEG_INFINITY);
+    sync_replayed(&mut view, || amount(3.0));
+    assert_eq!(snapshot(&view), snapshot(&total_and_mean(table.clone())));
+    assert_eq!(float_cell(&view, "total"), 3.0);
+}
+
+/// +inf and -inf together sum to NaN, as in a rebuild; the sum follows
+/// whichever remain as they leave.
+#[test]
+fn opposite_infinities_sum_to_nan_until_one_leaves() {
+    let table = float_amounts();
+    let mut view = total_and_mean(table.clone());
+    append_amount(&table, 2.0);
+    append_amount(&table, f64::INFINITY);
+    append_amount(&table, f64::NEG_INFINITY);
+    view.sync();
+    assert!(float_cell(&view, "total").is_nan());
+    assert!(float_cell(&total_and_mean(table.clone()), "total").is_nan());
+
+    table.borrow_mut().delete_row(2).unwrap(); // -inf
+    view.sync();
+    assert_eq!(float_cell(&view, "total"), f64::INFINITY);
+    assert_eq!(float_cell(&view, "mean"), f64::INFINITY);
+
+    table.borrow_mut().delete_row(1).unwrap(); // +inf
+    view.sync();
+    assert_eq!(snapshot(&view), snapshot(&total_and_mean(table.clone())));
+    assert_eq!(float_cell(&view, "total"), 2.0);
+}
+
+/// A percentile that lands exactly on a value is that value, whatever the
+/// next one is: `2 * 1 + inf * 0` is NaN.
+#[test]
+fn a_percentile_on_a_value_ignores_an_infinite_neighbour() {
+    let table = float_amounts();
+    for amount in [1.0, 2.0, f64::INFINITY] {
+        append_amount(&table, amount);
+    }
+    let view = AggregateView::new(
+        "median".into(),
+        table.clone(),
+        vec!["region".into()],
+        vec![("mid".into(), "amount".into(), AggregateFunction::Median)],
+    )
+    .unwrap();
+    assert_eq!(float_cell(&view, "mid"), 2.0);
+}

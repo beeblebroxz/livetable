@@ -247,12 +247,57 @@ class TestSingleColumnJoinBackwardCompat:
         assert math.copysign(1.0, row["k"]) == -1.0
         assert math.copysign(1.0, row["right_k"]) == 1.0
 
+    def test_int32_and_int64_keys_match_by_value(self):
+        """An INT32 key joins an INT64 key, on build and after tick()."""
+        left = livetable.Table("left", livetable.Schema([
+            ("k", livetable.ColumnType.INT32, False),
+        ]))
+        left.append_row({"k": 7})
+        right = livetable.Table("right", livetable.Schema([
+            ("k", livetable.ColumnType.INT64, False),
+            ("data", livetable.ColumnType.STRING, False),
+        ]))
+        right.append_row({"k": 7, "data": "seven"})
+
+        joined = left.join(right, on="k", how="inner")
+        assert len(joined) == 1
+        assert joined[0]["right_data"] == "seven"
+
+        left.append_row({"k": 8})
+        right.append_row({"k": 8, "data": "eight"})
+        left.tick()
+        assert [row["right_data"] for row in joined] == ["seven", "eight"]
+
+    def test_csv_tables_join_across_inferred_widths(self):
+        """from_csv infers INT32 or INT64 per table; the join still matches."""
+        small = livetable.Table.from_csv("small", "id,name\n1,x\n2,y\n")
+        wide = livetable.Table.from_csv("wide", "id,amount\n1,5\n3000000000,7\n")
+
+        joined = small.join(wide, on="id", how="inner")
+        assert len(joined) == 1
+        assert joined[0]["right_amount"] == 5
+
 
 # ============================================================================
 # Error Handling Tests
 # ============================================================================
 
 class TestMultiColumnJoinErrors:
+    @pytest.mark.parametrize("left_type, right_type", [
+        (livetable.ColumnType.FLOAT32, livetable.ColumnType.FLOAT64),
+        (livetable.ColumnType.INT32, livetable.ColumnType.STRING),
+        (livetable.ColumnType.INT64, livetable.ColumnType.FLOAT64),
+    ])
+    def test_key_type_mismatch(self, left_type, right_type):
+        """Key types that can never be equal raise, not join to nothing."""
+        left = livetable.Table("left", livetable.Schema([("k", left_type, False)]))
+        right = livetable.Table("right", livetable.Schema([("k", right_type, False)]))
+
+        with pytest.raises(ValueError, match="type mismatch"):
+            left.join(right, on="k")
+        with pytest.raises(ValueError, match="type mismatch"):
+            livetable.JoinView("j", left, right, "k", "k", livetable.JoinType.LEFT)
+
     """Tests for error handling in multi-column joins."""
 
     def test_key_count_mismatch(self):

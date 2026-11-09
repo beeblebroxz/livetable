@@ -163,6 +163,21 @@ output: id, name, right_order_id, right_user_id, right_amount
 
 The prefix is unconditional, not only a collision workaround.
 
+Output names are unique. If a prefixed name is already a left column or an
+earlier right output name, `right_` is applied again until it is free. This
+happens when the left parent is itself a join, whose columns already start
+with `right_`:
+
+```text
+left (a join):  oid, cust, right_cid, right_name
+right:          cid, name
+output:         oid, cust, right_cid, right_name, right_right_cid, right_right_name
+```
+
+Before 2026-11-09 both sides produced `right_cid` here: the name was listed
+twice, the right value replaced the left one, and `get_value` could not read
+a left column that started with `right_`.
+
 For unmatched rows:
 
 - LEFT/FULL joins fill right-side columns with `ColumnValue::Null`.
@@ -170,8 +185,15 @@ For unmatched rows:
 
 ## Key semantics
 
-- Key column counts must match and the corresponding column types must compare
-  as the same `ColumnValue` variant.
+- Key column counts must match.
+- Corresponding key columns must have the same type, except that `Int32` and
+  `Int64` keys compare by value (`from_csv` and `from_json` pick the width per
+  table). Any other mismatch, such as `Float32` with `Float64`, an integer
+  with a float or string, or `Date` with `DateTime`, is an error at
+  construction. A column with no static type (a computed or aggregate
+  column) is not checked; a key of another type never matches there. (Before
+  2026-11-09 nothing was checked, and an `Int32` key never matched an `Int64`
+  key.)
 - NULL keys never match.
 - Float NaN keys never match.
 - Float keys compare by value: `-0.0` matches `0.0`, as in sorts, aggregates,
@@ -226,6 +248,8 @@ for many-to-many keys.
 - No join planner, persistence, spilling, or parallel execution.
 - Right-side output names always use `right_`; callers cannot customize the
   prefix.
+- Key types are not coerced beyond integer width: a `Float32` key cannot join
+  a `Float64` key, nor an integer key a float key.
 - The implementation is single-threaded because views use `Rc<RefCell<...>>`.
 
 Self joins are possible when the caller supplies compatible handles, but they

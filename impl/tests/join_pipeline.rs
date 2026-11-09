@@ -1193,3 +1193,224 @@ fn two_sided_batches_over_the_bound_rebuild() {
     assert!(!history_kept(&joined, cursor), "over the bound rebuilds");
     assert_eq!(joined.len(), 257);
 }
+
+fn k_join(
+    left: &Rc<RefCell<Table>>,
+    right: &Rc<RefCell<Table>>,
+    how: JoinType,
+) -> Result<JoinView, String> {
+    JoinView::new(
+        "j".into(),
+        left.clone(),
+        right.clone(),
+        "k".into(),
+        "k".into(),
+        how,
+    )
+}
+
+fn keyed_row(id: i32, k: ColumnValue) -> Row {
+    HashMap::from([("id".into(), Int32(id)), ("k".into(), k)])
+}
+
+/// An Int32 key and an Int64 key are the same key when their values are
+/// equal, on a build and on incremental inserts from either side.
+#[test]
+fn int32_and_int64_keys_match_by_value() {
+    use ColumnValue::Int64;
+    let l = keyed("l", ColumnType::Int32, &[(1, Int32(7)), (2, Int32(8))]);
+    let r = keyed("r", ColumnType::Int64, &[(10, Int64(7))]);
+    let fresh = || rows_sorted(&k_join(&l, &r, JoinType::Full).unwrap());
+    let mut joined = k_join(&l, &r, JoinType::Full).unwrap();
+    assert_eq!(joined.len(), 2, "7 matches, 8 keeps a placeholder");
+    assert_eq!(joined.get_value(0, "right_id").unwrap(), Int32(10));
+
+    let before = baseline(&joined);
+    r.borrow_mut().append_row(keyed_row(11, Int64(8))).unwrap();
+    let changes = replayed(&mut joined, before);
+    assert!(
+        changes.contains(&update(1, "right_id", Null, Int32(11))),
+        "the Int64 8 fills the Int32 8's placeholder: {changes:?}"
+    );
+    joined.check_bookkeeping().unwrap();
+    assert_eq!(rows_sorted(&joined), fresh());
+
+    let before = baseline(&joined);
+    l.borrow_mut().append_row(keyed_row(3, Int32(7))).unwrap();
+    replayed(&mut joined, before);
+    joined.check_bookkeeping().unwrap();
+    assert_eq!(joined.len(), 3);
+    assert_eq!(rows_sorted(&joined), fresh());
+}
+
+/// `from_csv` picks an integer width per table from its values, so a shared
+/// id column can be Int32 in one table and Int64 in the other.
+#[test]
+fn csv_tables_join_across_inferred_integer_widths() {
+    let small = Table::from_csv("small", "id,name\n1,x\n2,y\n").unwrap();
+    let wide = Table::from_csv("wide", "id,amount\n1,5\n3000000000,7\n").unwrap();
+    assert_eq!(
+        small.schema().get_column_type("id"),
+        Some(ColumnType::Int32)
+    );
+    assert_eq!(wide.schema().get_column_type("id"), Some(ColumnType::Int64));
+    let joined = JoinView::new(
+        "j".into(),
+        Rc::new(RefCell::new(small)),
+        Rc::new(RefCell::new(wide)),
+        "id".into(),
+        "id".into(),
+        JoinType::Inner,
+    )
+    .unwrap();
+    assert_eq!(joined.len(), 1, "id 1 is in both tables");
+}
+
+/// Key types that can never be equal are an error, not an empty join.
+#[test]
+fn mismatched_key_types_are_rejected() {
+    let cases = [
+        (ColumnType::Float32, ColumnType::Float64),
+        (ColumnType::Int32, ColumnType::String),
+        (ColumnType::Int64, ColumnType::Float64),
+        (ColumnType::Date, ColumnType::DateTime),
+    ];
+    for (a, b) in cases {
+        for (left, right) in [(a, b), (b, a)] {
+            let error = k_join(
+                &keyed("l", left, &[]),
+                &keyed("r", right, &[]),
+                JoinType::Left,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{left:?} joined to {right:?} was accepted"));
+            assert!(
+                error.contains(&format!("{left:?}")) && error.contains(&format!("{right:?}")),
+                "{error}"
+            );
+        }
+    }
+}
+
+/// A left column whose name starts with `right_` is a left column.
+#[test]
+fn a_left_column_named_like_a_right_output_stays_readable() {
+    let mut left = Table::new(
+        "l".into(),
+        Schema::new(vec![
+            ("id".into(), ColumnType::Int32, false),
+            ("right_hand".into(), ColumnType::String, false),
+        ]),
+    );
+    left.append_row(HashMap::from([
+        ("id".into(), Int32(1)),
+        ("right_hand".into(), name("yes")),
+    ]))
+    .unwrap();
+    let joined = JoinView::new(
+        "j".into(),
+        Rc::new(RefCell::new(left)),
+        customers(&[(1, "ann")]),
+        "id".into(),
+        "cid".into(),
+        JoinType::Left,
+    )
+    .unwrap();
+    assert_eq!(joined.get_value(0, "right_hand").unwrap(), name("yes"));
+    assert_eq!(joined.get_row(0).unwrap()["right_hand"], name("yes"));
+    assert_eq!(joined.get_value(0, "right_name").unwrap(), name("ann"));
+}
+
+/// A join over a join: the first join's `right_` columns are left columns of
+/// the second, and the second's right columns must not reuse their names.
+#[test]
+fn a_join_over_a_join_keeps_every_column() {
+    let o = orders(&[(1, Some(10), 5), (2, Some(20), 6)]);
+    let c = customers(&[(10, "ann"), (20, "bob")]);
+    let accounts = customers(&[(10, "gold")]);
+    let first = Rc::new(RefCell::new(join(o.clone(), c.clone(), JoinType::Left)));
+    let mut second = JoinView::new(
+        "j2".into(),
+        first.clone(),
+        accounts.clone(),
+        "right_cid".into(),
+        "cid".into(),
+        JoinType::Left,
+    )
+    .unwrap();
+    let names = second.column_names();
+    assert_eq!(
+        names,
+        [
+            "oid",
+            "cust",
+            "amount",
+            "right_cid",
+            "right_name",
+            "right_right_cid",
+            "right_right_name"
+        ]
+    );
+    let check_cells = |view: &JoinView| {
+        for row in 0..view.len() {
+            let full = view.get_row(row).unwrap();
+            assert_eq!(full.len(), names.len(), "row {row}: {full:?}");
+            for (index, column) in names.iter().enumerate() {
+                assert_eq!(
+                    view.get_value(row, column).as_ref(),
+                    Ok(&full[column]),
+                    "row {row} column {column}"
+                );
+                assert_eq!(
+                    view.get_value_by_index(row, index).as_ref(),
+                    Ok(&full[column]),
+                    "row {row} column {index}"
+                );
+            }
+        }
+    };
+    check_cells(&second);
+    // Order 2 has no account: it keeps its customer from the first join.
+    assert_eq!(
+        second.get_value(0, "right_right_name").unwrap(),
+        name("gold")
+    );
+    assert_eq!(second.get_value(1, "right_name").unwrap(), name("bob"));
+    assert_eq!(second.get_value(1, "right_right_name").unwrap(), Null);
+
+    let before = baseline(&second);
+    accounts
+        .borrow_mut()
+        .append_row(customer(20, "silver"))
+        .unwrap();
+    assert_eq!(
+        replayed(&mut second, before),
+        [
+            update(1, "right_right_cid", Null, Int32(20)),
+            update(1, "right_right_name", Null, name("silver")),
+        ]
+    );
+    check_cells(&second);
+
+    let before = baseline(&second);
+    accounts
+        .borrow_mut()
+        .set_value(0, "name", name("platinum"))
+        .unwrap();
+    assert_eq!(
+        replayed(&mut second, before),
+        [update(
+            0,
+            "right_right_name",
+            name("gold"),
+            name("platinum")
+        )]
+    );
+
+    let before = baseline(&second);
+    accounts.borrow_mut().delete_row(1).unwrap();
+    replayed(&mut second, before);
+    check_cells(&second);
+    assert_eq!(second.get_value(1, "right_name").unwrap(), name("bob"));
+    second.check_bookkeeping().unwrap();
+}

@@ -222,6 +222,8 @@ agg = livetable.AggregateView(
 # (they would otherwise permanently poison incremental SUM/AVG/percentile state).
 # In group-by keys, all NaNs form a single group (Postgres-style) and -0.0
 # groups together with 0.0.
+# Infinities are kept: a group holding +inf sums to +inf (NaN if it also
+# holds -inf), and returns to its finite sum once the infinity is removed.
 
 # Access aggregated data
 for i in range(len(agg)):
@@ -879,10 +881,14 @@ explicit `JoinView` registers itself the first time a view is chained on it.
 Registries hold weak references, so keep the chained views you use alive.
 
 **Notes:**
-- Right table columns are prefixed with `"right_"` to avoid conflicts
+- Right table columns are prefixed with `"right_"` to avoid conflicts. If
+  the prefixed name is already taken, the prefix is applied again
 - NULL values in join keys don't match (SQL semantics)
 - Float keys: NaN never matches; `-0.0` matches `0.0`
 - Key counts must match between left and right
+- Key types must match, except that `INT32` and `INT64` keys compare by
+  value. Any other mismatch (for example `FLOAT32` with `FLOAT64`, or `INT32`
+  with `STRING`) raises `ValueError`
 
 ### JoinType
 

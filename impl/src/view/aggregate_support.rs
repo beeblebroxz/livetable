@@ -51,8 +51,13 @@ impl Ord for OrderedF64 {
 /// Internal state for tracking aggregate statistics for one source column
 #[derive(Debug, Clone)]
 pub(super) struct ColumnAggState {
-    /// Running sum for SUM and AVG calculations
-    pub(super) sum: f64,
+    /// Running sum of the finite values, for SUM and AVG. Infinities are
+    /// counted below instead: adding one and later subtracting it would
+    /// leave `inf - inf`, a NaN that no later removal clears.
+    sum: f64,
+    /// How many +inf and -inf values the column holds.
+    positive_infinities: usize,
+    negative_infinities: usize,
     /// Count of non-null values
     pub(super) count: usize,
     /// Every value with its multiplicity, so MIN/MAX are the first and last
@@ -68,6 +73,8 @@ impl ColumnAggState {
     pub(super) fn new(needs_sorted: bool, needs_extremes: bool) -> Self {
         ColumnAggState {
             sum: 0.0,
+            positive_infinities: 0,
+            negative_infinities: 0,
             count: 0,
             extremes: needs_extremes.then(BTreeMap::new),
             sorted_values: if needs_sorted { Some(Vec::new()) } else { None },
@@ -97,10 +104,36 @@ impl ColumnAggState {
 
     /// The sum, count and MIN/MAX multiset, which both adds update.
     fn add_to_totals(&mut self, value: f64) {
-        self.sum += value;
+        match self.infinities(value) {
+            Some(infinities) => *infinities += 1,
+            None => self.sum += value,
+        }
         self.count += 1;
         if let Some(extremes) = &mut self.extremes {
             *extremes.entry(OrderedF64(value)).or_insert(0) += 1;
+        }
+    }
+
+    /// The counter for an infinite value's sign; None for a finite value.
+    /// NaN never arrives: `extract_numeric` excludes it.
+    fn infinities(&mut self, value: f64) -> Option<&mut usize> {
+        if value == f64::INFINITY {
+            Some(&mut self.positive_infinities)
+        } else if value == f64::NEG_INFINITY {
+            Some(&mut self.negative_infinities)
+        } else {
+            None
+        }
+    }
+
+    /// The sum of every value held, as adding them in any order gives it:
+    /// an infinity outweighs the finite sum, and opposite infinities are NaN.
+    fn total(&self) -> f64 {
+        match (self.positive_infinities > 0, self.negative_infinities > 0) {
+            (true, true) => f64::NAN,
+            (true, false) => f64::INFINITY,
+            (false, true) => f64::NEG_INFINITY,
+            (false, false) => self.sum,
         }
     }
 
@@ -114,7 +147,13 @@ impl ColumnAggState {
     /// Remove a numeric value from the aggregate state. Removed values come
     /// from changeset payloads, so they are always present.
     pub(super) fn remove_value(&mut self, value: f64) {
-        self.sum -= value;
+        match self.infinities(value) {
+            Some(infinities) => {
+                debug_assert!(*infinities > 0, "removed infinity {value} was never added");
+                *infinities = infinities.saturating_sub(1);
+            }
+            None => self.sum -= value,
+        }
         self.count = self.count.saturating_sub(1);
 
         if let Some(ref mut sorted) = self.sorted_values {
@@ -155,6 +194,11 @@ impl ColumnAggState {
             return Some(sorted[lo]);
         }
         let frac = idx - lo as f64;
+        if frac == 0.0 {
+            // Exactly on a value: interpolating would compute `hi * 0`,
+            // which is NaN for an infinite neighbour.
+            return Some(sorted[lo]);
+        }
         Some(sorted[lo] * (1.0 - frac) + sorted[hi] * frac)
     }
 
@@ -168,11 +212,11 @@ impl ColumnAggState {
             // also makes a state that was emptied by incremental removal agree
             // with a from-scratch rebuild (which has no per-column state at all).
             AggregateFunction::Sum if self.count == 0 => ColumnValue::Null,
-            AggregateFunction::Sum => ColumnValue::Float64(self.sum),
+            AggregateFunction::Sum => ColumnValue::Float64(self.total()),
             AggregateFunction::Count => ColumnValue::Int64(self.count as i64),
             AggregateFunction::Avg => {
                 if self.count > 0 {
-                    ColumnValue::Float64(self.sum / self.count as f64)
+                    ColumnValue::Float64(self.total() / self.count as f64)
                 } else {
                     ColumnValue::Null
                 }
