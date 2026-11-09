@@ -49,10 +49,10 @@ fn median(mut values: Vec<f64>) -> f64 {
 }
 
 fn main() {
-    assert!(
-        !cfg!(debug_assertions),
-        "debug builds give meaningless timings: run with --release"
-    );
+    // Not `assert!`: clippy rejects an assertion on a constant.
+    if cfg!(debug_assertions) {
+        panic!("debug builds give meaningless timings: run with --release");
+    }
     for (rows, groups) in [
         (10_000, 8),
         (100_000, 8),

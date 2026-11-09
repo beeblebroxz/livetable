@@ -623,10 +623,10 @@ fn two_sided(ctx: &Ctx, p: &Pipeline) {
 }
 
 fn main() {
-    assert!(
-        !cfg!(debug_assertions),
-        "debug builds give meaningless timings: run with --release"
-    );
+    // Not `assert!`: clippy rejects an assertion on a constant.
+    if cfg!(debug_assertions) {
+        panic!("debug builds give meaningless timings: run with --release");
+    }
     let sizes: Vec<usize> = std::env::args()
         .skip(1)
         .map(|s| s.parse().expect("integer row count"))
