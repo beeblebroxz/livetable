@@ -242,6 +242,7 @@ items below remain original future ideas.
 - [x] View-over-view composition (DAG): all views implement `ReadableTable`; tables, filters, sorts, aggregates, and joins emit changesets so chains through them update incrementally, while children of projection and computed views use version-checked refresh
 - [x] Shared Rust/Python filter replay for bounded mixed batches, with derived-coordinate changesets, bounded history, and rebuild invalidation
 - [x] Sorted-coordinate batch replay with cached keys, stable ties, row-move events, and Python SortedView.group_by(); aggregate index remapping batched for structural changes
+- [x] One-pass batch replay in the sorted view (the "slide over" pass above): a batch of three or more events rewrites each vector once
 - [x] CSV/JSON serialization with type inference
 - [x] Python bindings via PyO3
 - [x] WebSocket server for real-time sync (Actix-web + React frontend)

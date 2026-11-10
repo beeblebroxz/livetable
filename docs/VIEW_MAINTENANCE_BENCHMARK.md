@@ -790,6 +790,87 @@ A sorted view rebuilds above 256 events, so larger batches are not measured.
   The harness checks that each sync and its rebuild agree on the row count.
 
 
+## After one-pass batch replay in the sorted view (2026-11-09)
+
+Design: [batch replay spec](superpowers/specs/2026-11-09-batch-replay-costs-design.md), part 2.
+Harness: [`impl/examples/batch_replay_benchmark.rs`](../impl/examples/batch_replay_benchmark.rs),
+with `--sort-only`.
+
+**What changed.** A sorted view applied a batch one event at a time, and each
+structural event makes five linear steps over its vectors. A batch of three
+or more events is now resolved against the vectors as they were before the
+batch and then applied to each vector in one pass. Batches of one or two
+events take the old path.
+
+**How this was measured.** As in the section above: one `sync()` after a
+batch, then a `refresh()` as the rebuild. The view sorts N orders by `rank`,
+an Int64 column in no particular order. Batches are appends, inserts at
+random positions and deletes at random positions. Medians of 3.
+
+### Results
+
+At 1M rows:
+
+| Batch | Events | Before | After | Rebuild |
+|---|---:|---:|---:|---:|
+| Scattered inserts | 1 | 3.75 ms | 3.77 ms | 157 ms |
+| Scattered inserts | 4 | 11.8 ms | 6.4 ms | 154 ms |
+| Scattered inserts | 16 | 45.8 ms | 7.0 ms | 157 ms |
+| Scattered inserts | 64 | 181 ms | 6.7 ms | 157 ms |
+| Scattered inserts | 256 | 703 ms | 7.2 ms | 156 ms |
+| Scattered deletes | 1 | 3.06 ms | 3.08 ms | 154 ms |
+| Scattered deletes | 4 | 10.3 ms | 6.1 ms | 156 ms |
+| Scattered deletes | 16 | 44.7 ms | 5.7 ms | 160 ms |
+| Scattered deletes | 64 | 179 ms | 5.9 ms | 152 ms |
+| Scattered deletes | 256 | 718 ms | 6.2 ms | 151 ms |
+| Appends | 1 | 0.87 ms | 0.87 ms | 147 ms |
+| Appends | 4 | 2.4 ms | 1.7 ms | 159 ms |
+| Appends | 16 | 8.8 ms | 1.9 ms | 152 ms |
+| Appends | 64 | 29.3 ms | 2.0 ms | 155 ms |
+| Appends | 256 | 125 ms | 2.4 ms | 154 ms |
+
+- **A batch now costs about two events,** whatever its size: 6 to 7 ms for
+  4 to 256 scattered inserts or deletes, against 3 to 4 ms for one.
+- **At the 256-event bound a batch costs under 5% of a rebuild,** against
+  0.8 to 4.6 rebuilds before. At 100k rows it costs 4% to 8% of one, against
+  1.3 to 8 rebuilds before.
+- **One event is unchanged:** it takes the old path.
+
+### Where the two paths cross
+
+A temporary variant of the harness, not committed, timed batches of 1, 2 and
+3 events with each path forced (medians of 7, 1M rows):
+
+| Batch | Events | Event by event | One pass |
+|---|---:|---:|---:|
+| Scattered inserts | 1 | 2.8 ms | 5.2 ms |
+| Scattered inserts | 2 | 5.2 ms | 5.7 ms |
+| Scattered inserts | 3 | 8.0 ms | 6.0 ms |
+| Scattered deletes | 1 | 2.3 ms | 5.4 ms |
+| Scattered deletes | 2 | 5.4 ms | 5.4 ms |
+| Scattered deletes | 3 | 8.1 ms | 6.3 ms |
+| Appends | 1 | 0.69 ms | 1.39 ms |
+| Appends | 2 | 1.29 ms | 1.67 ms |
+| Appends | 3 | 1.88 ms | 1.73 ms |
+
+One pass costs 1.9 to 2.3 times one event, is level at two (slower for
+appends), and is ahead from three. The view therefore switches at three
+events and keeps both paths.
+
+### Environment
+
+- **Machine, OS and toolchain:** as in
+  [the join work limit section](#after-the-join-work-limit-2026-11-09).
+- **Before:** commit `5babf49`, with the harness's small sort batches and
+  `--sort-only` flag added.
+- **After:** the commit that records these results.
+- **Raw output:**
+  [`sort_batch_replay_2026-11-09-before.jsonl`](../benchmarks/sort_batch_replay_2026-11-09-before.jsonl)
+  and
+  [`sort_batch_replay_2026-11-09-after.jsonl`](../benchmarks/sort_batch_replay_2026-11-09-after.jsonl).
+- **Reproduce:** `cargo run --release --manifest-path impl/Cargo.toml --example batch_replay_benchmark -- --sort-only 100000 1000000`.
+
+
 ## Method
 
 - **Pipelines.** Each runs on fresh root tables, with exactly one view (or

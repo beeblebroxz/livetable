@@ -24,6 +24,13 @@ table.tick()  # syncs parents before children
   payloads across later updates, index shifts, and deletions. Payloads are
   prepared before mutating the cached state. Historical reconciliation is
   O(B²) worst-case for B events; larger batches use a full rebuild.
+- Since 2026-11-09, a batch of three or more events is applied in one pass
+  (`impl/src/view/sorted/batch.rs`). Every event is first resolved against
+  the cached state as it was before the batch, which gives its sorted
+  position without moving anything, and the three vectors are then rewritten
+  once. Batches of one or two events are applied event by event, as before.
+  Both paths emit the same events. A parent whose rows disagree with its
+  changeset rebuilds the sort instead of indexing out of range.
 - All emitted indices are in the sort's own row coordinates at that event.
   An insertion/deletion emits the corresponding sorted-position event. A
   moved row emits `RowDeleted(old position, old full row)` followed by
@@ -69,8 +76,12 @@ used O(N + B) temporary index storage instead). Construction and
 initial cache allocation are not measured by the update benchmark below.
 
 This is not an O(1) row-movement implementation. Moving rows, middle insertions,
-and deletions still shift vectors and inverse indices; structural batches can
-do O(BN) vector work. MIN/MAX updates are O(log g) per value, with no rescans
+and deletions still shift vectors and inverse indices: a single event costs
+O(N) vector work. Since 2026-11-09 a batch of three or more events costs
+O(N + B log N + B²) in the sort, about two events' worth, instead of O(BN):
+256 scattered inserts at 1M rows fell from 703 ms to 7.2 ms (see the
+[batch replay measurements](VIEW_MAINTENANCE_BENCHMARK.md#after-one-pass-batch-replay-in-the-sorted-view-2026-11-09)).
+MIN/MAX updates are O(log g) per value, with no rescans
 since 2026-10-26, and percentiles maintain sorted vectors. A sort's 256 input events can produce 512 output events, so a child
 filter/sort with the same 256-input bound can legitimately rebuild.
 
@@ -145,6 +156,12 @@ read counts, not timing thresholds.
   keys, NaN/signed zero, 256/257 input boundary, 512 output events, multiple and
   lagging consumers, no-op history, refresh/compaction, stale-child creation,
   nested sorts/filters, and zero source reads for non-sort and aggregate updates.
+  Batch tests cover a row inserted and deleted in one batch, a row re-keyed
+  twice, inserts between equal keys, appends only, and a batch that deletes
+  every row.
+- `impl/src/view/sorted/batch_tests.rs`: random batches of 1 to 256 events
+  through the one-pass path and the event-by-event path, requiring the same
+  events, the same cached vectors, and the vectors a rebuild gives.
 - `impl/tests/forward_prop_fuzz.rs`: randomized single/mixed batches compare
   each live stage to fresh recomputation, including all aggregate functions.
   Sorted output is also replayed independently, checking every old payload and

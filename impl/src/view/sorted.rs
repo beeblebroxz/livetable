@@ -9,6 +9,18 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+type Row = HashMap<String, ColumnValue>;
+
+mod batch;
+#[cfg(test)]
+mod batch_tests;
+
+/// Batches of at least this many events are applied in one pass over the
+/// view's vectors (`batch.rs`); shorter ones event by event. One pass costs
+/// about as much as two events, measured: 1.9 to 2.3 times one event, level
+/// at two, and ahead from three (docs/VIEW_MAINTENANCE_BENCHMARK.md).
+const MIN_BATCH_REPLAY_EVENTS: usize = 3;
+
 /// Sort order specification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
@@ -466,35 +478,62 @@ impl SortedView {
     }
 }
 
-impl IncrementalView for SortedView {
-    fn apply_changes(&mut self, changes: &[TableChange]) -> bool {
-        if changes.is_empty() {
-            return false;
+impl SortedView {
+    /// The length the batch leaves, or None if an event's index is out of
+    /// range for the rows before it: inserts at or before the end, deletes
+    /// and updates before it.
+    fn final_len(mut len: usize, changes: &[TableChange]) -> Option<usize> {
+        for change in changes {
+            match change {
+                TableChange::RowInserted { index, .. } if *index <= len => len += 1,
+                TableChange::RowDeleted { index, .. } if *index < len => len -= 1,
+                TableChange::CellUpdated { row, .. } if *row < len => {}
+                _ => return None,
+            }
         }
-        if changes.len() > MAX_FILTER_REPLAY_CHANGES {
-            self.rebuild_index();
-            return true;
-        }
-        // A moved row is represented as delete(old row) + insert(new row).
-        // Recover full payloads before modifying any cached state; later
-        // updates/deletions in this batch may hide them from the live parent.
+        Some(len)
+    }
+
+    /// The row after each sort-key update, by change index. A moved row is
+    /// emitted as delete(old row) + insert(new row), and later updates or
+    /// deletions in the batch may hide those payloads from the live parent,
+    /// so they are recovered before any cached state changes. None if a row
+    /// cannot be read.
+    fn updated_rows(&self, changes: &[TableChange]) -> Option<HashMap<usize, Row>> {
         let mut updated_rows = HashMap::new();
         for (index, change) in changes.iter().enumerate() {
             if matches!(change, TableChange::CellUpdated { column, .. }
                 if self.sort_keys.iter().any(|key| key.column == *column))
             {
                 let row = row_after_update(changes, index, |i| self.parent.borrow().get_row(i));
-                match row {
-                    Ok(row) => {
-                        updated_rows.insert(index, row);
-                    }
-                    Err(_) => {
-                        self.rebuild_index();
-                        return true;
-                    }
-                }
+                updated_rows.insert(index, row.ok()?);
             }
         }
+        Some(updated_rows)
+    }
+
+    /// Apply a batch in one pass over the view's vectors. Emits the same
+    /// events as `apply_each`.
+    fn apply_batch(&mut self, changes: &[TableChange], updated_rows: HashMap<usize, Row>) -> bool {
+        let Some(resolved) = self.resolve_batch(changes, updated_rows) else {
+            self.rebuild_index();
+            return true;
+        };
+        self.output_changes.clear();
+        for change in self.commit_batch(resolved) {
+            self.output_changes.push(change);
+        }
+        !self.output_changes.is_empty()
+    }
+
+    /// Apply a batch one event at a time. Every structural event shifts the
+    /// view's vectors, so this is for batches too short to gain from
+    /// `apply_batch`.
+    fn apply_each(
+        &mut self,
+        changes: &[TableChange],
+        mut updated_rows: HashMap<usize, Row>,
+    ) -> bool {
         self.output_changes.clear();
         for (change_index, change) in changes.iter().enumerate() {
             match change {
@@ -605,6 +644,31 @@ impl IncrementalView for SortedView {
         }
 
         !self.output_changes.is_empty()
+    }
+}
+
+impl IncrementalView for SortedView {
+    fn apply_changes(&mut self, changes: &[TableChange]) -> bool {
+        if changes.is_empty() {
+            return false;
+        }
+        if changes.len() > MAX_FILTER_REPLAY_CHANGES
+            // A parent whose rows disagree with its changeset rebuilds
+            // rather than index out of range.
+            || Self::final_len(self.sorted_index.len(), changes) != Some(self.parent.borrow().len())
+        {
+            self.rebuild_index();
+            return true;
+        }
+        let Some(updated_rows) = self.updated_rows(changes) else {
+            self.rebuild_index();
+            return true;
+        };
+        if changes.len() >= MIN_BATCH_REPLAY_EVENTS {
+            self.apply_batch(changes, updated_rows)
+        } else {
+            self.apply_each(changes, updated_rows)
+        }
     }
 
     fn last_synced_generation(&self) -> u64 {

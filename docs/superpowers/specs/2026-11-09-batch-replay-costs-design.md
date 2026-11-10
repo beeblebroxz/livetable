@@ -1,7 +1,8 @@
 # Batch replay costs in joins and sorted views
 
-**Status:** Part 1 (join work limit) implemented 2026-11-09. Part 2 (one-pass
-batch replay in the sorted view) is designed here and not implemented.
+**Status:** Both parts implemented 2026-11-09. Part 2's results, and where the
+implementation departs from the design, are under
+[Part 2 as built](#part-2-as-built).
 
 ## Why
 
@@ -75,7 +76,7 @@ never change what it produces: a rebuild gives the same rows.
   512 output events before the smaller limit applies. Deletes in batches of
   512 events or fewer are not looked up, and key updates are never counted.
 
-## Part 2: one-pass batch replay in the sorted view (design)
+## Part 2: one-pass batch replay in the sorted view
 
 The original vision asks for this: "inserting 20 rows at scattered indexes
 can be done in one 'slide over' pass rather than 20 separate passes."
@@ -171,6 +172,46 @@ for them.
   re-keyed twice; an insert between rows of equal key; a batch of appends
   only; a batch that deletes every row.
 
+### Part 2 as built
+
+Code: `impl/src/view/sorted/batch.rs`. Plan:
+`docs/superpowers/plans/2026-11-09-sorted-batch-replay.md`.
+
+Medians of 3 at 1M rows
+(`benchmarks/sort_batch_replay_2026-11-09-{before,after}.jsonl`):
+
+| Batch | Before | After | Budget |
+|---|---:|---:|---:|
+| 256 scattered inserts | 703 ms | 7.2 ms | under 20 ms |
+| 256 scattered deletes | 718 ms | 6.2 ms | under 20 ms |
+| 256 appends | 125 ms | 2.4 ms | under 10 ms |
+| 1 scattered insert | 3.75 ms | 3.77 ms | at most 1.10× |
+
+Every budget is met. The before column differs slightly from the table above,
+which came from the earlier run of the same harness.
+
+Departures from the design:
+
+- **Batches of one or two events keep the per-event path.** One pass costs
+  about two events' worth: 1.9 to 2.3 times one event, level at two, ahead
+  from three. So the switch is at three events
+  (`MIN_BATCH_REPLAY_EVENTS`), and both paths stay.
+- **The two paths are checked against each other,** not by more fuzz trials.
+  A unit test applies random batches of 1 to 256 events through both and
+  requires the same events, the same three vectors, and the vectors a
+  rebuild gives. `forward_prop_fuzz` already runs batches of up to 6 events
+  through whole pipelines, which now takes the one-pass path from 3.
+- **Parent order is a segment list,** not a walk back through the events:
+  runs of pre-batch rows that are still consecutive, and inserted rows.
+  It gives each event's row directly, and its final form is the parent
+  order the commit needs.
+- **`sort_values` is rewritten in place,** by one `retain` for deleted rows
+  and one rotation per inserted row from the end, so no second copy of the
+  key columns is allocated.
+- **A parent whose rows disagree with its changeset now rebuilds,** in both
+  paths. The sorted view used to index out of range there; the aggregate
+  and the join already rebuilt.
+
 ### The same split in the join
 
 The join's batch has the same shape, and the same split applies: resolve
@@ -199,6 +240,17 @@ prove the technique.
   right delete into one.
 - **The filter view.** Its per-event cost is one shift of one vector, and a
   256-event batch stays below its rebuild.
+
+## Acceptance (part 2)
+
+- The existing tests in `impl/tests/sorted_pipeline.rs` pass unmodified, and
+  the five new batch tests pass on both paths.
+- The differential unit test fails under each of four planted bugs: an
+  off-by-one in the floating-row count, a wrong tie rule against frozen
+  rows, reversed order between two inserted rows with one anchor, and a
+  short rotation in the commit.
+- The budgets above.
+- **Full suite:** fuzz, clippy and the Python suite all pass.
 
 ## Acceptance (part 1)
 

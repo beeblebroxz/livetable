@@ -631,3 +631,135 @@ fn float_sort_has_transitive_nan_order_and_stable_signed_zero_ties() {
         }
     }
 }
+
+/// Sync after `mutate`, replay the emitted history onto the rows from before
+/// it, and check the result against the view and a fresh sort.
+fn replayed_batch(
+    table: &Rc<RefCell<Table>>,
+    view: &mut SortedView,
+    mutate: impl FnOnce(&mut Table),
+) -> Vec<TableChange> {
+    let mut rows = snapshot(view);
+    let cursor = view.changeset().unwrap().total_len();
+    mutate(&mut table.borrow_mut());
+    view.sync();
+    let changes = view
+        .changeset()
+        .unwrap()
+        .changes_from(cursor)
+        .expect("a small batch keeps history")
+        .to_vec();
+    replay(&mut rows, &changes);
+    assert_eq!(rows, snapshot(view), "replayed history reproduces the view");
+    assert_eq!(rows, snapshot(&sorted(table.clone())), "the view is sorted");
+    changes
+}
+
+fn ids(view: &dyn ReadableTable) -> Vec<i32> {
+    snapshot(view)
+        .iter()
+        .map(|row| row["id"].as_i32().unwrap())
+        .collect()
+}
+
+// Batches of three or more events are applied in one pass (sorted/batch.rs).
+
+#[test]
+fn a_row_inserted_and_deleted_in_one_batch_emits_both() {
+    let table = base(5);
+    let mut ranked = sorted(table.clone());
+    let changes = replayed_batch(&table, &mut ranked, |table| {
+        table.insert_row(2, row(10, Some(1), 10)).unwrap(); // ties with id 1, after it
+        table.delete_row(2).unwrap();
+        table.set_value(0, "amount", ColumnValue::Int32(5)).unwrap();
+    });
+    assert!(matches!(
+        changes.as_slice(),
+        [
+            TableChange::RowInserted { index: 2, .. },
+            TableChange::RowDeleted { index: 2, .. },
+            TableChange::CellUpdated { row: 0, .. },
+        ]
+    ));
+    assert_eq!(ids(&ranked), [0, 1, 2, 3, 4]);
+}
+
+#[test]
+fn a_row_rekeyed_twice_in_one_batch_moves_twice() {
+    let table = base(5);
+    let mut ranked = sorted(table.clone());
+    let changes = replayed_batch(&table, &mut ranked, |table| {
+        table.set_value(0, "rank", ColumnValue::Int32(10)).unwrap(); // to the end
+        table.set_value(0, "rank", ColumnValue::Int32(2)).unwrap(); // ties with id 2, before it
+        table.append_row(row(11, Some(7), 10)).unwrap();
+    });
+    assert!(matches!(
+        changes.as_slice(),
+        [
+            TableChange::RowDeleted { index: 0, .. },
+            TableChange::RowInserted { index: 4, .. },
+            TableChange::RowDeleted { index: 4, .. },
+            TableChange::RowInserted { index: 1, .. },
+            TableChange::RowInserted { index: 5, .. },
+        ]
+    ));
+    assert_eq!(ids(&ranked), [1, 0, 2, 3, 4, 11]);
+}
+
+#[test]
+fn equal_keys_keep_parent_order_through_a_batch() {
+    let table = base(4);
+    for index in 0..4 {
+        table
+            .borrow_mut()
+            .set_value(index, "rank", ColumnValue::Int32(5))
+            .unwrap();
+    }
+    let mut ranked = sorted(table.clone());
+    replayed_batch(&table, &mut ranked, |table| {
+        table.insert_row(2, row(10, Some(5), 10)).unwrap();
+        table.insert_row(2, row(11, Some(5), 10)).unwrap(); // before id 10
+        table.insert_row(4, row(12, Some(5), 10)).unwrap(); // after id 10
+        table.delete_row(0).unwrap();
+        table.insert_row(0, row(13, Some(5), 10)).unwrap();
+        table.set_value(5, "rank", ColumnValue::Int32(5)).unwrap(); // a key edit that changes nothing
+    });
+    // Every key is equal, so the view is in parent order.
+    assert_eq!(ids(&ranked), ids(&*table.borrow()));
+    assert_eq!(ids(&ranked), [13, 1, 11, 10, 12, 2, 3]);
+}
+
+#[test]
+fn a_batch_of_appends_lands_each_row_at_its_rank() {
+    let table = base(6);
+    let mut ranked = sorted(table.clone());
+    let changes = replayed_batch(&table, &mut ranked, |table| {
+        for (id, rank) in [(20, Some(3)), (21, Some(-1)), (22, None), (23, Some(3))] {
+            table.append_row(row(id, rank, 10)).unwrap();
+        }
+    });
+    assert_eq!(changes.len(), 4);
+    assert_eq!(ids(&ranked), [21, 0, 1, 2, 3, 20, 23, 4, 5, 22]);
+}
+
+#[test]
+fn a_batch_can_delete_every_row_and_the_next_can_refill() {
+    let table = base(6);
+    let mut ranked = sorted(table.clone());
+    let changes = replayed_batch(&table, &mut ranked, |table| {
+        for _ in 0..6 {
+            table.delete_row(0).unwrap();
+        }
+    });
+    assert!(changes
+        .iter()
+        .all(|change| matches!(change, TableChange::RowDeleted { index: 0, .. })));
+    assert_eq!(ranked.len(), 0);
+
+    replayed_batch(&table, &mut ranked, |table| {
+        for (id, rank) in [(30, Some(2)), (31, Some(1)), (32, Some(3))] {
+            table.append_row(row(id, rank, 10)).unwrap();
+        }
+    });
+    assert_eq!(ids(&ranked), [31, 30, 32]);
+}
