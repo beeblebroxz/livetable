@@ -226,6 +226,28 @@ match. A batch of value-only edits on the right side locates its output rows
 in one pass over the join's index. See the
 [view maintenance benchmark](VIEW_MAINTENANCE_BENCHMARK.md) for costs.
 
+Since 2026-11-09 a sync also limits its own index maintenance. Every
+structural event shifts or scans the join's index, so a large batch used to
+cost many times the rebuild it avoided. The join counts the index and key-hash
+entries a sync moves or scans, and abandons the sync for a rebuild in two
+cases:
+
+- **History can still be delivered:** past 1,024 passes over the join's rows
+  (both parents plus the output; at least 4,096 rows). That is four passes for
+  each of 256 events, so batches within the other views' replay bound are
+  unaffected unless their events are unusually expensive.
+- **History is lost** (the batch has recorded more than 512 events, or its
+  inserts and deletes are certain to): past a further 64 passes, about the
+  cost of a rebuild. Events that move nothing, such as appends at the end of
+  the left parent, cost no passes and are never cut short.
+
+Whether a batch is certain to overflow is estimated before it is applied,
+from the matches its inserted rows have. A batch of more than 512 events also
+counts the entries its deleted rows will remove, which costs one extra scan
+of the other side's key hashes. The estimate decides only when the join gives
+up, never what it produces. See the
+[batch replay measurements](VIEW_MAINTENANCE_BENCHMARK.md#after-the-join-work-limit-2026-11-09).
+
 Joins publish output history in their own coordinates, so filters, sorts,
 aggregates, and joins built on a join replay it instead of rebuilding. Each
 batch records one event per output-index change: inserted and deleted joined

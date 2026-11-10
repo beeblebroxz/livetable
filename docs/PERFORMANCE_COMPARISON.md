@@ -104,6 +104,15 @@ tick. Mutation and tick are timed separately, and the raw output is committed.
 cargo run --release --manifest-path impl/Cargo.toml --example view_maintenance_benchmark -- 10000 100000 1000000
 ```
 
+The same report's
+[batch replay section](VIEW_MAINTENANCE_BENCHMARK.md#after-the-join-work-limit-2026-11-09)
+measures one `sync()` of a join or a sorted view after a batch of 64 to 4,096
+structural events, beside a rebuild of the same view:
+
+```bash
+cargo run --release --manifest-path impl/Cargo.toml --example batch_replay_benchmark -- 100000 1000000
+```
+
 ### Filter comparison
 
 `benchmarks/filter_vs_pandas.py` compares:

@@ -74,15 +74,51 @@ type HashedMap<V> = HashMap<u64, V, BuildHasherDefault<IdentityHasher>>;
 /// consumers rebuild above their own replay bounds anyway.
 const MAX_JOIN_OUTPUT_CHANGES: usize = MAX_FILTER_REPLAY_CHANGES * 2;
 
-/// One incremental batch's output events. Past the bound it stops recording,
-/// and building payloads; the batch then invalidates history.
-#[derive(Default)]
+/// Index maintenance one sync may do while its history can still be
+/// delivered, in passes over the join's rows (both parents plus the output):
+/// four passes for each of 256 events, the replay bound of the other views.
+/// Every structural event costs passes over the join index, so without a
+/// limit a large batch costs far more than the rebuild it avoids.
+const JOIN_REPLAY_PASSES: usize = MAX_FILTER_REPLAY_CHANGES * 4;
+
+/// About what a rebuild costs, in the same unit: measured, 64 such passes
+/// took 0.5 to 1.5 times a rebuild (docs/VIEW_MAINTENANCE_BENCHMARK.md). A
+/// batch whose history is lost keeps applying only while that is cheaper,
+/// so it costs at most about twice the cheaper path.
+const JOIN_REBUILD_PASSES: usize = 64;
+
+/// The fewest rows the work limits scale by, so a batch that grows a small
+/// join is not cut short by the size the join started at.
+const MIN_JOIN_WORK_ROWS: usize = 4096;
+
+/// One incremental batch's output events and the index maintenance it has
+/// cost. Past the output bound it stops recording, and building payloads; the
+/// batch then invalidates history. Past the work limit the sync is abandoned
+/// for a rebuild.
 struct JoinOutput {
     changes: Vec<TableChange>,
     overflowed: bool,
+    /// Join-index and key-hash entries moved or scanned so far.
+    work: usize,
+    /// `work` past this abandons the sync.
+    work_limit: usize,
+    /// The work a batch may still do once its history is lost.
+    rebuild_work: usize,
 }
 
 impl JoinOutput {
+    /// `rows`: both parents' rows plus the join's, when the sync starts.
+    fn new(rows: usize) -> Self {
+        let rows = rows.max(MIN_JOIN_WORK_ROWS);
+        JoinOutput {
+            changes: Vec::new(),
+            overflowed: false,
+            work: 0,
+            work_limit: rows.saturating_mul(JOIN_REPLAY_PASSES),
+            rebuild_work: rows.saturating_mul(JOIN_REBUILD_PASSES),
+        }
+    }
+
     fn record(
         &mut self,
         change: impl FnOnce() -> Result<TableChange, String>,
@@ -93,9 +129,36 @@ impl JoinOutput {
         if self.changes.len() == MAX_JOIN_OUTPUT_CHANGES {
             self.overflowed = true;
             self.changes = Vec::new();
+            self.history_lost();
             return Ok(());
         }
         self.changes.push(change()?);
+        Ok(())
+    }
+
+    /// This batch's history will not be delivered, so applying the rest of
+    /// it is worth no more than the rebuild it would save.
+    fn history_lost(&mut self) {
+        self.work_limit = self
+            .work_limit
+            .min(self.work.saturating_add(self.rebuild_work));
+    }
+
+    /// The events still to apply will record at least `events` more changes.
+    /// An estimate: it decides only when to give up, never what is applied.
+    fn expect(&mut self, events: usize) {
+        if !self.overflowed && self.changes.len().saturating_add(events) > MAX_JOIN_OUTPUT_CHANGES {
+            self.history_lost();
+        }
+    }
+
+    /// Account for `entries` join-index or key-hash entries about to be
+    /// moved or scanned. An error abandons the sync, which then rebuilds.
+    fn spend(&mut self, entries: usize) -> Result<(), String> {
+        self.work = self.work.saturating_add(entries);
+        if self.work > self.work_limit {
+            return Err("join replay work limit exceeded".to_string());
+        }
         Ok(())
     }
 
@@ -797,6 +860,7 @@ impl JoinView {
         right: Half,
         out: &mut JoinOutput,
     ) -> Result<(), String> {
+        out.spend(self.join_index.len() - pos)?;
         self.join_index.insert(pos, entry);
         out.record(|| {
             Ok(TableChange::RowInserted {
@@ -815,6 +879,9 @@ impl JoinView {
         out: &mut JoinOutput,
     ) -> Result<Vec<usize>, String> {
         let range = self.left_range(l);
+        if !range.is_empty() {
+            out.spend(self.join_index.len() - range.end)?;
+        }
         let removed: Vec<Entry> = self.join_index.drain(range.clone()).collect();
         for &(_, r) in &removed {
             out.record(|| {
@@ -835,6 +902,8 @@ impl JoinView {
         right: &Row,
         out: &mut JoinOutput,
     ) -> Result<Vec<usize>, String> {
+        // One scan to find the entries, one to remove them.
+        out.spend(self.join_index.len() * 2)?;
         let positions = self.right_positions(r);
         for (removed, &p) in positions.iter().enumerate() {
             let left = self.join_index[p].0;
@@ -860,6 +929,7 @@ impl JoinView {
             return Ok(());
         }
         for r in rights {
+            out.spend(self.join_index.len())?;
             let still_matched = self
                 .join_index
                 .iter()
@@ -927,6 +997,7 @@ impl JoinView {
                                     data: self.output_row(Half::Live(None), Half::Live(Some(r)))?,
                                 })
                             })?;
+                            out.spend(self.join_index.len() - pos)?;
                             self.join_index.remove(pos);
                         }
                     }
@@ -1048,9 +1119,15 @@ impl JoinView {
         // must match on the right, for one scan of the right's key hashes.
         let mut after_rows: HashMap<usize, Row> = HashMap::new();
         let mut targets: Vec<JoinKey> = Vec::new();
+        // A batch too long for the history to hold also looks up its
+        // deleted rows' keys, to count the entries they will remove.
+        let count_deletes = changes.len() > MAX_JOIN_OUTPUT_CHANGES;
         for (t, change) in changes.iter().enumerate() {
             match change {
                 TableChange::RowInserted { data, .. } => {
+                    targets.extend(Self::build_composite_key(data, &self.left_keys));
+                }
+                TableChange::RowDeleted { data, .. } if count_deletes => {
                     targets.extend(Self::build_composite_key(data, &self.left_keys));
                 }
                 TableChange::CellUpdated { column, .. } if self.left_keys.contains(column) => {
@@ -1071,10 +1148,21 @@ impl JoinView {
             self.right_pending,
             targets,
         )?;
+        // Each inserted or deleted row adds or removes one entry per match,
+        // or its placeholder in a LEFT/FULL join.
+        let unmatched = usize::from(matches!(self.join_type, JoinType::Left | JoinType::Full));
+        out.expect(Self::expected_events(
+            changes,
+            &self.left_keys,
+            &right_matches,
+            unmatched,
+            count_deletes,
+        ));
         for (t, change) in changes.iter().enumerate() {
             match change {
                 TableChange::RowDeleted { index, data } => {
                     let rights = self.remove_left_entries(*index, data, out)?;
+                    out.spend(self.join_index.len())?;
                     for (l, _) in self.join_index.iter_mut() {
                         if let Some(l) = l {
                             if *l > *index {
@@ -1083,6 +1171,7 @@ impl JoinView {
                         }
                     }
                     if let Some(hashes) = &mut self.left_key_hashes {
+                        out.spend(hashes.len() - *index)?;
                         hashes.remove(*index);
                     }
                     self.left_rows -= 1;
@@ -1094,6 +1183,7 @@ impl JoinView {
                     // is the last Some(l) — usually found in O(1) from the end.
                     let max_existing_left = self.join_index.iter().rev().find_map(|(l, _)| *l);
                     if max_existing_left.is_some_and(|max_l| max_l >= *index) {
+                        out.spend(self.join_index.len())?;
                         for (l, _) in self.join_index.iter_mut() {
                             if let Some(l) = l {
                                 if *l >= *index {
@@ -1104,6 +1194,7 @@ impl JoinView {
                     }
                     let key = Self::build_composite_key(data, &self.left_keys);
                     if let Some(hashes) = &mut self.left_key_hashes {
+                        out.spend(hashes.len() - *index)?;
                         hashes.insert(*index, key_hash(key.as_ref()));
                     }
                     self.left_rows += 1;
@@ -1161,9 +1252,13 @@ impl JoinView {
         // must match on the left, for one scan of the left's key hashes.
         let mut after_rows: HashMap<usize, Row> = HashMap::new();
         let mut targets: Vec<JoinKey> = Vec::new();
+        let count_deletes = changes.len() > MAX_JOIN_OUTPUT_CHANGES;
         for (t, change) in changes.iter().enumerate() {
             match change {
                 TableChange::RowInserted { data, .. } => {
+                    targets.extend(Self::build_composite_key(data, &self.right_keys));
+                }
+                TableChange::RowDeleted { data, .. } if count_deletes => {
                     targets.extend(Self::build_composite_key(data, &self.right_keys));
                 }
                 TableChange::CellUpdated { column, .. } if self.right_keys.contains(column) => {
@@ -1184,6 +1279,15 @@ impl JoinView {
             self.left_pending,
             targets,
         )?;
+        // One entry per match, or the unmatched entry in a RIGHT/FULL join.
+        let unmatched = usize::from(matches!(self.join_type, JoinType::Right | JoinType::Full));
+        out.expect(Self::expected_events(
+            changes,
+            &self.right_keys,
+            &left_matches,
+            unmatched,
+            count_deletes,
+        ));
         // A value-only batch moves no rows: one pass locates every target.
         let positions = if structural {
             HashMap::new()
@@ -1201,6 +1305,7 @@ impl JoinView {
             match change {
                 TableChange::RowDeleted { index, data } => {
                     let lefts = self.remove_right_entries(*index, data, out)?;
+                    out.spend(self.join_index.len())?;
                     for (_, r) in self.join_index.iter_mut() {
                         if let Some(r) = r {
                             if *r > *index {
@@ -1209,6 +1314,7 @@ impl JoinView {
                         }
                     }
                     if let Some(hashes) = &mut self.right_key_hashes {
+                        out.spend(hashes.len() - *index)?;
                         hashes.remove(*index);
                     }
                     self.right_rows -= 1;
@@ -1219,6 +1325,7 @@ impl JoinView {
                     // left), so the shift is a single conditional pass. A
                     // tail insert has no row at or after it to shift.
                     if *index < self.right_rows {
+                        out.spend(self.join_index.len())?;
                         for (_, r) in self.join_index.iter_mut() {
                             if let Some(r) = r {
                                 if *r >= *index {
@@ -1229,6 +1336,7 @@ impl JoinView {
                     }
                     let key = Self::build_composite_key(data, &self.right_keys);
                     if let Some(hashes) = &mut self.right_key_hashes {
+                        out.spend(hashes.len() - *index)?;
                         hashes.insert(*index, key_hash(key.as_ref()));
                     }
                     self.right_rows += 1;
@@ -1246,6 +1354,7 @@ impl JoinView {
                     before.insert(column.clone(), old_value.clone());
                     let new_key = Self::build_composite_key(&after, &self.right_keys);
                     if Self::build_composite_key(&before, &self.right_keys) == new_key {
+                        out.spend(self.join_index.len())?;
                         let at = self.right_positions(*row);
                         let name = self.right_output_name(column);
                         Self::update_cells(at, name, old_value, new_value, out)?;
@@ -1266,6 +1375,7 @@ impl JoinView {
                     new_value,
                 } => {
                     let at = if structural {
+                        out.spend(self.join_index.len())?;
                         self.right_positions(*row)
                     } else {
                         positions.get(row).cloned().unwrap_or_default()
@@ -1412,6 +1522,32 @@ impl JoinView {
         )
     }
 
+    /// A lower estimate of the output events one side's batch will record:
+    /// each inserted row, and each deleted row when `count_deletes` put its
+    /// key among the match targets, adds or removes one entry per matching
+    /// row of the other parent, or `unmatched` entries without a match.
+    fn expected_events(
+        changes: &[TableChange],
+        keys: &[String],
+        matches: &HashMap<JoinKey, Vec<usize>>,
+        unmatched: usize,
+        count_deletes: bool,
+    ) -> usize {
+        let entries = |row: &Row| {
+            Self::build_composite_key(row, keys)
+                .and_then(|key| matches.get(&key))
+                .map_or(unmatched, Vec::len)
+        };
+        changes
+            .iter()
+            .map(|change| match change {
+                TableChange::RowInserted { data, .. } => entries(data),
+                TableChange::RowDeleted { data, .. } if count_deletes => entries(data),
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// True if the batch contains changes that can alter join_index
     /// membership or row positions: inserts, deletes, or updates to a
     /// join-key column. Non-key cell updates are positionally inert.
@@ -1513,7 +1649,7 @@ impl JoinView {
         self.output_changes.clear();
         self.left_pending = !left_changes.is_empty();
         self.right_pending = !right_changes.is_empty();
-        let mut out = JoinOutput::default();
+        let mut out = JoinOutput::new(self.left_rows + self.right_rows + self.join_index.len());
         // The value-only side goes first, so the structural side reads the
         // other parent live in the state consumers have already applied.
         // Both structural: phase 1 applies the left batch against the right
@@ -1533,7 +1669,8 @@ impl JoinView {
                 .and_then(|()| self.apply_right_changes(&right_changes, right_structural, &mut out))
         };
         if applied.is_err() {
-            // An unreadable parent row: rebuild rather than guess.
+            // An unreadable parent row, or more index maintenance than the
+            // batch is worth: rebuild.
             self.rebuild_index();
             return true;
         }

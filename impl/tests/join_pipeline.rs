@@ -1414,3 +1414,99 @@ fn a_join_over_a_join_keeps_every_column() {
     assert_eq!(second.get_value(1, "right_name").unwrap(), name("bob"));
     second.check_bookkeeping().unwrap();
 }
+
+/// A customer that matches no order costs three passes over the join index
+/// to delete and emits nothing, so only the work limit stops such a batch.
+#[test]
+fn expensive_batches_rebuild_past_the_work_limit() {
+    let order_rows: Vec<Order> = (0..2000).map(|i| (i, Some(0), i)).collect();
+    let o = orders(&order_rows);
+    let customer_rows: Vec<(i32, &str)> = std::iter::once((0, "c"))
+        .chain((0..2000).map(|i| (1000 + i, "u")))
+        .collect();
+    let c = customers(&customer_rows);
+    let mut joined = join(o.clone(), c.clone(), JoinType::Inner);
+    assert_eq!(joined.len(), 2000);
+
+    let (_, cursor) = baseline(&joined);
+    for _ in 0..256 {
+        c.borrow_mut().delete_row(1).unwrap();
+    }
+    joined.sync();
+    assert!(history_kept(&joined, cursor), "256 events stay incremental");
+    joined.check_bookkeeping().unwrap();
+
+    // About 3 passes over 2000 entries each: past 1024 passes over the
+    // join's rows (2000 orders, 1745 customers, 2000 output rows).
+    let (_, cursor) = baseline(&joined);
+    for _ in 0..1500 {
+        c.borrow_mut().delete_row(1).unwrap();
+    }
+    joined.sync();
+    assert!(
+        !history_kept(&joined, cursor),
+        "past the work limit the join rebuilds"
+    );
+    joined.check_bookkeeping().unwrap();
+    assert_eq!(
+        rows_sorted(&joined),
+        rows_sorted(&join(o.clone(), c.clone(), JoinType::Inner))
+    );
+}
+
+/// A batch that must overflow the history is applied only while that is
+/// cheaper than a rebuild: here each new order lands near the front of the
+/// join index, a move of every entry behind it.
+#[test]
+fn a_batch_that_must_overflow_stops_at_a_rebuilds_worth_of_work() {
+    let n = 3000;
+    let customer_rows: Vec<(i32, &str)> = (0..n).map(|i| (i, "c")).collect();
+    let c = Rc::new(RefCell::new(Counted {
+        inner: customers_table(&customer_rows),
+        reads: Cell::new(0),
+    }));
+    let order_rows: Vec<Order> = (0..n).map(|i| (i, Some(i), 1)).collect();
+    let o = orders(&order_rows);
+    let customers_left = || {
+        JoinView::new(
+            "j".into(),
+            c.clone(),
+            o.clone(),
+            "cid".into(),
+            "cust".into(),
+            JoinType::Left,
+        )
+        .unwrap()
+    };
+    let mut joined = customers_left();
+    // The first order insert builds the customers' key hashes.
+    o.borrow_mut().append_row(order(n, Some(0), 1)).unwrap();
+    joined.sync();
+
+    // 100 orders for customer 0 fit the history, so they are applied.
+    let before = baseline(&joined);
+    for i in 0..100 {
+        o.borrow_mut()
+            .append_row(order(10_000 + i, Some(0), 1))
+            .unwrap();
+    }
+    replayed(&mut joined, before);
+
+    // 600 more cannot fit (600 > 512), and cost more than a rebuild.
+    for i in 0..600 {
+        o.borrow_mut()
+            .append_row(order(20_000 + i, Some(0), 1))
+            .unwrap();
+    }
+    c.borrow().reads.set(0);
+    joined.sync();
+    assert!(
+        c.borrow().reads.get() >= n as usize,
+        "a rebuild rereads every customer key: {} reads",
+        c.borrow().reads.get()
+    );
+    joined.check_bookkeeping().unwrap();
+    // One order per customer, the warm-up order, then 100 and 600.
+    assert_eq!(joined.len(), (n + 701) as usize);
+    assert_eq!(rows_sorted(&joined), rows_sorted(&customers_left()));
+}

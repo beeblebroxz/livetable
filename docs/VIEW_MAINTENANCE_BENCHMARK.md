@@ -687,6 +687,109 @@ unchanged.
 - **Reproduce:** `cargo run --release --manifest-path impl/Cargo.toml --example aggregate_build_benchmark`.
 
 
+## After the join work limit (2026-11-09)
+
+Design: [batch replay spec](superpowers/specs/2026-11-09-batch-replay-costs-design.md).
+Harness: [`impl/examples/batch_replay_benchmark.rs`](../impl/examples/batch_replay_benchmark.rs).
+
+**What changed.** A join applied a one-sided batch of any size event by
+event, and each structural event passes over the join's index. The join now
+counts that index maintenance and abandons the sync for a rebuild when it is
+no longer worth it: past 1,024 passes over its rows while its history can
+still be delivered, and past about one rebuild's worth (64 passes) once the
+history is lost or certain to be. Batches of events that move nothing, such
+as appends to the left parent, are not affected.
+
+**How this was measured.** The earlier sections time one event. This harness
+times one `sync()` after a batch of B events, then a `refresh()` of the same
+view over the same rows as the rebuild to compare with.
+
+- **Tables:** N orders, ten per customer, and N/10 customers, both
+  FastUpdates so that the untimed root mutations stay cheap.
+- **Joins:** `orders_left` is orders LEFT JOIN customers, so the batch is on
+  the left side. `orders_right` is customers LEFT JOIN orders.
+- **Batches:** appends, inserts at random positions and deletes at random
+  positions, of 64, 256, 1,024 and 4,096 orders.
+- **Sampling:** the median of 3. Before each sample the join is rebuilt and
+  one untimed event of the same kind is synced, so per-side key hashes
+  exist.
+
+### Results
+
+At 1M orders. "÷ rebuild" is the after time over the rebuild time.
+
+| Workload | Batch | Before | After | Rebuild | ÷ rebuild |
+|---|---:|---:|---:|---:|---:|
+| `orders_left` scattered inserts | 1,024 | 938 ms | 203 ms | 122 ms | 1.7× |
+| `orders_left` scattered inserts | 4,096 | 3,701 ms | 201 ms | 117 ms | 1.7× |
+| `orders_left` scattered deletes | 1,024 | 972 ms | 213 ms | 121 ms | 1.8× |
+| `orders_left` scattered deletes | 4,096 | 3,766 ms | 210 ms | 116 ms | 1.8× |
+| `orders_right` appends | 1,024 | 335 ms | 255 ms | 170 ms | 1.5× |
+| `orders_right` appends | 4,096 | 1,382 ms | 255 ms | 168 ms | 1.5× |
+| `orders_right` scattered inserts | 1,024 | 1,311 ms | 283 ms | 169 ms | 1.7× |
+| `orders_right` scattered inserts | 4,096 | 5,588 ms | 297 ms | 179 ms | 1.7× |
+| `orders_right` scattered deletes | 1,024 | 2,628 ms | 285 ms | 168 ms | 1.7× |
+| `orders_right` scattered deletes | 4,096 | 11,588 ms | 286 ms | 174 ms | 1.6× |
+| `orders_left` appends | 1,024 | 1.10 ms | 1.16 ms | 120 ms | 0.01× |
+| `orders_left` appends | 4,096 | 2.83 ms | 3.08 ms | 141 ms | 0.02× |
+
+- **Large batches now cost 1.5 to 1.8 rebuilds at 1M,** against 2 to 63
+  before. At 100k they cost 1.9 to 2.5 rebuilds, against 3.4 to 90. None
+  kept its history before or after: each emits more than 512 events.
+- **The cost no longer grows with the batch.** 4,096 events cost what 1,024
+  do: the join gives up after the same amount of work, then rebuilds.
+- **The remaining overhead is the attempt.** The join spends up to about one
+  rebuild's worth of work before giving up, so a batch costs at most about
+  twice the cheaper path. Giving up at once would need the batch's cost
+  before applying it, which the spec's part 2 provides.
+- **Appends to the left parent are unchanged** and stay incremental: 3 ms
+  for 4,096 rows against a 141 ms rebuild.
+- **Batches of 64 and 256 events are unchanged within noise.** They keep
+  their history, as before, and cost what they did: 0.1 to 3.7 rebuilds at
+  1M. That cost is the subject of the spec's part 2.
+  - At 1M every such row is within 12% of before, except `orders_right`
+    appends at 256 events (87 ms before, 103 ms after).
+  - At 100k three rows were higher in the recorded run: `orders_left`
+    deletes at 64 and 256 events (7.4 → 11.1 ms and 31.2 → 46.0 ms) and
+    `orders_right` appends at 64 (2.4 → 5.4 ms). Two reruns of the 100k
+    size gave 8.3 and 7.5 ms, 37.7 and 29.7 ms, and 2.4 and 2.4 ms.
+  - With medians of 3, these runs cannot rule out a change of up to about
+    20% at these sizes. The change adds a counter update per index step and
+    one key lookup per inserted row.
+
+### Sorted view baseline
+
+The same harness records the sorted view, whose code this change does not
+touch, as the baseline for one-pass batch replay (the spec's part 2). At 1M
+rows, from the before run:
+
+| Batch | 64 events | 256 events | Rebuild |
+|---|---:|---:|---:|
+| Scattered inserts | 167 ms | 711 ms | 185 ms |
+| Scattered deletes | 205 ms | 749 ms | 175 ms |
+| Appends | 30 ms | 122 ms | 190 ms |
+
+A sorted view rebuilds above 256 events, so larger batches are not measured.
+
+### Environment
+
+- **Machine:** Apple M1 Pro, 16 GiB RAM, 8 cores, macOS 27.2.1 (26B131). This
+  is not the machine of the earlier sections; do not compare across them.
+- **Toolchain:** rustc 1.99.1 (58cf8f9c3 2026-10-13), release build.
+- **Before:** commit `0c1a27b`, with this harness added.
+- **After:** the commit that records these results.
+- **Load:** no other builds or tests were running during the recorded runs.
+  CPU frequency, thermal state and scheduling were uncontrolled.
+- **Raw output:**
+  [`batch_replay_2026-11-09-before.jsonl`](../benchmarks/batch_replay_2026-11-09-before.jsonl),
+  [`batch_replay_2026-11-09-after.jsonl`](../benchmarks/batch_replay_2026-11-09-after.jsonl),
+  and the two 100k reruns of the after code,
+  [`rerun1`](../benchmarks/batch_replay_2026-11-09-after-100k-rerun1.jsonl) and
+  [`rerun2`](../benchmarks/batch_replay_2026-11-09-after-100k-rerun2.jsonl).
+- **Reproduce:** `cargo run --release --manifest-path impl/Cargo.toml --example batch_replay_benchmark -- 100000 1000000`.
+  The harness checks that each sync and its rebuild agree on the row count.
+
+
 ## Method
 
 - **Pipelines.** Each runs on fresh root tables, with exactly one view (or
