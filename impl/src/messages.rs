@@ -89,9 +89,37 @@ pub struct ViewNodeSpec {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LabAction {
-    Reset { rows: usize },
+    Reset {
+        rows: usize,
+    },
     Step,
-    Update { row_id: u64, amount: f64 },
+    /// `size` mutations before one tick: 16, 64 or 256.
+    Burst {
+        size: usize,
+    },
+    Update {
+        row_id: u64,
+        amount: f64,
+    },
+}
+
+/// What one of the requester's views cost during a lab command, measured on
+/// the server. Microseconds.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct ViewTiming {
+    pub node_id: String,
+    /// The view's own `sync()`.
+    pub sync_us: f64,
+    /// Building a fresh view of the same kind over the same parent, after
+    /// the sync. Bursts only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_us: Option<f64>,
+}
+
+/// Per-view engine time for the requester's pipeline, in pipeline order.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct LabTiming {
+    pub views: Vec<ViewTiming>,
 }
 
 /// Messages sent from client to server
@@ -171,6 +199,10 @@ pub enum ServerMessage {
         rows: usize,
         step: u64,
         mutations: usize,
+        /// Absent after a reset, and when the requester has no pipeline on
+        /// the lab table.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timing: Option<LabTiming>,
     },
     LabError {
         request_id: u32,

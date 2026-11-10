@@ -325,6 +325,8 @@ mod tests {
             kind: "filter".into(),
             view: probe.clone(),
             delivery,
+            sync: Box::new(|| {}),
+            rebuild: Box::new(|| Ok(())),
         };
         probe
             .borrow_mut()

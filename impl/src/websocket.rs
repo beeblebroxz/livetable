@@ -109,6 +109,7 @@ struct Disconnect {
 struct LabCommand {
     request_id: u32,
     action: LabAction,
+    conn: ConnId,
     requester: ClientRecipient,
 }
 
@@ -252,6 +253,8 @@ impl Handler<LabCommand> for TableEngineActor {
                         self.broadcast_base("lab", update);
                     }
                 }
+                // Before the tick, which would sync these views untimed.
+                let timing = self.engine.lab_timing(message.conn, &message.action);
                 self.propagate_views("lab");
                 Self::send(
                     &message.requester,
@@ -260,6 +263,7 @@ impl Handler<LabCommand> for TableEngineActor {
                         rows,
                         step,
                         mutations,
+                        timing,
                     },
                 );
             }
@@ -432,6 +436,7 @@ impl TableWebSocket {
                 self.state.engine.do_send(LabCommand {
                     request_id,
                     action,
+                    conn: self.conn_id,
                     requester,
                 });
             }
@@ -716,5 +721,93 @@ mod tests {
                 ..
             } if node_id == "bad"
         )));
+    }
+
+    #[actix::test]
+    async fn a_lab_burst_replies_with_the_requesters_view_timing() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let requester = Probe {
+            messages: received.clone(),
+        }
+        .start()
+        .recipient();
+        let mut lab = TableEngine::new();
+        lab.enable_lab().unwrap();
+        let engine = TableEngineActor {
+            engine: lab,
+            ..TableEngineActor::new()
+        }
+        .start();
+
+        engine
+            .send(SetPipeline {
+                conn: 7,
+                table_name: "lab".into(),
+                pipeline_generation: 1,
+                nodes: vec![
+                    ViewNodeSpec {
+                        id: "high-value".into(),
+                        source_id: "base".into(),
+                        kind: ViewKindSpec::Filter {
+                            predicate: "amount >= 1000".into(),
+                        },
+                    },
+                    ViewNodeSpec {
+                        id: "ranked".into(),
+                        source_id: "high-value".into(),
+                        kind: ViewKindSpec::Sort {
+                            keys: vec![crate::messages::SortKeySpec {
+                                column: "amount".into(),
+                                descending: true,
+                            }],
+                        },
+                    },
+                ],
+                requester: requester.clone(),
+            })
+            .await
+            .unwrap();
+        // Another connection's command: it has no pipeline, so no timing.
+        for (request_id, conn) in [(1, 7), (2, 8)] {
+            engine
+                .send(LabCommand {
+                    request_id,
+                    action: LabAction::Burst { size: 64 },
+                    conn,
+                    requester: requester.clone(),
+                })
+                .await
+                .unwrap();
+        }
+
+        actix::clock::sleep(Duration::from_millis(10)).await;
+        let messages = received.lock().unwrap();
+        let timing = |id: u32| {
+            messages
+                .iter()
+                .find_map(|message| match message {
+                    ServerMessage::LabComplete {
+                        request_id,
+                        mutations: 64,
+                        rows: 1000,
+                        timing,
+                        ..
+                    } if *request_id == id => Some(timing.clone()),
+                    _ => None,
+                })
+                .expect("a LabComplete for the burst")
+        };
+        let views = timing(1).expect("the requester has a pipeline").views;
+        let timed: Vec<&str> = views.iter().map(|view| view.node_id.as_str()).collect();
+        assert_eq!(timed, ["high-value", "ranked"]);
+        assert!(views.iter().all(|view| view.rebuild_us.is_some()));
+        assert!(timing(2).is_none());
+        // The reply follows the burst's deliveries.
+        let complete = messages
+            .iter()
+            .position(|m| matches!(m, ServerMessage::LabComplete { request_id: 1, .. }))
+            .unwrap();
+        assert!(messages[..complete].iter().any(|message| matches!(message,
+            ServerMessage::ViewDelta { node_id, .. } if node_id == "ranked")));
     }
 }

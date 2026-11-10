@@ -41,12 +41,26 @@ pub struct NodeSnapshot {
 
 pub type PipelineBuildResult = Result<NodeSnapshot, (String, String)>;
 
+/// A freshly built pipeline view with the handles `ViewNode` keeps for it.
+struct BuiltNode {
+    kind: &'static str,
+    view: Rc<RefCell<dyn ReadableTable>>,
+    sync: Box<dyn Fn()>,
+    rebuild: Box<dyn Fn() -> Result<(), String>>,
+}
+
 struct ViewNode {
     id: String,
     source_id: String,
     kind: String,
     view: Rc<RefCell<dyn ReadableTable>>,
     delivery: DeliveryState,
+    /// Sync this node's view. The tick registry syncs every connection's
+    /// views together; the lab times one connection's nodes one at a time.
+    sync: Box<dyn Fn()>,
+    /// Build, and drop, a fresh view of this node's kind over its parent:
+    /// the work a rebuild does, without disturbing the live view.
+    rebuild: Box<dyn Fn() -> Result<(), String>>,
 }
 
 struct Pipeline {
@@ -327,34 +341,74 @@ impl TableEngine {
                 .get(&spec.source_id)
                 .expect("validated source must exist")
                 .clone();
-            let built: Result<(String, Rc<RefCell<dyn ReadableTable>>), String> = match &spec.kind {
-                ViewKindSpec::Filter { predicate } => build_filter(parent, &spec.id, predicate)
-                    .map(|view| {
+            let id = spec.id.clone();
+            let built: Result<BuiltNode, String> = match &spec.kind {
+                ViewKindSpec::Filter { predicate } => {
+                    build_filter(parent.clone(), &spec.id, predicate).map(|view| {
                         base.tickable.register_filter(&view);
-                        let readable: Rc<RefCell<dyn ReadableTable>> = view;
-                        ("filter".to_string(), readable)
-                    }),
-                ViewKindSpec::Sort { keys } => build_sort(parent, &spec.id, keys).map(|view| {
-                    base.tickable.register_sorted(&view);
-                    let readable: Rc<RefCell<dyn ReadableTable>> = view;
-                    ("sort".to_string(), readable)
-                }),
+                        let synced = view.clone();
+                        let predicate = predicate.clone();
+                        BuiltNode {
+                            kind: "filter",
+                            sync: Box::new(move || {
+                                synced.borrow_mut().sync();
+                            }),
+                            rebuild: Box::new(move || {
+                                build_filter(parent.clone(), &id, &predicate).map(drop)
+                            }),
+                            view,
+                        }
+                    })
+                }
+                ViewKindSpec::Sort { keys } => {
+                    build_sort(parent.clone(), &spec.id, keys).map(|view| {
+                        base.tickable.register_sorted(&view);
+                        let synced = view.clone();
+                        let keys = keys.clone();
+                        BuiltNode {
+                            kind: "sort",
+                            sync: Box::new(move || {
+                                synced.borrow_mut().sync();
+                            }),
+                            rebuild: Box::new(move || {
+                                build_sort(parent.clone(), &id, &keys).map(drop)
+                            }),
+                            view,
+                        }
+                    })
+                }
                 ViewKindSpec::Group { group_by, aggs } => {
-                    build_group(parent, &spec.id, group_by, aggs).map(|view| {
+                    build_group(parent.clone(), &spec.id, group_by, aggs).map(|view| {
                         base.tickable.register_aggregate(&view);
-                        let readable: Rc<RefCell<dyn ReadableTable>> = view;
-                        ("group".to_string(), readable)
+                        let synced = view.clone();
+                        let (group_by, aggs) = (group_by.clone(), aggs.clone());
+                        BuiltNode {
+                            kind: "group",
+                            sync: Box::new(move || {
+                                synced.borrow_mut().sync();
+                            }),
+                            rebuild: Box::new(move || {
+                                build_group(parent.clone(), &id, &group_by, &aggs).map(drop)
+                            }),
+                            view,
+                        }
                     })
                 }
             };
 
-            let (kind, view) = match built {
+            let BuiltNode {
+                kind,
+                view,
+                sync,
+                rebuild,
+            } = match built {
                 Ok(built) => built,
                 Err(message) => {
                     results.push(Err((spec.id.clone(), message)));
                     break;
                 }
             };
+            let kind = kind.to_string();
             let delivery = DeliveryState::new(&*view.borrow());
             match snapshot_view(
                 pipeline_generation,
@@ -377,6 +431,8 @@ impl TableEngine {
                 kind,
                 view,
                 delivery,
+                sync,
+                rebuild,
             });
         }
 

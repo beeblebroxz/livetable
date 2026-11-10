@@ -32,7 +32,9 @@ By default the server seeds one in-memory table named `demo`. Add `-- --lab`
 to also enable synthetic `lab` data and the
 [Orders Lab control extension](ORDERS_LAB.md#demo-control-extension):
 `LabCommand`, `LabComplete`, and `LabError`. These additive v3 messages do not
-change existing sequencing contracts. The `--lab` CLI requires a loopback host.
+change existing sequencing contracts. Since 2026-11-09 `LabCommand` also takes a
+`burst` action and `LabComplete` carries an optional `timing` field; both are
+additive, so the protocol version is unchanged. The `--lab` CLI requires a loopback host.
 State is not
 persisted across restarts. CORS is permissive because this server is intended
 for local development and demos.
