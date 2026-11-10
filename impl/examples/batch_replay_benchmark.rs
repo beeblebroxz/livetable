@@ -2,6 +2,7 @@
 //! structural events, beside a full rebuild of the same view. Prints one JSON
 //! line per (rows, view, workload, batch).
 //! Run: cargo run --release --example batch_replay_benchmark -- 100000 1000000
+//! Add `--sort-only` to skip the join workloads.
 //! See docs/VIEW_MAINTENANCE_BENCHMARK.md.
 use livetable::{
     ColumnType, ColumnValue, JoinType, JoinView, ReadableTable, Schema, SortKey, SortedView,
@@ -18,8 +19,9 @@ type Shared = Rc<RefCell<Table>>;
 /// Samples per figure; the median is reported.
 const SAMPLES: usize = 3;
 const BATCHES: [usize; 4] = [64, 256, 1024, 4096];
-/// Sorted views rebuild above 256 events, so larger batches measure nothing new.
-const SORT_BATCHES: [usize; 2] = [64, 256];
+/// Sorted views rebuild above 256 events, so larger batches measure nothing
+/// new. One event is the server's usual tick.
+const SORT_BATCHES: [usize; 5] = [1, 4, 16, 64, 256];
 
 /// Deterministic positions and keys.
 struct Lcg(u64);
@@ -277,8 +279,11 @@ fn main() {
     if cfg!(debug_assertions) {
         panic!("debug builds give meaningless timings: run with --release");
     }
-    let sizes: Vec<usize> = std::env::args()
-        .skip(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let sort_only = args.iter().any(|arg| arg == "--sort-only");
+    let sizes: Vec<usize> = args
+        .iter()
+        .filter(|arg| *arg != "--sort-only")
         .map(|s| s.parse().expect("integer row count"))
         .collect();
     let sizes = if sizes.is_empty() {
@@ -294,8 +299,10 @@ fn main() {
         let mut rng = Lcg(rows as u64);
         let o = orders(rows, &mut rng);
         let c = customers(rows / 10);
-        eprintln!("{rows} join");
-        join_workloads(rows, &o, &c, &mut rng);
+        if !sort_only {
+            eprintln!("{rows} join");
+            join_workloads(rows, &o, &c, &mut rng);
+        }
         o.borrow_mut().clear_changeset();
         eprintln!("{rows} sort");
         sort_workloads(rows, &o, &mut rng);
