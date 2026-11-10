@@ -379,7 +379,7 @@ See [tests/README.md](tests/README.md) for the full test matrix and toolchain sp
 
 ## React Frontend
 
-The default page is the **Orders Lab**: five guided scenarios, a branching
+The default page is the **Orders Lab**: six guided scenarios, a branching
 server-side pipeline, a virtualized results table, and an actual WebSocket
 delivery inspector. Explore deterministic datasets up to 100,000 rows, bounded
 mixed-batch streaming, independent clients, and intentionally dropped-delta

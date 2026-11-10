@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import { useLab, type LabStats, type NodeDelivery } from '../hooks/useLab';
-import { formatBytes, formatCell, NODE_LABELS, SCENARIOS, scenarioAction } from '../lib/lab';
-import type { LabAction, PipelineSnapshot, WireViewRecord } from '../types';
+import { BURST_SIZES, formatBytes, formatCell, formatMicros, formatShare, NODE_LABELS, SCENARIOS, scenarioAction } from '../lib/lab';
+import type { LabAction, LabTiming, PipelineSnapshot, WireViewRecord } from '../types';
 import './OrdersLab.css';
 
 function Glyph({ name, size = 16 }: { name: 'arrow' | 'play' | 'pause' | 'reset' | 'external' | 'check'; size?: number }) {
@@ -65,7 +65,7 @@ function PipelineGraph({ snapshots, stats, selected, onSelect, threshold }: {
       <div className="graph-branch" aria-hidden="true"><span /><span /></div>
       <div className="branch-nodes">{node('ranked', '03', 'SORT amount descending')}{node('regions', '04', 'GROUP BY region · sum / count / avg')}</div>
     </div>
-    <p className="graph-caption">One source, two downstream perspectives. Filter and sort receive bounded deltas; regional totals receive snapshots.</p>
+    <p className="graph-caption">One source, two downstream perspectives. Filter, sort and regional totals all receive bounded deltas.</p>
   </section>;
 }
 
@@ -86,6 +86,35 @@ function DeliveryInspector({ stats, busy }: { stats: LabStats; busy: boolean }) 
   </aside>;
 }
 
+const SCENARIO_COUNT = String(SCENARIOS.length).padStart(2, '0');
+
+// Times come from the server: each view's own sync() for the last command,
+// and for a burst a fresh build of the same view over the same rows.
+function EngineTime({ timing }: { timing: LabTiming | null }) {
+  if (!timing?.views.length) return null;
+  const rebuilt = timing.views.some(view => view.rebuild_us !== undefined);
+  return <section className="engine-time" aria-label="Server-measured view sync time">
+    <div className="engine-time-heading"><span className="eyebrow">ENGINE TIME · MEASURED ON THE SERVER</span><h2>What each view cost</h2></div>
+    <div className="engine-time-scroll"><table className="engine-time-table">
+      <thead><tr><th scope="col">View</th><th scope="col" className="numeric">Sync</th>{rebuilt && <><th scope="col" className="numeric">Rebuild</th><th scope="col">Sync beside a rebuild</th></>}</tr></thead>
+      <tbody>{timing.views.map(view => {
+        const share = view.rebuild_us ? view.sync_us / view.rebuild_us : null;
+        return <tr key={view.node_id}>
+          <th scope="row">{NODE_LABELS[view.node_id] ?? view.node_id}</th>
+          <td className="numeric">{formatMicros(view.sync_us)}</td>
+          {rebuilt && <>
+            <td className="numeric">{view.rebuild_us === undefined ? '—' : formatMicros(view.rebuild_us)}</td>
+            <td>{share === null ? '—' : <span className="engine-share"><span className="engine-bar" aria-hidden="true"><i className={share > 1 ? 'over' : ''} style={{ width: `${Math.min(100, share * 100)}%` }} /></span>{formatShare(share)}</span>}</td>
+          </>}
+        </tr>;
+      })}</tbody>
+    </table></div>
+    <p className="measurement-note">Sync is each view’s own sync() for this batch, timed on the server for this client’s views only. {rebuilt
+      ? 'Rebuild is a fresh build of the same view over the same rows, timed in the same command; a real rebuild would also resend the whole view as a snapshot.'
+      : 'Run a burst to time a rebuild of each view beside it.'} Neither includes applying the mutations, JSON, the network or rendering.</p>
+  </section>;
+}
+
 export function OrdersLab() {
   const clientB = new URLSearchParams(window.location.search).get('client') === 'b';
   const [threshold, setThreshold] = useState(clientB ? 2500 : 1000);
@@ -94,6 +123,7 @@ export function OrdersLab() {
   const [selectedNode, setSelectedNode] = useState('ranked');
   const [size, setSize] = useState(1000);
   const [rate, setRate] = useState(2);
+  const [burstSize, setBurstSize] = useState<number>(256);
   const [streaming, setStreaming] = useState(false);
   const [resetConfirm, setResetConfirm] = useState(false);
   const [localError, setLocalError] = useState('');
@@ -161,7 +191,7 @@ export function OrdersLab() {
       {!ready && <div className="server-notice" role="status"><strong>{lab.connected ? 'Waiting for the Orders lab' : 'Start the local lab server'}</strong><code>cargo run --release --manifest-path impl/Cargo.toml --features server --bin livetable-server -- --lab</code><span>The lab is opt-in and loopback-only. Existing “demo” editor data is untouched.</span></div>}
       {error && <div className="lab-error" role="alert">{error}</div>}
 
-      <section className="lab-toolbar" aria-label="Lab controls"><div className="mode-switch" aria-label="Experience mode"><button aria-pressed={mode === 'guided'} onClick={() => { setMode('guided'); setStreaming(false); }}>Guided tour <span>05</span></button><button aria-pressed={mode === 'explore'} onClick={() => setMode('explore')}>Explore & stream</button></div>
+      <section className="lab-toolbar" aria-label="Lab controls"><div className="mode-switch" aria-label="Experience mode"><button aria-pressed={mode === 'guided'} onClick={() => { setMode('guided'); setStreaming(false); }}>Guided tour <span>{SCENARIO_COUNT}</span></button><button aria-pressed={mode === 'explore'} onClick={() => setMode('explore')}>Explore & stream</button></div>
         <div className="dataset-controls"><label>DATASET<select aria-label="Dataset size" value={size} disabled={lab.busy || streaming} onChange={event => setSize(Number(event.target.value))}><option value={1000}>1,000 orders</option><option value={10000}>10,000 orders</option><option value={100000}>100,000 orders</option></select></label><button className="quiet-button" disabled={disabled} onClick={() => setResetConfirm(true)}><Glyph name="reset" /> Reset / load</button></div>
       </section>
 
@@ -169,10 +199,10 @@ export function OrdersLab() {
 
       {mode === 'guided' ? <>
         <div className="tour-steps" aria-label="Guided scenarios">{SCENARIOS.map((item, index) => <button key={item.id} disabled={lab.busy} aria-current={scenarioIndex === index ? 'step' : undefined} onClick={() => { setScenarioIndex(index); setLocalError(''); }}><span>{item.number}</span>{item.tag}<Glyph name="arrow" /></button>)}</div>
-        <section className="scenario-card"><div className="scenario-number">{scenario.number}<span>/ 05</span></div><div className="scenario-copy"><span className="eyebrow">{scenario.tag}</span><h2>{scenario.title}</h2><p>{scenario.description}</p><div className="expected-path">{scenario.expected}</div></div><div className="scenario-actions">{scenario.id === 'clients' && <a className="secondary-button" href={peerUrl} target="_blank" rel="noreferrer">Open the other client <Glyph name="external" /></a>}<button className="primary-button" disabled={disabled} onClick={runScenario}>{lab.busy ? 'Following the change…' : scenario.action}<Glyph name="arrow" /></button><span>Live server mutation · repeatable after reset</span></div></section>
-      </> : <section className="explore-controls"><div><span className="eyebrow">BOUNDED MIXED WORKLOAD</span><h2>Make it move.</h2><p>Each batch updates, deletes and inserts. Row count stays steady.</p></div><label>Target batches / sec<select aria-label="Target batches per second" value={rate} disabled={streaming || lab.busy} onChange={event => setRate(Number(event.target.value))}><option value={1}>1 / sec</option><option value={2}>2 / sec</option><option value={5}>5 / sec</option><option value={10}>10 / sec</option></select></label><button className="secondary-button" disabled={disabled} onClick={() => void execute({ kind: 'step' }, 'Single mixed batch')}>Single step <Glyph name="arrow" /></button><button className="primary-button" disabled={!ready || (!streaming && lab.busy)} onClick={() => setStreaming(!streaming)}><Glyph name={streaming ? 'pause' : 'play'} />{streaming ? 'Pause stream' : 'Start stream'}</button><span className="flow-control-note">One batch in flight. Slows down automatically when delivery takes longer.</span></section>}
+        <section className="scenario-card"><div className="scenario-number">{scenario.number}<span>/ {SCENARIO_COUNT}</span></div><div className="scenario-copy"><span className="eyebrow">{scenario.tag}</span><h2>{scenario.title}</h2><p>{scenario.description}</p><div className="expected-path">{scenario.expected}</div></div><div className="scenario-actions">{scenario.id === 'clients' && <a className="secondary-button" href={peerUrl} target="_blank" rel="noreferrer">Open the other client <Glyph name="external" /></a>}<button className="primary-button" disabled={disabled} onClick={runScenario}>{lab.busy ? 'Following the change…' : scenario.action}<Glyph name="arrow" /></button><span>Live server mutation · repeatable after reset</span></div></section>
+      </> : <section className="explore-controls"><div><span className="eyebrow">BOUNDED MIXED WORKLOAD</span><h2>Make it move.</h2><p>Each batch updates, deletes and inserts. Row count stays steady.</p></div><label>Target batches / sec<select aria-label="Target batches per second" value={rate} disabled={streaming || lab.busy} onChange={event => setRate(Number(event.target.value))}><option value={1}>1 / sec</option><option value={2}>2 / sec</option><option value={5}>5 / sec</option><option value={10}>10 / sec</option></select></label><button className="secondary-button" disabled={disabled} onClick={() => void execute({ kind: 'step' }, 'Single mixed batch')}>Single step <Glyph name="arrow" /></button><label>Burst size<select aria-label="Burst size" value={burstSize} disabled={streaming || lab.busy} onChange={event => setBurstSize(Number(event.target.value))}>{BURST_SIZES.map(option => <option key={option} value={option}>{option} changes</option>)}</select></label><button className="secondary-button" disabled={disabled} onClick={() => void execute({ kind: 'burst', size: burstSize }, `Burst of ${burstSize}`)}>Run burst <Glyph name="arrow" /></button><button className="primary-button" disabled={!ready || (!streaming && lab.busy)} onClick={() => setStreaming(!streaming)}><Glyph name={streaming ? 'pause' : 'play'} />{streaming ? 'Pause stream' : 'Start stream'}</button><span className="flow-control-note">One batch in flight. Slows down automatically when delivery takes longer.</span></section>}
 
-      <section className="metrics-strip" aria-label="Measured delivery metrics"><div><span>RECEIVED JSON</span><strong>{formatBytes(lab.stats.bytes)}</strong><small>Since trace start / clear</small></div><div><span>DELTA DELIVERIES</span><strong>{lab.stats.deltas.toLocaleString()}<i className="metric-accent">↗</i></strong><small>Compact row operations</small></div><div><span>SNAPSHOT DELIVERIES</span><strong>{lab.stats.snapshots.toLocaleString()}</strong><small>Initial, group, fallback or repair</small></div><div><span>RECOVERIES</span><strong>{lab.stats.recovered}<small className="inline-small"> / {lab.stats.repairs} requests</small></strong><small>{lab.stats.statuses} watermarks received</small></div><button className="clear-trace" disabled={lab.busy || streaming} onClick={lab.clear} title="Clear client counters and trace; keep server data">Clear trace <Glyph name="reset" /></button></section>
+      <section className="metrics-strip" aria-label="Measured delivery metrics"><div><span>RECEIVED JSON</span><strong>{formatBytes(lab.stats.bytes)}</strong><small>Since trace start / clear</small></div><div><span>DELTA DELIVERIES</span><strong>{lab.stats.deltas.toLocaleString()}<i className="metric-accent">↗</i></strong><small>Compact row operations</small></div><div><span>SNAPSHOT DELIVERIES</span><strong>{lab.stats.snapshots.toLocaleString()}</strong><small>Initial, fallback or repair</small></div><div><span>RECOVERIES</span><strong>{lab.stats.recovered}<small className="inline-small"> / {lab.stats.repairs} requests</small></strong><small>{lab.stats.statuses} watermarks received</small></div><button className="clear-trace" disabled={lab.busy || streaming} onClick={lab.clear} title="Clear client counters and trace; keep server data">Clear trace <Glyph name="reset" /></button></section>
 
       <div className="lab-workspace"><div className="workspace-main"><PipelineGraph snapshots={lab.snapshots} stats={lab.stats} selected={selectedNode} onSelect={selectNode} threshold={threshold} />
         <section className="results-section"><div className="results-heading"><div><span className="eyebrow">MATERIALIZED CLIENT STATE</span><h2>{NODE_LABELS[selectedNode]} <span>{lab.snapshots[selectedNode]?.rows.length.toLocaleString('en-US') ?? '—'}</span></h2></div><label className="threshold-control">My threshold<select aria-label="Client filter threshold" value={threshold} disabled={lab.busy || streaming} onChange={event => { setThreshold(Number(event.target.value)); setEdit(null); }}><option value={500}>$500</option><option value={1000}>$1,000</option><option value={2500}>$2,500</option><option value={4000}>$4,000</option></select></label></div>
@@ -182,6 +212,7 @@ export function OrdersLab() {
         </section>
         <div className="lab-result" role="status">{lab.busy ? <><span className="activity-dot is-active" /> Waiting for deliveries{scenario.id === 'recovery' ? ' and recovery' : ''}…</> : lab.result ? <><Glyph name="check" /><strong>{lab.result.label}</strong><span>{lab.result.ms.toFixed(1)} ms send → client-state completion</span></> : <><span className="small-cross">+</span><span>Ready when you are. Run a scenario and follow its deliveries.</span></>}</div>
         <p className="measurement-note">Completion is the command reply after queued deliveries, plus repair when injected. Includes client parsing and reconciliation; excludes React commit and browser paint. Concurrent clients can contribute traffic. Not an engine-only benchmark.</p>
+        <EngineTime timing={lab.timing} />
       </div><DeliveryInspector stats={lab.stats} busy={lab.busy} /></div>
 
       <section className="under-the-hood"><button onClick={() => setShowStorage(!showStorage)} aria-expanded={showStorage}><span><span className="small-cross">+</span> Under the hood <small>Typed storage & honest boundaries</small></span><span>{showStorage ? '−' : '+'}</span></button>{showStorage && <div className="storage-details"><div><h3>Native-width columns</h3><p>Order and quantity use INT32 buffers. Amount uses FLOAT64. Repeated region and product strings use interned IDs. These are server storage choices, not a zero-copy JSON transport.</p></div><div><h3>Measure memory separately</h3><p>No estimated “memory saved” gauge here. Run the repository’s column-layout benchmark for allocator-counted storage comparisons. Client row arrays and view caches have their own costs.</p><code>cargo run --release --manifest-path impl/Cargo.toml --example column_layout_benchmark -- 10000 100000</code></div><div><h3>Know the limits</h3><p>Initial and repair snapshots are unchunked. Client delta application still copies row-array references. Derived rows, including groups, have no stable row identity; deltas address them by position. The lab has no persistence or authentication and is for local synthetic data only.</p></div></div>}</section>

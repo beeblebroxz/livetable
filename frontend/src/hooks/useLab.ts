@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { LabAction } from '../types';
+import type { LabAction, LabTiming } from '../types';
 import { usePipeline, type PipelineEvent } from './usePipeline';
-import { labPipeline } from '../lib/lab';
+import { formatMicros, labPipeline } from '../lib/lab';
 
 export interface TraceEntry { id: number; at: number; node: string; kind: string; bytes: number; detail: string }
 export interface NodeDelivery { kind: string; bytes: number; operations: number; seq: number; indices: number[] }
@@ -20,6 +20,8 @@ export function useLab(threshold: number) {
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState('');
   const [result, setResult] = useState<{ label: string; ms: number } | null>(null);
+  // Server-measured view times from this client's latest completed command.
+  const [timing, setTiming] = useState<LabTiming | null>(null);
   const pendingRef = useRef<Pending | null>(null);
   const counterRef = useRef(0);
   const eventIdRef = useRef(0);
@@ -37,7 +39,7 @@ export function useLab(threshold: number) {
   const onEvent = useCallback((event: PipelineEvent) => {
     if (event.kind === 'generation') {
       finish('Pipeline replaced. Run the scenario again after it loads.');
-      setStats(emptyStats()); setResult(null);
+      setStats(emptyStats()); setResult(null); setTiming(null);
       return;
     }
     if (event.kind === 'disconnected') { finish('Connection lost. The command may have been applied; inspect the reconnected state before retrying.'); return; }
@@ -63,10 +65,12 @@ export function useLab(threshold: number) {
         entry = { id: ++eventIdRef.current, at: event.at, node: 'transport', kind: 'watermark', bytes: event.bytes, detail: 'Per-node delivery sequences; no row payload' };
       } else if (message.type === 'LabComplete') {
         if (pendingRef.current?.id === message.request_id) {
+          setTiming(message.timing ?? null);
           pendingRef.current.ack = true;
           if (!pendingRef.current.recovery) finish();
         }
-        entry = { id: ++eventIdRef.current, at: event.at, node: 'server', kind: 'complete', bytes: event.bytes, detail: `${message.mutations.toLocaleString()} mutations · ${message.rows.toLocaleString()} rows · batch ${message.step}` };
+        const synced = message.timing ? ` · views synced in ${formatMicros(message.timing.views.reduce((sum, view) => sum + view.sync_us, 0))} on the server` : '';
+        entry = { id: ++eventIdRef.current, at: event.at, node: 'server', kind: 'complete', bytes: event.bytes, detail: `${message.mutations.toLocaleString()} mutations · ${message.rows.toLocaleString()} rows · batch ${message.step}${synced}` };
       } else if (message.type === 'LabError') {
         if (pendingRef.current?.id === message.request_id) finish(message.message);
         entry = { id: ++eventIdRef.current, at: event.at, node: 'server', kind: 'error', bytes: event.bytes, detail: message.message };
@@ -123,7 +127,7 @@ export function useLab(threshold: number) {
     if (pending) { window.clearTimeout(pending.timer); pending.reject(new Error('Lab closed')); pendingRef.current = null; }
   }, []);
 
-  return { ...pipeline, stats, busy, problem, result, run,
-    clear: () => { setStats(emptyStats()); setResult(null); setProblem(''); },
+  return { ...pipeline, stats, busy, problem, result, timing, run,
+    clear: () => { setStats(emptyStats()); setResult(null); setProblem(''); setTiming(null); },
   };
 }

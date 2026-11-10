@@ -84,7 +84,7 @@ export type ClientMessage =
 // Clients drop any delta whose `seq` is <= the snapshot's `seq` (already
 // reflected) and apply the rest. See ServerMessage in impl/src/messages.rs.
 export type ServerMessage =
-  | { type: 'LabComplete'; request_id: number; rows: number; step: number; mutations: number }
+  | { type: 'LabComplete'; request_id: number; rows: number; step: number; mutations: number; timing?: LabTiming }
   | { type: 'LabError'; request_id: number; message: string }
   | { type: 'Subscribed'; table_name: string; protocol_version?: number }
   | { type: 'TableData'; table_name: string; seq: number; columns: string[]; rows: WireTableRecord[] }
@@ -129,4 +129,10 @@ export type ServerMessage =
 export type LabAction =
   | { kind: 'reset'; rows: number }
   | { kind: 'step' }
+  | { kind: 'burst'; size: number }
   | { kind: 'update'; row_id: number; amount: number };
+
+// Server-measured microseconds for one of this client's views during a lab
+// command: its own sync(), and for a burst a fresh build of the same view.
+export interface ViewTiming { node_id: string; sync_us: number; rebuild_us?: number }
+export interface LabTiming { views: ViewTiming[] }

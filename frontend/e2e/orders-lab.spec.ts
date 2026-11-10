@@ -45,6 +45,43 @@ test('guided tour exercises actual deltas, sorted moves and final-message recove
   expect(errors).toEqual([]);
 });
 
+test('a 256-change burst stays incremental and shows server-measured engine time', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await ready(page);
+  await reset(page, '10000');
+  await expect(page.locator('.engine-time')).toHaveCount(0); // a reset is not timed
+  await page.getByRole('button', { name: '06 Batched replay' }).click();
+  await page.getByRole('button', { name: 'Run a 256-change burst' }).click();
+  await expect(page.locator('.lab-result')).toContainText('Change a lot. Stay incremental.');
+  for (const node of ['All orders', 'High-value orders', 'Ranked orders', 'Regional totals']) {
+    await expect(page.locator('.pipeline-node').filter({ hasText: node }).locator('.delivery-tag')).toHaveText('delta');
+  }
+  await expect(page.locator('.trace-entry.snapshot')).toHaveCount(0);
+  await expect(page.locator('.pipeline-node').filter({ hasText: 'All orders' }).locator('.node-bottom b')).toHaveText('10,000');
+  const rows = page.locator('.engine-time tbody tr');
+  await expect(rows).toHaveCount(3);
+  for (const [index, view] of ['High-value orders', 'Ranked orders', 'Regional totals'].entries()) {
+    await expect(rows.nth(index)).toContainText(view);
+    await expect(rows.nth(index)).toContainText(/\d (µs|ms)/);
+    await expect(rows.nth(index)).toContainText('a rebuild');
+  }
+  await expect(page.locator('.engine-time thead')).toContainText('Rebuild');
+  // An ordinary step is timed too, without the rebuild comparison.
+  await page.getByRole('button', { name: 'Explore & stream' }).click();
+  await page.getByRole('button', { name: 'Single step' }).click();
+  await expect(page.locator('.lab-result')).toContainText('Single mixed batch');
+  await expect(rows).toHaveCount(3);
+  await expect(page.locator('.engine-time thead')).not.toContainText('Rebuild');
+  await page.getByLabel('Burst size').selectOption('64');
+  await page.getByRole('button', { name: 'Run burst' }).click();
+  await expect(page.locator('.lab-result')).toContainText('Burst of 64');
+  await expect(page.locator('.engine-time thead')).toContainText('Rebuild');
+  await page.screenshot({ path: 'test-results/orders-lab-burst.png', fullPage: true });
+  expect(errors).toEqual([]);
+});
+
 test('independent clients share resets and mutations without sharing filters', async ({ page, context }) => {
   await page.goto('/');
   await ready(page);

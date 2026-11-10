@@ -32,11 +32,19 @@ export const SCENARIOS = [
   { id: 'recovery', number: '05', title: 'Miss a message. Catch up.', tag: 'Snapshot recovery',
     description: 'Discard one incoming filter delta in this client. The next server watermark detects the gap and triggers a repair snapshot.',
     action: 'Drop a delta & recover', expected: 'Dropped delta → watermark → QueryView → coherent snapshot' },
+  { id: 'burst', number: '06', title: 'Change a lot. Stay incremental.', tag: 'Batched replay',
+    description: 'Apply 256 scattered edits, deletes and inserts in one tick. Each view replays the batch instead of rebuilding, and the server reports what that cost. Load 100,000 orders first: on a small table a rebuild is the cheaper path.',
+    action: 'Run a 256-change burst', expected: 'One delta per view · no snapshot · engine time beside a rebuild' },
 ] as const;
 export type ScenarioId = typeof SCENARIOS[number]['id'];
 
+// The server accepts exactly these. 256 is the filter's replay bound, so a
+// burst keeps every view incremental.
+export const BURST_SIZES = [16, 64, 256] as const;
+
 export function scenarioAction(id: ScenarioId, base: PipelineSnapshot, threshold: number, ranked?: PipelineSnapshot): LabAction {
   if (id === 'clients') return { kind: 'step' };
+  if (id === 'burst') return { kind: 'burst', size: 256 };
   const excluded = id === 'excluded' || id === 'crossing';
   // Guided commands inspect only as far as the first suitable row, not a sort
   // or full-table recomputation. Default seeds guarantee both memberships.
@@ -55,6 +63,15 @@ export function scenarioAction(id: ScenarioId, base: PipelineSnapshot, threshold
 
 export function formatBytes(bytes: number) {
   return bytes < 1000 ? `${bytes} B` : bytes < 1_000_000 ? `${(bytes / 1000).toFixed(1)} KB` : `${(bytes / 1_000_000).toFixed(2)} MB`;
+}
+
+export function formatMicros(us: number) {
+  return us < 1000 ? `${us < 10 ? us.toFixed(1) : Math.round(us)} µs` : `${(us / 1000).toFixed(us < 10_000 ? 2 : 1)} ms`;
+}
+
+// A view's sync time beside its rebuild time. Above 1 the rebuild was cheaper.
+export function formatShare(share: number) {
+  return share < 1 ? `${(share * 100).toFixed(share < 0.1 ? 1 : 0)}% of a rebuild` : `${share.toFixed(1)}× a rebuild`;
 }
 
 export function formatCell(column: string, value: unknown): string {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatBytes, labPipeline, scenarioAction } from './lab';
+import { BURST_SIZES, formatBytes, formatMicros, formatShare, labPipeline, SCENARIOS, scenarioAction } from './lab';
 import type { PipelineSnapshot } from '../types';
 
 const base: PipelineSnapshot = { generation: 1, nodeId: 'base', sourceId: 'base', kind: 'base', seq: 0, columns: ['order', 'amount'], rows: [
@@ -21,6 +21,20 @@ describe('guided scenarios', () => {
     expect(scenarioAction('ranked', base, 1000, ranked)).toEqual({ kind: 'update', row_id: 2, amount: 5000 });
     expect(scenarioAction('recovery', base, 1000, ranked)).toEqual({ kind: 'update', row_id: 2, amount: 1481 });
     expect(scenarioAction('clients', base, 1000, ranked)).toEqual({ kind: 'step' });
+  });
+  it('runs the burst scenario at the largest size the server accepts, without choosing a row', () => {
+    expect(SCENARIOS[SCENARIOS.length - 1].id).toBe('burst');
+    expect(scenarioAction('burst', { ...base, rows: [] }, 1000)).toEqual({ kind: 'burst', size: 256 });
+    expect(Math.max(...BURST_SIZES)).toBe(256);
+  });
+  it('formats server microseconds and a sync time beside its rebuild', () => {
+    expect(formatMicros(2.64)).toBe('2.6 µs');
+    expect(formatMicros(806.8)).toBe('807 µs');
+    expect(formatMicros(4286.9)).toBe('4.29 ms');
+    expect(formatMicros(30877)).toBe('30.9 ms');
+    expect(formatShare(0.0956)).toBe('9.6% of a rebuild');
+    expect(formatShare(0.32)).toBe('32% of a rebuild');
+    expect(formatShare(3.17)).toBe('3.2× a rebuild'); // a small table: the rebuild was cheaper
   });
   it('explains when reset is needed instead of inventing a row ID', () => {
     expect(() => scenarioAction('excluded', { ...base, rows: [] }, 1000)).toThrow('Reset');

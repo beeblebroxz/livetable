@@ -46,6 +46,31 @@ describe('Orders lab controller', () => {
     expect(result.current.result?.label).toBe('Batch');
   });
 
+  it('keeps the server view timing of its own latest command only', async () => {
+    const { result } = renderHook(() => useLab(1000));
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => seed(socket));
+    const timing = { views: [{ node_id: 'high-value', sync_us: 4286.9, rebuild_us: 30877 }, { node_id: 'ranked', sync_us: 806.8, rebuild_us: 8442.8 }] };
+    let command: Promise<void>;
+    act(() => { command = result.current.run({ kind: 'burst', size: 256 }, 'Burst'); });
+    expect(socket.sentMessages[socket.sentMessages.length - 1]).toEqual({ type: 'LabCommand', request_id: 1, action: { kind: 'burst', size: 256 } });
+    // Another client's reply carries its own pipeline's times, not ours.
+    await act(async () => socket.receive({ type: 'LabComplete', request_id: 200, rows: 1000, mutations: 256, step: 1, timing: { views: [{ node_id: 'ranked', sync_us: 1 }] } }));
+    expect(result.current.timing).toBeNull();
+    await act(async () => { socket.receive({ type: 'LabComplete', request_id: 1, rows: 1000, mutations: 256, step: 1, timing }); await command; });
+    expect(result.current.timing).toEqual(timing);
+    expect(result.current.stats.events[0].detail).toContain('views synced in 5.09 ms on the server');
+    // A later command without timing (a reset) replaces it; clearing the trace does too.
+    act(() => { command = result.current.run({ kind: 'reset', rows: 1000 }, 'Reset'); });
+    await act(async () => { socket.receive({ type: 'LabComplete', request_id: 2, rows: 1000, mutations: 2000, step: 0 }); await command; });
+    expect(result.current.timing).toBeNull();
+    act(() => { command = result.current.run({ kind: 'step' }, 'Step'); });
+    await act(async () => { socket.receive({ type: 'LabComplete', request_id: 3, rows: 1000, mutations: 3, step: 1, timing: { views: [{ node_id: 'ranked', sync_us: 6 }] } }); await command; });
+    expect(result.current.timing?.views).toHaveLength(1);
+    act(() => result.current.clear());
+    expect(result.current.timing).toBeNull();
+  });
+
   it('discards one delta, waits past the ack, and completes after ordinary watermark repair', async () => {
     const { result } = renderHook(() => useLab(1000));
     const socket = FakeWebSocket.instances[0];
